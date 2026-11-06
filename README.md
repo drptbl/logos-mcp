@@ -16,6 +16,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `messaging_send` | publishes text or base64 bytes to a topic and returns a `request_id` |
 | `messaging_send_status` | queued, sent, propagated or error for a `request_id` |
 | `messaging_read` | messages received on a subscribed topic, paged with `after_seq` |
+| `rln_status` | whether the node can send right now: RLN membership state and messages left in this epoch |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
