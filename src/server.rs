@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     events::EventStore,
     guard::{self, FilesRoot},
-    logosctl::{Arg, LogosError, Logosctl, embedded_json},
+    logosctl::{Arg, LogosError, embedded_json},
+    node::Node,
 };
 
 const DELIVERY: &str = "delivery_module";
@@ -110,7 +111,7 @@ pub struct WalletPaths {
 
 #[derive(Clone)]
 pub struct LogosServer {
-    ctl: Logosctl,
+    node: Arc<dyn Node>,
     events: Arc<EventStore>,
     files: Option<FilesRoot>,
     settings: NodeSettings,
@@ -232,13 +233,13 @@ fn is_uninitialized(e: &LogosError) -> bool {
 #[tool_router]
 impl LogosServer {
     pub fn new(
-        ctl: Logosctl,
+        node: Arc<dyn Node>,
         events: Arc<EventStore>,
         files: Option<FilesRoot>,
         settings: NodeSettings,
     ) -> Self {
         Self {
-            ctl,
+            node,
             events,
             files,
             settings,
@@ -268,7 +269,7 @@ impl LogosServer {
     }
 
     async fn sequencer_addr(&self) -> Result<String, String> {
-        match self.ctl.call(LEZ, "get_sequencer_addr", &[]).await {
+        match self.node.call(LEZ, "get_sequencer_addr", &[]).await {
             Ok(Value::String(s)) => Ok(s),
             Ok(other) => Err(format!("unexpected get_sequencer_addr result: {other}")),
             Err(e) => Err(e.to_string()),
@@ -277,11 +278,7 @@ impl LogosServer {
 
     /// The daemon's pid and lez_core's uptime, to tell whether either restarted.
     async fn lez_instance(&self) -> Result<(u64, u64), String> {
-        let status = self
-            .ctl
-            .command(&["status"])
-            .await
-            .map_err(|e| e.to_string())?;
+        let status = self.node.status().await.map_err(|e| e.to_string())?;
         let pid = status.pointer("/daemon/pid").and_then(Value::as_u64);
         let uptime = status
             .get("modules")
@@ -299,7 +296,7 @@ impl LogosServer {
     }
 
     async fn list_accounts(&self) -> Result<Vec<Value>, String> {
-        match self.ctl.call(LEZ, "list_accounts", &[]).await {
+        match self.node.call(LEZ, "list_accounts", &[]).await {
             Ok(Value::Array(list)) => Ok(list),
             Ok(other) => Err(format!("unexpected list_accounts result: {other}")),
             Err(e) => Err(e.to_string()),
@@ -342,7 +339,7 @@ impl LogosServer {
             Arg::str(paths.config.display().to_string()),
             Arg::str(paths.storage.display().to_string()),
         ];
-        match self.ctl.call(LEZ, "open", &args).await {
+        match self.node.call(LEZ, "open", &args).await {
             Ok(code) if code == json!(0) => {}
             Ok(code) => {
                 return Err(format!(
@@ -382,7 +379,7 @@ impl LogosServer {
             Err(e) => return fail(e),
         };
         // lez_core reports a failed height read as 0.
-        let height = match self.ctl.call(LEZ, "get_current_block_height", &[]).await {
+        let height = match self.node.call(LEZ, "get_current_block_height", &[]).await {
             Ok(Value::Number(n)) if n.as_u64().is_some_and(|h| h > 0) => Some(n),
             _ => None,
         };
@@ -416,7 +413,7 @@ impl LogosServer {
             let address = guard::account_id_base58(id).map(|b58| format!("{kind}/{b58}"));
             // lez_core reports a failed balance read as an empty string, not an error.
             let balance = match self
-                .ctl
+                .node
                 .call(LEZ, "get_balance", &[Arg::str(id), Arg::Bool(public)])
                 .await
             {
@@ -453,11 +450,11 @@ impl LogosServer {
         description = "Show the Logos daemon, loaded modules, messaging connection and this server's settings."
     )]
     async fn node_status(&self) -> Result<CallToolResult, McpError> {
-        let daemon = match self.ctl.command(&["status"]).await {
+        let daemon = match self.node.status().await {
             Ok(v) => v,
             Err(e) => return logos_fail(e),
         };
-        let connection = match self.ctl.call(DELIVERY, "getConnectionStatus", &[]).await {
+        let connection = match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
             Ok(v) => v,
             Err(e) if is_uninitialized(&e) => json!("not created (call messaging_connect)"),
             Err(e) => json!(format!("unavailable: {e}")),
@@ -480,7 +477,7 @@ impl LogosServer {
         description = "Bring up the messaging node on the configured network. Safe to call repeatedly: it only creates and starts a node when none exists, and leaves an existing node as it is."
     )]
     async fn messaging_connect(&self) -> Result<CallToolResult, McpError> {
-        match self.ctl.ensure_loaded(DELIVERY).await {
+        match self.node.ensure_loaded(DELIVERY).await {
             // Calls right after a load can fail while the module settles.
             Ok(true) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
             Ok(false) => {}
@@ -489,20 +486,20 @@ impl LogosServer {
         let mut created = false;
         let mut started = false;
         let mut connection = Value::Null;
-        match self.ctl.call(DELIVERY, "getConnectionStatus", &[]).await {
+        match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
             // An existing node is never restarted here: "Disconnected" can be a
             // running node between peers, or one an operator created but has
             // deliberately not started (e.g. waiting for an RLN membership).
             Ok(status) => connection = status,
             Err(e) if is_uninitialized(&e) => {
                 if let Err(e) = self
-                    .ctl
+                    .node
                     .call(DELIVERY, "createNode", &[Arg::str(self.node_config())])
                     .await
                 {
                     return logos_fail(e);
                 }
-                if let Err(e) = self.ctl.call(DELIVERY, "start", &[]).await {
+                if let Err(e) = self.node.call(DELIVERY, "start", &[]).await {
                     return logos_fail(e);
                 }
                 created = true;
@@ -516,7 +513,7 @@ impl LogosServer {
             let topics: Vec<String> = self.subscriptions.lock().unwrap().iter().cloned().collect();
             for t in topics {
                 if self
-                    .ctl
+                    .node
                     .call(DELIVERY, "subscribe", &[Arg::str(&t)])
                     .await
                     .is_ok()
@@ -550,7 +547,7 @@ impl LogosServer {
             return fail(e);
         }
         if let Err(e) = self
-            .ctl
+            .node
             .call(DELIVERY, "subscribe", &[Arg::str(&p.topic)])
             .await
         {
@@ -569,7 +566,7 @@ impl LogosServer {
             return fail(e);
         }
         if let Err(e) = self
-            .ctl
+            .node
             .call(DELIVERY, "unsubscribe", &[Arg::str(&p.topic)])
             .await
         {
@@ -601,7 +598,7 @@ impl LogosServer {
             return fail(e);
         }
         match self
-            .ctl
+            .node
             .call(DELIVERY, "send", &[Arg::str(&p.topic), Arg::Bytes(payload)])
             .await
         {
@@ -644,7 +641,7 @@ impl LogosServer {
         description = "Whether this node can send right now: RLN membership state and the messages left in the current epoch. On logos.dev RLN is off."
     )]
     async fn rln_status(&self) -> Result<CallToolResult, McpError> {
-        let rln = match self.ctl.call(DELIVERY, "rlnState", &[]).await {
+        let rln = match self.node.call(DELIVERY, "rlnState", &[]).await {
             Ok(v) => v,
             Err(e) if is_uninitialized(&e) => {
                 return fail("messaging node not created yet: call messaging_connect");
@@ -668,7 +665,7 @@ impl LogosServer {
         let scope_args = [Arg::str(registry), Arg::str(identifier)];
 
         let membership = match self
-            .ctl
+            .node
             .call(RLN, "get_membership_state", &scope_args)
             .await
         {
@@ -690,7 +687,7 @@ impl LogosServer {
             scope_args[1].clone(),
             Arg::str(now.to_string()),
         ];
-        let quota = self.ctl.call(RLN, "get_epoch_quota", &quota_args).await;
+        let quota = self.node.call(RLN, "get_epoch_quota", &quota_args).await;
         let remaining = quota
             .as_ref()
             .ok()
@@ -785,7 +782,7 @@ impl LogosServer {
             return fail("transfer cancelled before sending: nothing was sent");
         }
         let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
-        let outcome = match self.ctl.call(LEZ, "transfer_public", &args).await {
+        let outcome = match self.node.call(LEZ, "transfer_public", &args).await {
             Ok(v) => TransferOutcome::read(&embedded_json(v)),
             Err(e) => TransferOutcome::Unknown(e.to_string()),
         };
@@ -803,7 +800,7 @@ impl LogosServer {
                 // lez_core only reports a numeric code, and its numbering has changed
                 // upstream, so a code is only named on the version it was confirmed on.
                 let confirmed =
-                    self.ctl.call(LEZ, "version", &[]).await.ok() == Some(json!("0.5.1"));
+                    self.node.call(LEZ, "version", &[]).await.ok() == Some(json!("0.5.1"));
                 let hint = if confirmed && reason.ends_with("wallet FFI error 9") {
                     " (insufficient funds: the sender can't cover the amount and fee)"
                 } else {
@@ -837,7 +834,7 @@ impl LogosServer {
             );
         }
         // lez_core returns an empty string when it can't create the account.
-        let id = match self.ctl.call(LEZ, "create_account_public", &[]).await {
+        let id = match self.node.call(LEZ, "create_account_public", &[]).await {
             Ok(Value::String(id)) if guard::account_id_base58(&id).is_some() => id,
             unclear => {
                 // The account may exist even though the reply doesn't say so. Still
@@ -859,7 +856,7 @@ impl LogosServer {
         if let Some(known) = agent_accounts.as_mut() {
             known.insert(id.clone());
         }
-        let saved = matches!(self.ctl.call(LEZ, "save", &[]).await, Ok(v) if v == json!(0));
+        let saved = matches!(self.node.call(LEZ, "save", &[]).await, Ok(v) if v == json!(0));
         let address = guard::account_id_base58(&id).map(|b58| format!("Public/{b58}"));
         ok(json!({
             "address": address,
@@ -878,7 +875,7 @@ impl LogosServer {
             );
         }
         let mut ready = self.discovery_ready.lock().await;
-        let peer_info = match self.ctl.call(P2P, "peerInfo", &[]).await {
+        let peer_info = match self.node.call(P2P, "peerInfo", &[]).await {
             Ok(v) => v,
             Err(LogosError::Refused(m)) if m.contains("No libp2p context") => {
                 let nodes = self
@@ -892,14 +889,14 @@ impl LogosServer {
                     "mountKad": true,
                     "mountServiceDiscovery": true,
                 });
-                self.ctl
+                self.node
                     .call(P2P, "createNode", &[Arg::str(config.to_string())])
                     .await
                     .map_err(|e| e.to_string())?;
                 // A fresh node knows none of the interests registered on an earlier one.
                 self.interests.lock().await.clear();
                 *ready = false;
-                self.ctl
+                self.node
                     .call(P2P, "peerInfo", &[])
                     .await
                     .map_err(|e| e.to_string())?
@@ -910,7 +907,7 @@ impl LogosServer {
             // Both are safe to repeat (checked live on libp2p_module 1.1.0). A node created
             // elsewhere, or one whose start failed earlier, may not be running discovery yet.
             for method in ["start", "discoStart"] {
-                self.ctl
+                self.node
                     .call(P2P, method, &[])
                     .await
                     .map_err(|e| e.to_string())?;
@@ -946,7 +943,7 @@ impl LogosServer {
             Err(e) => return fail(e),
         };
         let args = [Arg::str(&p.service_id), Arg::str(&p.tag), Arg::str("")];
-        match self.ctl.call(P2P, "discoStartAdvertising", &args).await {
+        match self.node.call(P2P, "discoStartAdvertising", &args).await {
             Ok(_) => ok(json!({ "advertising": p.service_id, "peer_id": peer_id })),
             Err(e) => logos_fail(e),
         }
@@ -964,7 +961,7 @@ impl LogosServer {
             return fail(e);
         }
         match self
-            .ctl
+            .node
             .call(P2P, "discoStopAdvertising", &[Arg::str(&p.service_id)])
             .await
         {
@@ -992,14 +989,14 @@ impl LogosServer {
             let mut interests = self.interests.lock().await;
             if !interests.contains(&p.service_id) {
                 let sid = [Arg::str(&p.service_id)];
-                if let Err(e) = self.ctl.call(P2P, "discoRegisterInterest", &sid).await {
+                if let Err(e) = self.node.call(P2P, "discoRegisterInterest", &sid).await {
                     return logos_fail(e);
                 }
                 interests.insert(p.service_id.clone());
             }
         }
         let found = match self
-            .ctl
+            .node
             .call(P2P, "discoLookup", &[Arg::str(&p.service_id), Arg::str("")])
             .await
         {
@@ -1052,7 +1049,7 @@ impl LogosServer {
             Arg::Int(CHUNK_SIZE),
             Arg::Bool(true),
         ];
-        match self.ctl.call(STORAGE, "uploadUrl", &args).await {
+        match self.node.call(STORAGE, "uploadUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "upload");
                 ok(json!({ "session_id": session }))
@@ -1088,7 +1085,7 @@ impl LogosServer {
         ];
         // The download session id is the CID: clear any earlier run first.
         self.events.reset_transfer(&p.cid, "download");
-        match self.ctl.call(STORAGE, "downloadToUrl", &args).await {
+        match self.node.call(STORAGE, "downloadToUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "download");
                 ok(json!({ "session_id": session, "path": p.path }))
@@ -1119,7 +1116,7 @@ impl LogosServer {
         if let Err(e) = guard::validate_cid(&p.cid) {
             return fail(e);
         }
-        match self.ctl.call(STORAGE, "exists", &[Arg::str(&p.cid)]).await {
+        match self.node.call(STORAGE, "exists", &[Arg::str(&p.cid)]).await {
             Ok(v) => ok(json!({ "cid": p.cid, "exists": v })),
             Err(e) => logos_fail(e),
         }
@@ -1127,7 +1124,7 @@ impl LogosServer {
 
     #[tool(description = "Local storage quota and usage.")]
     async fn storage_space(&self) -> Result<CallToolResult, McpError> {
-        match self.ctl.call(STORAGE, "space", &[]).await {
+        match self.node.call(STORAGE, "space", &[]).await {
             Ok(v) => ok(embedded_json(v)),
             Err(e) => logos_fail(e),
         }

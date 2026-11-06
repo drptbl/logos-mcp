@@ -1,18 +1,14 @@
-mod events;
-mod guard;
-mod logosctl;
-mod server;
-
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::Parser;
 use rmcp::{ServiceExt, transport::stdio};
 
-use crate::{
-    events::{EventStore, spawn_watcher},
+use logos_mcp::{
+    events::EventStore,
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
+    node::Node,
     server::{LogosServer, NodeSettings, WalletPaths},
 };
 
@@ -118,22 +114,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     for peer in &cli.discovery_bootstrap {
-        guard::bootstrap_node(peer).map_err(anyhow::Error::msg)?;
+        logos_mcp::guard::bootstrap_node(peer).map_err(anyhow::Error::msg)?;
     }
 
     let events = Arc::new(EventStore::default());
-    spawn_watcher(
-        bin.clone(),
-        cli.config_dir.clone(),
-        "delivery_module",
-        events.clone(),
-    );
-    spawn_watcher(
-        bin.clone(),
-        cli.config_dir.clone(),
-        "storage_module",
-        events.clone(),
-    );
 
     let runner = ProcessRunner {
         bin: bin.clone(),
@@ -143,13 +127,18 @@ async fn main() -> anyhow::Result<()> {
     let settings = NodeSettings {
         preset: cli.preset,
         mode: cli.mode,
-        config_dir: cli.config_dir.map(|d| d.display().to_string()),
+        config_dir: cli.config_dir.as_ref().map(|d| d.display().to_string()),
         wallet,
         discovery_bootstrap: cli.discovery_bootstrap,
     };
     tracing::info!(logosctl = %bin.display(), ?settings, "starting logos-mcp");
 
-    let server = LogosServer::new(Logosctl::new(Arc::new(runner)), events, files, settings);
+    let node: Arc<dyn Node> =
+        Arc::new(Logosctl::new(Arc::new(runner)).with_watch(bin.clone(), cli.config_dir.clone()));
+    node.watch("delivery_module", events.clone());
+    node.watch("storage_module", events.clone());
+
+    let server = LogosServer::new(node, events, files, settings);
     let service = server
         .serve(stdio())
         .await
