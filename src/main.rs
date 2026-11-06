@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long, env = "LOGOS_MCP_WALLET_STORAGE", requires = "wallet_config")]
     wallet_storage: Option<PathBuf>,
 
+    /// Discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them.
+    #[arg(long, env = "LOGOS_MCP_DISCOVERY_BOOTSTRAP", value_delimiter = ',')]
+    discovery_bootstrap: Vec<String>,
+
     /// Timeout for each logosctl call, in seconds.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
@@ -113,6 +117,10 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
+    for peer in &cli.discovery_bootstrap {
+        guard::bootstrap_node(peer).map_err(anyhow::Error::msg)?;
+    }
+
     let events = Arc::new(EventStore::default());
     spawn_watcher(
         bin.clone(),
@@ -137,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         mode: cli.mode,
         config_dir: cli.config_dir.map(|d| d.display().to_string()),
         wallet,
+        discovery_bootstrap: cli.discovery_bootstrap,
     };
     tracing::info!(logosctl = %bin.display(), ?settings, "starting logos-mcp");
 

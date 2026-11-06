@@ -20,6 +20,9 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `wallet_status` | whether the agent wallet is open, its sequencer and the chain height |
 | `wallet_accounts` | the agent wallet's accounts with their addresses and balances in lepta |
 | `wallet_transfer` | sends lepta from one of the agent wallet's public accounts to a public account |
+| `wallet_new_account` | creates a public account in the agent wallet, for example a fresh receive address per job |
+| `discovery_advertise` / `discovery_stop` | advertises a service on the Logos discovery network, or stops |
+| `discovery_lookup` | finds nodes that advertise a service |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
@@ -92,6 +95,7 @@ Every flag also has an environment variable.
 | `--files-root` | `LOGOS_MCP_FILES_ROOT` | none | the only directory storage tools may read or write |
 | `--wallet-config` | `LOGOS_MCP_WALLET_CONFIG` | none | the agent wallet's `lez_core` config, wallet tools are off without it |
 | `--wallet-storage` | `LOGOS_MCP_WALLET_STORAGE` | none | the agent wallet's key storage |
+| `--discovery-bootstrap` | `LOGOS_MCP_DISCOVERY_BOOTSTRAP` | none | discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them |
 
 Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
 
@@ -154,6 +158,8 @@ python3 scripts/e2e.py --check storage
 ```
 
 Use `--config-dir` to point it at a separate `logosctl` session, so you don't touch the node you actually use.
+
+`scripts/demo_paid_job.py` runs a paid job between two agents. The buyer finds the provider through discovery, pays a fresh receive account the provider quotes, and gets the result back over messaging. Each side needs its own `logosctl` session and wallet. The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
 
 ## License
 

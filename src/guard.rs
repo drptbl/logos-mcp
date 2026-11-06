@@ -131,6 +131,34 @@ pub fn amount_le16_hex(lepta: &str) -> Result<String, String> {
         .collect())
 }
 
+/// A `/.../p2p/<peerId>` multiaddr as libp2p_module's `{peerId, addrs}` bootstrap entry.
+pub fn bootstrap_node(multiaddr: &str) -> Result<serde_json::Value, String> {
+    let bad =
+        || format!("bootstrap peer must be a multiaddr ending in /p2p/<peer id>: {multiaddr:?}");
+    let (addr, peer) = multiaddr.rsplit_once("/p2p/").ok_or_else(bad)?;
+    // Peer ids are base58 multihashes (12D3KooW…, 16Uiu2…, Qm…): 40 to 60 characters.
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let peer_ok = (40..=60).contains(&peer.len()) && peer.chars().all(|c| BASE58.contains(c));
+    if !addr.starts_with('/') || addr.len() < 2 || !peer_ok {
+        return Err(bad());
+    }
+    Ok(serde_json::json!({ "peerId": peer, "addrs": [addr] }))
+}
+
+/// A service id to advertise or look up: short, printable, no whitespace.
+pub fn validate_service_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(
+            "service id must be 1 to 128 characters with no whitespace, e.g. my-app/summarize/v1"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Advertisement data limit in libp2p_module's service discovery (from its error text).
+pub const MAX_AD_TAG_BYTES: usize = 33;
+
 /// The one directory storage tools may read from and write into.
 #[derive(Debug, Clone)]
 pub struct FilesRoot {

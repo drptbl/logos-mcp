@@ -180,3 +180,26 @@ fn encodes_amounts_as_16_byte_little_endian_hex() {
         assert!(amount_le16_hex(bad).is_err(), "{bad:?} should be refused");
     }
 }
+
+#[test]
+fn splits_bootstrap_multiaddrs_into_libp2p_entries() {
+    let node = bootstrap_node(
+        "/ip4/138.68.122.137/tcp/30304/p2p/16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc",
+    )
+    .unwrap();
+    assert_eq!(
+        node["peerId"],
+        "16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc"
+    );
+    assert_eq!(node["addrs"][0], "/ip4/138.68.122.137/tcp/30304");
+    for bad in [
+        "/ip4/1.2.3.4/tcp/30304",
+        "/p2p/16Uiu2",
+        "",
+        "/ip4/1.2.3.4/tcp/1/p2p/",
+        "garbage/p2p/not-a-peer",
+        "/ip4/1.2.3.4/tcp/1/p2p/0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl",
+    ] {
+        assert!(bootstrap_node(bad).is_err(), "{bad:?}");
+    }
+}
