@@ -49,6 +49,37 @@ pub fn validate_cid(cid: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A 32-byte LEZ account id (64 hex chars) in the Bitcoin base58 alphabet that
+/// `Public/<base58>` addresses use. `None` for anything that isn't such an id.
+pub fn account_id_base58(hex: &str) -> Option<String> {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if hex.len() != 64 {
+        return None;
+    }
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    // Repeated division by 58 over the big-endian number, least significant digit first.
+    let mut digits: Vec<u8> = Vec::new();
+    for &byte in &bytes {
+        let mut carry = u32::from(byte);
+        for d in digits.iter_mut() {
+            carry += u32::from(*d) << 8;
+            *d = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let zeros = bytes.iter().take_while(|&&b| b == 0).count();
+    let encoded = std::iter::repeat_n('1', zeros)
+        .chain(digits.iter().rev().map(|&d| ALPHABET[d as usize] as char))
+        .collect();
+    Some(encoded)
+}
+
 /// The one directory storage tools may read from and write into.
 #[derive(Debug, Clone)]
 pub struct FilesRoot {
