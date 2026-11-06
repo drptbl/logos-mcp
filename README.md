@@ -19,6 +19,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `rln_status` | whether the node can send right now: RLN membership state and messages left in this epoch |
 | `wallet_status` | whether the agent wallet is open, its sequencer and the chain height |
 | `wallet_accounts` | the agent wallet's accounts with their addresses and balances in lepta |
+| `wallet_transfer` | sends lepta from one of the agent wallet's public accounts to a public account |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
@@ -92,7 +93,7 @@ Every flag also has an environment variable.
 | `--wallet-config` | `LOGOS_MCP_WALLET_CONFIG` | none | the agent wallet's `lez_core` config, wallet tools are off without it |
 | `--wallet-storage` | `LOGOS_MCP_WALLET_STORAGE` | none | the agent wallet's key storage |
 
-Give the agent its own wallet with a small balance, not the one you use. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
+Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
 
 ```bash
 logosctl call lez_core create_new str:$HOME/.logos-agent/wallet_config.json str:$HOME/.logos-agent/storage.json str:
@@ -122,7 +123,8 @@ The server is the boundary between your agent and your node, so it checks what t
 - storage tools only see `--files-root`. Absolute paths, `..` and symlinks that point outside are refused, and a download never overwrites an existing file. Without `--files-root` file access is off
 - the network and node mode are fixed when you start the server. The agent can't change them
 - messages are limited to 150 KiB (the network limit) and topics must look like `/app/1/name/proto`
-- there is no tool that calls arbitrary module methods, and the wallet tools only read. They can't move funds
+- there is no tool that calls arbitrary module methods
+- `wallet_transfer` only sends from the agent wallet this server opened. If `lez_core` has another wallet open, it refuses
 - `lez_core` `0.5.1` can only open unencrypted key storage, so lock the wallet folder down (`chmod 700`)
 
 Uploaded files are announced to the network and anyone with the CID can fetch them. Don't put anything in the files root you wouldn't publish.
