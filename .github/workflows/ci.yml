@@ -31,6 +31,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # The library alone, as the Basecamp module uses it.
+      - run: cargo clippy --lib --no-default-features --locked -- -D warnings
 
   msrv:
     runs-on: ubuntu-latest

@@ -1,10 +1,11 @@
 use super::*;
+use crate::logosctl::Logosctl;
 use crate::logosctl::tests::{FakeRunner, ok as out};
 use tokio_util::sync::CancellationToken;
 
 fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
     LogosServer::new(
-        Logosctl::new(fake),
+        Arc::new(Logosctl::new(fake)),
         Arc::new(EventStore::default()),
         files,
         NodeSettings {
@@ -20,7 +21,7 @@ fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
 /// A server configured with the agent wallet at fixed (fake) paths.
 fn wallet_server(fake: Arc<FakeRunner>) -> LogosServer {
     LogosServer::new(
-        Logosctl::new(fake),
+        Arc::new(Logosctl::new(fake)),
         Arc::new(EventStore::default()),
         None,
         NodeSettings {
@@ -436,7 +437,7 @@ impl crate::logosctl::Runner for StatefulLez {
 async fn concurrent_wallet_calls_open_the_wallet_once() {
     let lez_core = Arc::new(StatefulLez::default());
     let s = LogosServer::new(
-        Logosctl::new(lez_core.clone()),
+        Arc::new(Logosctl::new(lez_core.clone())),
         Arc::new(EventStore::default()),
         None,
         wallet_server(FakeRunner::with(vec![])).settings.clone(),

@@ -214,11 +214,22 @@ fn truncate(s: &str, n: usize) -> String {
 #[derive(Clone)]
 pub struct Logosctl {
     runner: Arc<dyn Runner>,
+    /// The logosctl binary and session for `watch`. None in tests, where nothing watches.
+    watch: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 impl Logosctl {
     pub fn new(runner: Arc<dyn Runner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            watch: None,
+        }
+    }
+
+    /// Let `watch` start `logosctl watch` processes against this binary and session.
+    pub fn with_watch(mut self, bin: PathBuf, config_dir: Option<PathBuf>) -> Self {
+        self.watch = Some((bin, config_dir));
+        self
     }
 
     /// Run a non-`call` subcommand (`status`, `module ls`, ...).
@@ -259,6 +270,37 @@ impl Logosctl {
         }
         self.command(&["module", "load", module]).await?;
         Ok(true)
+    }
+}
+
+impl crate::node::Node for Logosctl {
+    fn call<'a>(
+        &'a self,
+        module: &'a str,
+        method: &'a str,
+        args: &'a [Arg],
+    ) -> crate::node::NodeFuture<'a, Value> {
+        Box::pin(Logosctl::call(self, module, method, args))
+    }
+
+    fn status(&self) -> crate::node::NodeFuture<'_, Value> {
+        Box::pin(self.command(&["status"]))
+    }
+
+    fn ensure_loaded<'a>(&'a self, module: &'a str) -> crate::node::NodeFuture<'a, bool> {
+        Box::pin(Logosctl::ensure_loaded(self, module))
+    }
+
+    fn watch(&self, module: &'static str, store: Arc<crate::events::EventStore>) {
+        match &self.watch {
+            Some((bin, config_dir)) => {
+                crate::events::spawn_watcher(bin.clone(), config_dir.clone(), module, store);
+            }
+            None => tracing::warn!(
+                module,
+                "watch requested but this Logosctl has no binary set (with_watch): no events will arrive"
+            ),
+        }
     }
 }
 
