@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeSet,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +26,7 @@ use crate::{
 const DELIVERY: &str = "delivery_module";
 const STORAGE: &str = "storage_module";
 const RLN: &str = "liblogos_rln_module";
+const LEZ: &str = "lez_core";
 const CHUNK_SIZE: i64 = 65_536;
 
 /// What the operator chose at launch. Agents cannot change these.
@@ -33,6 +35,43 @@ pub struct NodeSettings {
     pub preset: String,
     pub mode: String,
     pub config_dir: Option<String>,
+    /// The dedicated agent wallet. Wallet tools are off without it.
+    pub wallet: Option<WalletPaths>,
+}
+
+/// The open agent wallet, as `ensure_wallet` found or left it.
+struct WalletHandle {
+    sequencer: String,
+    opened_now: bool,
+    opened_by_this_server: bool,
+    accounts: Vec<Value>,
+}
+
+impl WalletHandle {
+    fn warning(&self) -> Option<&'static str> {
+        (!self.opened_by_this_server).then_some(
+            "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
+        )
+    }
+}
+
+/// The account ids in a `list_accounts` reply, for telling wallets apart.
+fn account_ids(accounts: &[Value]) -> BTreeSet<String> {
+    accounts
+        .iter()
+        .filter_map(|a| {
+            a.get("account_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Where the operator's agent wallet lives: the `lez_core` config and key storage.
+#[derive(Debug, Clone)]
+pub struct WalletPaths {
+    pub config: PathBuf,
+    pub storage: PathBuf,
 }
 
 #[derive(Clone)]
@@ -42,6 +81,9 @@ pub struct LogosServer {
     files: Option<FilesRoot>,
     settings: NodeSettings,
     subscriptions: Arc<Mutex<BTreeSet<String>>>,
+    /// Held while checking and opening the wallet. The agent wallet's account ids
+    /// once this server has opened it.
+    agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
@@ -139,6 +181,7 @@ impl LogosServer {
             files,
             settings,
             subscriptions: Arc::default(),
+            agent_accounts: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -151,6 +194,154 @@ impl LogosServer {
         self.files.as_ref().ok_or_else(|| {
             "storage file access is disabled: start the server with --files-root".to_string()
         })
+    }
+
+    fn wallet(&self) -> Result<&WalletPaths, String> {
+        self.settings.wallet.as_ref().ok_or_else(|| {
+            "wallet tools are disabled: start the server with --wallet-config and --wallet-storage"
+                .to_string()
+        })
+    }
+
+    async fn sequencer_addr(&self) -> Result<String, String> {
+        match self.ctl.call(LEZ, "get_sequencer_addr", &[]).await {
+            Ok(Value::String(s)) => Ok(s),
+            Ok(other) => Err(format!("unexpected get_sequencer_addr result: {other}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<Value>, String> {
+        match self.ctl.call(LEZ, "list_accounts", &[]).await {
+            Ok(Value::Array(list)) => Ok(list),
+            Ok(other) => Err(format!("unexpected list_accounts result: {other}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Make sure lez_core has a wallet open, opening the configured agent wallet
+    /// when none is. lez_core holds one wallet for the whole daemon, so a wallet
+    /// opened elsewhere is used as it is. It only counts as the agent wallet when
+    /// this server opened it and its accounts still match the ones seen then,
+    /// which also catches a daemon restart where another wallet was opened.
+    /// Serialized so concurrent tool calls never race to open it twice.
+    async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
+        let paths = self.wallet()?;
+        let mut agent_accounts = self.agent_accounts.lock().await;
+        let addr = self.sequencer_addr().await?;
+        if !addr.is_empty() {
+            let accounts = self.list_accounts().await?;
+            let is_agent = agent_accounts
+                .as_ref()
+                .is_some_and(|known| *known == account_ids(&accounts));
+            return Ok(WalletHandle {
+                sequencer: addr,
+                opened_now: false,
+                opened_by_this_server: is_agent,
+                accounts,
+            });
+        }
+        let args = [
+            Arg::str(paths.config.display().to_string()),
+            Arg::str(paths.storage.display().to_string()),
+        ];
+        match self.ctl.call(LEZ, "open", &args).await {
+            Ok(code) if code == json!(0) => {}
+            Ok(code) => {
+                return Err(format!(
+                    "lez_core could not open the agent wallet (code {code})"
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        let addr = self.sequencer_addr().await?;
+        if addr.is_empty() {
+            return Err("lez_core opened the wallet but reports no sequencer".into());
+        }
+        let accounts = self.list_accounts().await?;
+        *agent_accounts = Some(account_ids(&accounts));
+        Ok(WalletHandle {
+            sequencer: addr,
+            opened_now: true,
+            opened_by_this_server: true,
+            accounts,
+        })
+    }
+
+    #[tool(
+        description = "The agent wallet: whether it is open, its sequencer and the chain height."
+    )]
+    async fn wallet_status(&self) -> Result<CallToolResult, McpError> {
+        let w = match self.ensure_wallet().await {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        // lez_core reports a failed height read as 0.
+        let height = match self.ctl.call(LEZ, "get_current_block_height", &[]).await {
+            Ok(Value::Number(n)) if n.as_u64().is_some_and(|h| h > 0) => Some(n),
+            _ => None,
+        };
+        ok(json!({
+            "open": true,
+            "opened_now": w.opened_now,
+            "opened_by_this_server": w.opened_by_this_server,
+            "warning": w.warning(),
+            "sequencer": w.sequencer,
+            "block_height": height,
+        }))
+    }
+
+    #[tool(
+        description = "The agent wallet's own accounts with their addresses and balances in lepta."
+    )]
+    async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
+        let w = match self.ensure_wallet().await {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        let mut accounts = Vec::with_capacity(w.accounts.len());
+        for entry in &w.accounts {
+            let (Some(id), Some(public)) = (
+                entry.get("account_id").and_then(Value::as_str),
+                entry.get("is_public").and_then(Value::as_bool),
+            ) else {
+                continue;
+            };
+            let kind = if public { "Public" } else { "Private" };
+            let address = guard::account_id_base58(id).map(|b58| format!("{kind}/{b58}"));
+            // lez_core reports a failed balance read as an empty string, not an error.
+            let balance = match self
+                .ctl
+                .call(LEZ, "get_balance", &[Arg::str(id), Arg::Bool(public)])
+                .await
+            {
+                Ok(Value::String(b)) if !b.is_empty() => Some(b),
+                _ => None,
+            };
+            let note = match (&balance, public) {
+                (None, _) => Some("balance unavailable"),
+                (Some(_), false) => Some(
+                    "private balances only update when the wallet syncs, which this server does not do yet",
+                ),
+                _ => None,
+            };
+            accounts.push(json!({
+                "address": address,
+                "account_id": id,
+                "public": public,
+                "balance_lepta": balance,
+                "note": note,
+            }));
+        }
+        // lez_core returns an empty list both for a wallet without accounts and on failure.
+        let note = accounts
+            .is_empty()
+            .then_some("no accounts listed: either the wallet has none or listing failed");
+        ok(json!({
+            "accounts": accounts,
+            "warning": w.warning(),
+            "note": note,
+        }))
     }
 
     #[tool(

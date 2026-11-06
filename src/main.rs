@@ -13,7 +13,7 @@ use crate::{
     events::{EventStore, spawn_watcher},
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
-    server::{LogosServer, NodeSettings},
+    server::{LogosServer, NodeSettings, WalletPaths},
 };
 
 /// MCP server that lets AI agents use a running Logos node through logosctl.
@@ -39,6 +39,14 @@ struct Cli {
     /// Directory storage tools may read from and write to. Storage file access is off without it.
     #[arg(long, env = "LOGOS_MCP_FILES_ROOT")]
     files_root: Option<PathBuf>,
+
+    /// The agent wallet's lez_core config file. Wallet tools are off without it.
+    #[arg(long, env = "LOGOS_MCP_WALLET_CONFIG", requires = "wallet_storage")]
+    wallet_config: Option<PathBuf>,
+
+    /// The agent wallet's key storage file, created with `lez_core create_new`.
+    #[arg(long, env = "LOGOS_MCP_WALLET_STORAGE", requires = "wallet_config")]
+    wallet_storage: Option<PathBuf>,
 
     /// Timeout for each logosctl call, in seconds.
     #[arg(long, default_value_t = 60)]
@@ -82,6 +90,28 @@ async fn main() -> anyhow::Result<()> {
         .map(FilesRoot::new)
         .transpose()
         .context("--files-root must be an existing directory")?;
+    let wallet = match (cli.wallet_config, cli.wallet_storage) {
+        (Some(config), Some(storage)) => {
+            // The daemon opens these from its own working directory: pass absolute paths.
+            let absolute = |p: &PathBuf| {
+                let full = p
+                    .canonicalize()
+                    .ok()
+                    .filter(|p| p.is_file())
+                    .with_context(|| format!("wallet file not found: {}", p.display()))?;
+                // Paths reach lez_core as text: refuse ones that wouldn't survive that.
+                if full.to_str().is_none() {
+                    bail!("wallet path is not valid UTF-8: {}", full.display());
+                }
+                anyhow::Ok(full)
+            };
+            Some(WalletPaths {
+                config: absolute(&config)?,
+                storage: absolute(&storage)?,
+            })
+        }
+        _ => None,
+    };
 
     let events = Arc::new(EventStore::default());
     spawn_watcher(
@@ -106,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         preset: cli.preset,
         mode: cli.mode,
         config_dir: cli.config_dir.map(|d| d.display().to_string()),
+        wallet,
     };
     tracing::info!(logosctl = %bin.display(), ?settings, "starting logos-mcp");
 

@@ -95,3 +95,36 @@ fn new_file_refuses_existing_targets_and_directories() {
     let p = files.new_file("sub/fresh.bin").unwrap();
     assert!(p.starts_with(files.path()) && p.ends_with("fresh.bin"));
 }
+
+#[test]
+fn encodes_lez_account_ids_as_base58() {
+    // Expected values from lez_core's own account_id_to_base58 and an independent encoder.
+    let cases = [
+        (
+            "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f",
+            "GjgfTEYoYVFjomLH7zRzFHHGpLNEwD4iGtf53JhwSdMY",
+        ),
+        (
+            "8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1",
+            "9h9o2fwbcu7Mbuq8hzVf1UVDpMQpCdCr5ZnNVo3vTsjN",
+        ),
+        (
+            "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc",
+            "9uwkVJuXScDwLKVtQMcHFU9Hvb3uZjiEDVvDv4PYjCfM",
+        ),
+    ];
+    for (hex, b58) in cases {
+        assert_eq!(account_id_base58(hex).as_deref(), Some(b58), "{hex}");
+    }
+    assert_eq!(
+        account_id_base58("00").as_deref(),
+        None,
+        "ids are exactly 32 bytes"
+    );
+    assert_eq!(account_id_base58(&"zz".repeat(32)).as_deref(), None);
+    let zero_led = format!("00{}", "11".repeat(31));
+    assert!(
+        account_id_base58(&zero_led).unwrap().starts_with('1'),
+        "leading zero bytes become '1'"
+    );
+}

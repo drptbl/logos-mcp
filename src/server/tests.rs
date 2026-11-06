@@ -10,6 +10,25 @@ fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
             preset: "logos.dev".into(),
             mode: "Edge".into(),
             config_dir: None,
+            wallet: None,
+        },
+    )
+}
+
+/// A server configured with the agent wallet at fixed (fake) paths.
+fn wallet_server(fake: Arc<FakeRunner>) -> LogosServer {
+    LogosServer::new(
+        Logosctl::new(fake),
+        Arc::new(EventStore::default()),
+        None,
+        NodeSettings {
+            preset: "logos.test".into(),
+            mode: "Edge".into(),
+            config_dir: None,
+            wallet: Some(WalletPaths {
+                config: "/agent/wallet_config.json".into(),
+                storage: "/agent/storage.json".into(),
+            }),
         },
     )
 }
@@ -254,4 +273,237 @@ async fn rln_status_before_the_node_exists_points_to_connect() {
     assert!(is_error(&r));
     let msg = text(&r);
     assert!(msg.contains("messaging_connect"), "{msg}");
+}
+
+#[tokio::test]
+async fn wallet_tools_are_off_without_a_configured_wallet() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    for r in [
+        s.wallet_status().await.unwrap(),
+        s.wallet_accounts().await.unwrap(),
+    ] {
+        assert!(is_error(&r));
+        assert!(text(&r).contains("--wallet-config"), "{}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+fn lez(method: &str, result: &str) -> crate::logosctl::RawOutput {
+    out(&format!(
+        r#"{{"method":"{method}","module":"lez_core","result":{result},"status":"ok"}}"#
+    ))
+}
+
+#[tokio::test]
+async fn wallet_status_opens_the_configured_wallet_when_none_is_open() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""""#),
+        lez("open", "0"),
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        lez("get_current_block_height", "78065"),
+    ]);
+    let r = wallet_server(fake.clone()).wallet_status().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["open"], true);
+    assert_eq!(b["opened_now"], true);
+    assert_eq!(b["sequencer"], "https://testnet.lez.logos.co/");
+    assert_eq!(b["block_height"], 78065);
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(
+        calls[1][2..],
+        [
+            "lez_core",
+            "open",
+            "str:/agent/wallet_config.json",
+            "str:/agent/storage.json"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn wallet_accounts_lists_addresses_and_balances() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez(
+            "list_accounts",
+            r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1","is_public":false}]"#,
+        ),
+        lez("get_balance", r#""250""#),
+        // lez_core reports a failed balance read as an empty string.
+        lez("get_balance", r#""""#),
+    ]);
+    let r = wallet_server(fake.clone()).wallet_accounts().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let accounts = body(&r)["accounts"].clone();
+    assert_eq!(
+        accounts[0]["address"],
+        "Public/GjgfTEYoYVFjomLH7zRzFHHGpLNEwD4iGtf53JhwSdMY"
+    );
+    assert_eq!(accounts[0]["balance_lepta"], "250");
+    assert_eq!(
+        accounts[1]["address"],
+        "Private/9h9o2fwbcu7Mbuq8hzVf1UVDpMQpCdCr5ZnNVo3vTsjN"
+    );
+    assert_eq!(accounts[1]["balance_lepta"], Value::Null);
+    assert!(
+        accounts[1]["note"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable")
+    );
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(
+        calls[2][4..],
+        [
+            "str:e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f",
+            "true"
+        ]
+    );
+    assert_eq!(calls[3][5], "false", "private balances are read as private");
+    assert_eq!(calls.len(), 4, "addresses are encoded locally");
+    assert!(
+        calls.iter().all(|c| c[3] != "open"),
+        "an already open wallet is not reopened"
+    );
+}
+
+#[tokio::test]
+async fn wallet_tools_report_a_wallet_that_will_not_open() {
+    let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#), lez("open", "1")]);
+    let r = wallet_server(fake).wallet_accounts().await.unwrap();
+    assert!(is_error(&r));
+    assert!(
+        text(&r).contains("could not open the agent wallet"),
+        "{}",
+        text(&r)
+    );
+}
+
+/// A lez_core stand-in that keeps the "is a wallet open" state like the real
+/// module and yields before every reply, so concurrent tool calls interleave.
+#[derive(Default)]
+struct StatefulLez {
+    open: std::sync::atomic::AtomicBool,
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::logosctl::Runner for StatefulLez {
+    fn run(&self, args: Vec<String>) -> crate::logosctl::RunFuture<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            let result = match args[3].as_str() {
+                "get_sequencer_addr" if self.open.load(SeqCst) => {
+                    r#""https://testnet.lez.logos.co/""#
+                }
+                "get_sequencer_addr" => r#""""#,
+                "open" => {
+                    self.opens.fetch_add(1, SeqCst);
+                    // The real module refuses a second open with INTERNAL_ERROR.
+                    if self.open.swap(true, SeqCst) {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                }
+                "get_current_block_height" => "78065",
+                "list_accounts" => AGENT_ACCOUNTS,
+                other => panic!("unexpected call {other}"),
+            };
+            Ok(lez(&args[3], result))
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_wallet_calls_open_the_wallet_once() {
+    let lez_core = Arc::new(StatefulLez::default());
+    let s = LogosServer::new(
+        Logosctl::new(lez_core.clone()),
+        Arc::new(EventStore::default()),
+        None,
+        wallet_server(FakeRunner::with(vec![])).settings.clone(),
+    );
+    let (a, b) = tokio::join!(s.wallet_status(), s.wallet_status());
+    for r in [a.unwrap(), b.unwrap()] {
+        assert!(!is_error(&r), "{}", text(&r));
+    }
+    assert_eq!(lez_core.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn wallet_status_warns_about_a_wallet_opened_elsewhere() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        lez("get_current_block_height", "78065"),
+    ]);
+    let b = body(&wallet_server(fake).wallet_status().await.unwrap());
+    assert_eq!(b["opened_by_this_server"], false);
+    assert!(
+        b["warning"]
+            .as_str()
+            .unwrap()
+            .contains("may not be the agent wallet")
+    );
+}
+
+const AGENT_ACCOUNTS: &str = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true}]"#;
+const OTHER_ACCOUNTS: &str = r#"[{"account_id":"846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc","is_public":true}]"#;
+
+#[tokio::test]
+async fn a_wallet_swapped_after_opening_is_flagged_in_both_tools() {
+    let fake = FakeRunner::with(vec![
+        // first call: nothing open, the server opens the agent wallet and remembers its accounts
+        lez("get_sequencer_addr", r#""""#),
+        lez("open", "0"),
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        lez("get_current_block_height", "78065"),
+        // later the daemon restarted and someone else opened a different wallet
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_balance", r#""95212392""#),
+    ]);
+    let s = wallet_server(fake);
+    let first = body(&s.wallet_status().await.unwrap());
+    assert_eq!(first["opened_by_this_server"], true);
+    assert_eq!(first["warning"], Value::Null);
+    let later = body(&s.wallet_accounts().await.unwrap());
+    assert!(
+        later["warning"]
+            .as_str()
+            .unwrap()
+            .contains("may not be the agent wallet"),
+        "{later}"
+    );
+}
+
+#[tokio::test]
+async fn zero_height_and_empty_account_lists_are_not_taken_as_data() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", "[]"),
+        lez("get_current_block_height", "0"),
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", "[]"),
+    ]);
+    let s = wallet_server(fake);
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(
+        status["block_height"],
+        Value::Null,
+        "lez_core returns 0 when it cannot read the height"
+    );
+    let accounts = body(&s.wallet_accounts().await.unwrap());
+    assert!(
+        accounts["note"]
+            .as_str()
+            .unwrap()
+            .contains("listing failed"),
+        "{accounts}"
+    );
 }
