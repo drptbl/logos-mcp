@@ -80,6 +80,57 @@ pub fn account_id_base58(hex: &str) -> Option<String> {
     Some(encoded)
 }
 
+/// The 64-char lowercase hex id of a public LEZ account given as
+/// `Public/<base58>` or as hex. Private accounts are refused.
+pub fn public_account_hex(input: &str) -> Result<String, String> {
+    if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(input.to_ascii_lowercase());
+    }
+    let Some(b58) = input.strip_prefix("Public/") else {
+        return Err("give a public account as Public/<base58> or as 64 hex characters".into());
+    };
+    const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    // Repeated multiply-by-58 into a big-endian byte buffer, least significant byte first.
+    let mut bytes: Vec<u8> = Vec::new();
+    for c in b58.chars() {
+        let mut carry = ALPHABET
+            .find(c)
+            .ok_or("account address is not valid base58")? as u32;
+        for b in bytes.iter_mut() {
+            carry += u32::from(*b) * 58;
+            *b = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 {
+            bytes.push((carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let zeros = b58.chars().take_while(|&c| c == '1').count();
+    bytes.extend(std::iter::repeat_n(0, zeros));
+    if bytes.len() != 32 {
+        return Err("account address must decode to 32 bytes".into());
+    }
+    Ok(bytes.iter().rev().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A positive amount in lepta, given as a decimal string, encoded the way
+/// `lez_core` takes it: 16 bytes little-endian as 32 hex characters.
+pub fn amount_le16_hex(lepta: &str) -> Result<String, String> {
+    if lepta.is_empty() || !lepta.chars().all(|c| c.is_ascii_digit()) {
+        return Err("amount must be a whole number of lepta, as digits".into());
+    }
+    let amount: u128 = lepta.parse().map_err(|_| "amount is too large")?;
+    if amount == 0 {
+        return Err("amount must be more than 0".into());
+    }
+    Ok(amount
+        .to_le_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
 /// The one directory storage tools may read from and write into.
 #[derive(Debug, Clone)]
 pub struct FilesRoot {

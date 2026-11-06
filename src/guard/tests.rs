@@ -128,3 +128,55 @@ fn encodes_lez_account_ids_as_base58() {
         "leading zero bytes become '1'"
     );
 }
+
+#[test]
+fn parses_public_recipients_to_account_hex() {
+    let hex = "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc";
+    assert_eq!(
+        public_account_hex("Public/9uwkVJuXScDwLKVtQMcHFU9Hvb3uZjiEDVvDv4PYjCfM").as_deref(),
+        Ok(hex)
+    );
+    assert_eq!(
+        public_account_hex(hex).as_deref(),
+        Ok(hex),
+        "hex ids pass through"
+    );
+    assert_eq!(
+        public_account_hex(&hex.to_uppercase()).as_deref(),
+        Ok(hex),
+        "hex is normalised to lowercase"
+    );
+    assert!(public_account_hex("Private/9uwkVJuXScDwLKVtQMcHFU9Hvb3uZjiEDVvDv4PYjCfM").is_err());
+    assert!(public_account_hex("Public/0OIl").is_err(), "not base58");
+    assert!(public_account_hex("Public/9uwk").is_err(), "not 32 bytes");
+    assert!(public_account_hex("").is_err());
+}
+
+#[test]
+fn encodes_amounts_as_16_byte_little_endian_hex() {
+    // 100,000,000 lepta (one faucet claim) = 0x05f5e100
+    assert_eq!(
+        amount_le16_hex("100000000").as_deref(),
+        Ok("00e1f505000000000000000000000000")
+    );
+    assert_eq!(
+        amount_le16_hex("1").as_deref(),
+        Ok("01000000000000000000000000000000")
+    );
+    assert_eq!(
+        amount_le16_hex("340282366920938463463374607431768211455").as_deref(),
+        Ok("ffffffffffffffffffffffffffffffff"),
+        "u128::MAX"
+    );
+    for bad in [
+        "0",
+        "",
+        "-5",
+        "1.5",
+        "1e9",
+        " 10",
+        "340282366920938463463374607431768211456",
+    ] {
+        assert!(amount_le16_hex(bad).is_err(), "{bad:?} should be refused");
+    }
+}

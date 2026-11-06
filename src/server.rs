@@ -16,6 +16,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     events::EventStore,
@@ -52,6 +53,30 @@ impl WalletHandle {
         (!self.opened_by_this_server).then_some(
             "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
         )
+    }
+}
+
+/// What a `transfer_public` reply proves. Only an explained refusal proves nothing
+/// was sent, so anything else that isn't a clean submission is unknown.
+#[derive(Debug)]
+enum TransferOutcome {
+    Submitted(String),
+    Refused(String),
+    Unknown(String),
+}
+
+impl TransferOutcome {
+    fn read(result: &Value) -> Self {
+        let success = result.get("success").and_then(Value::as_bool);
+        let tx_hash = result.get("tx_hash").and_then(Value::as_str).unwrap_or("");
+        let error = result.get("error").and_then(Value::as_str).unwrap_or("");
+        match success {
+            Some(true) if !tx_hash.is_empty() => Self::Submitted(tx_hash.to_string()),
+            Some(false) if !error.is_empty() && tx_hash.is_empty() => {
+                Self::Refused(error.to_string())
+            }
+            _ => Self::Unknown(format!("unexpected transfer_public result: {result}")),
+        }
     }
 }
 
@@ -118,6 +143,16 @@ pub struct ReadParams {
     pub after_seq: Option<u64>,
     /// Max messages to return (default 50, max 256).
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TransferParams {
+    /// One of the agent wallet's public accounts, as wallet_accounts lists it (Public/<base58>).
+    pub from: String,
+    /// Recipient public account, Public/<base58> or 64 hex characters.
+    pub to: String,
+    /// Amount in lepta as a decimal string (1 LEZ = 1,000,000,000 lepta).
+    pub amount_lepta: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -211,6 +246,29 @@ impl LogosServer {
         }
     }
 
+    /// The daemon's pid and lez_core's uptime, to tell whether either restarted.
+    async fn lez_instance(&self) -> Result<(u64, u64), String> {
+        let status = self
+            .ctl
+            .command(&["status"])
+            .await
+            .map_err(|e| e.to_string())?;
+        let pid = status.pointer("/daemon/pid").and_then(Value::as_u64);
+        let uptime = status
+            .get("modules")
+            .and_then(Value::as_array)
+            .and_then(|m| {
+                m.iter()
+                    .find(|m| m.get("name").and_then(Value::as_str) == Some(LEZ))
+            })
+            .and_then(|m| m.get("uptime_seconds"))
+            .and_then(Value::as_u64);
+        match (pid, uptime) {
+            (Some(pid), Some(uptime)) => Ok((pid, uptime)),
+            _ => Err("could not read the daemon and lez_core status".into()),
+        }
+    }
+
     async fn list_accounts(&self) -> Result<Vec<Value>, String> {
         match self.ctl.call(LEZ, "list_accounts", &[]).await {
             Ok(Value::Array(list)) => Ok(list),
@@ -226,8 +284,17 @@ impl LogosServer {
     /// which also catches a daemon restart where another wallet was opened.
     /// Serialized so concurrent tool calls never race to open it twice.
     async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
-        let paths = self.wallet()?;
         let mut agent_accounts = self.agent_accounts.lock().await;
+        self.ensure_wallet_locked(&mut agent_accounts).await
+    }
+
+    /// `ensure_wallet` for a caller that already holds the wallet lock and keeps it,
+    /// so a transfer's wallet check and its send happen as one step.
+    async fn ensure_wallet_locked(
+        &self,
+        agent_accounts: &mut Option<BTreeSet<String>>,
+    ) -> Result<WalletHandle, String> {
+        let paths = self.wallet()?;
         let addr = self.sequencer_addr().await?;
         if !addr.is_empty() {
             let accounts = self.list_accounts().await?;
@@ -241,6 +308,7 @@ impl LogosServer {
                 accounts,
             });
         }
+        let before = self.lez_instance().await?;
         let args = [
             Arg::str(paths.config.display().to_string()),
             Arg::str(paths.storage.display().to_string()),
@@ -259,6 +327,14 @@ impl LogosServer {
             return Err("lez_core opened the wallet but reports no sequencer".into());
         }
         let accounts = self.list_accounts().await?;
+        // The listing must come from the wallet just opened: a daemon or lez_core
+        // restart in between could leave someone else's wallet open instead.
+        let after = self.lez_instance().await?;
+        if after.0 != before.0 || after.1 < before.1 {
+            return Err(
+                "lez_core restarted while the agent wallet was being opened; try again".into(),
+            );
+        }
         *agent_accounts = Some(account_ids(&accounts));
         Ok(WalletHandle {
             sequencer: addr,
@@ -625,6 +701,95 @@ impl LogosServer {
                 Err(e) => json!({ "error": e.to_string() }),
             },
             "epoch_seconds": rln.get("epochSizeSec"),
+        }))
+    }
+
+    #[tool(
+        description = "Send lepta from one of the agent wallet's public accounts to a public account. The wallet's balance is the only limit. Returns the transaction hash once submitted, not confirmed: check wallet_accounts for the new balances."
+    )]
+    async fn wallet_transfer(
+        &self,
+        ct: CancellationToken,
+        Parameters(p): Parameters<TransferParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let to = match guard::public_account_hex(&p.to) {
+            Ok(hex) => hex,
+            Err(e) => return fail(format!("recipient: {e}")),
+        };
+        let amount = match guard::amount_le16_hex(&p.amount_lepta) {
+            Ok(hex) => hex,
+            Err(e) => return fail(e),
+        };
+        let from = match guard::public_account_hex(&p.from) {
+            Ok(hex) => hex,
+            Err(e) => return fail(format!("sender: {e}")),
+        };
+        // Held until the send returns: one transfer at a time, checked and sent as one step.
+        // rmcp only signals a cancelled request, it keeps running the handler, so a
+        // transfer queued behind another must notice the cancel itself.
+        let mut agent_accounts = tokio::select! {
+            guard = self.agent_accounts.lock() => guard,
+            () = ct.cancelled() => return fail("transfer cancelled before sending: nothing was sent"),
+        };
+        let w = match self.ensure_wallet_locked(&mut agent_accounts).await {
+            Ok(w) => w,
+            Err(e) => return fail(e),
+        };
+        if !w.opened_by_this_server {
+            return fail(
+                "refusing to send: the wallet open in lez_core is not the agent wallet this server opened",
+            );
+        }
+        let sender_is_ours = w.accounts.iter().any(|a| {
+            a.get("account_id").and_then(Value::as_str) == Some(from.as_str())
+                && a.get("is_public").and_then(Value::as_bool) == Some(true)
+        });
+        if !sender_is_ours {
+            return fail(
+                "sender must be one of the agent wallet's public accounts (see wallet_accounts)",
+            );
+        }
+        if from == to {
+            return fail("sender and recipient are the same account");
+        }
+        if ct.is_cancelled() {
+            return fail("transfer cancelled before sending: nothing was sent");
+        }
+        let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
+        let outcome = match self.ctl.call(LEZ, "transfer_public", &args).await {
+            Ok(v) => TransferOutcome::read(&embedded_json(v)),
+            Err(e) => TransferOutcome::Unknown(e.to_string()),
+        };
+        // An audit line on stderr for every transfer the agent attempts.
+        tracing::info!(target: "logos_mcp::transfer", from = %p.from, to = %p.to, amount_lepta = %p.amount_lepta, ?outcome, "wallet_transfer");
+        let tx_hash = match outcome {
+            TransferOutcome::Submitted(tx_hash) => tx_hash,
+            TransferOutcome::Unknown(detail) => {
+                return fail(format!(
+                    "outcome unknown: the transfer may have been sent. Inclusion can take several minutes, so watch wallet_accounts over a few blocks before retrying ({detail})"
+                ));
+            }
+            TransferOutcome::Refused(reason) => {
+                // lez_core says it refused and gives no transaction hash.
+                // lez_core only reports a numeric code, and its numbering has changed
+                // upstream, so a code is only named on the version it was confirmed on.
+                let confirmed =
+                    self.ctl.call(LEZ, "version", &[]).await.ok() == Some(json!("0.5.1"));
+                let hint = if confirmed && reason.ends_with("wallet FFI error 9") {
+                    " (insufficient funds: the sender can't cover the amount and fee)"
+                } else {
+                    ""
+                };
+                return fail(format!("transfer not sent: {reason}{hint}"));
+            }
+        };
+        ok(json!({
+            "submitted": true,
+            "tx_hash": tx_hash,
+            "from": p.from,
+            "to": p.to,
+            "amount_lepta": p.amount_lepta,
+            "note": "submitted, not yet confirmed: inclusion can take several minutes, then wallet_accounts shows the new balances",
         }))
     }
 

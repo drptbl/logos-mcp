@@ -1,5 +1,6 @@
 use super::*;
 use crate::logosctl::tests::{FakeRunner, ok as out};
+use tokio_util::sync::CancellationToken;
 
 fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
     LogosServer::new(
@@ -299,9 +300,11 @@ fn lez(method: &str, result: &str) -> crate::logosctl::RawOutput {
 async fn wallet_status_opens_the_configured_wallet_when_none_is_open() {
     let fake = FakeRunner::with(vec![
         lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
         lez("open", "0"),
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", AGENT_ACCOUNTS),
+        daemon_status(80675, 301),
         lez("get_current_block_height", "78065"),
     ]);
     let r = wallet_server(fake.clone()).wallet_status().await.unwrap();
@@ -313,7 +316,7 @@ async fn wallet_status_opens_the_configured_wallet_when_none_is_open() {
     assert_eq!(b["block_height"], 78065);
     let calls = fake.calls.lock().unwrap();
     assert_eq!(
-        calls[1][2..],
+        calls[2][2..],
         [
             "lez_core",
             "open",
@@ -365,14 +368,20 @@ async fn wallet_accounts_lists_addresses_and_balances() {
     assert_eq!(calls[3][5], "false", "private balances are read as private");
     assert_eq!(calls.len(), 4, "addresses are encoded locally");
     assert!(
-        calls.iter().all(|c| c[3] != "open"),
+        calls
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("open")),
         "an already open wallet is not reopened"
     );
 }
 
 #[tokio::test]
 async fn wallet_tools_report_a_wallet_that_will_not_open() {
-    let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#), lez("open", "1")]);
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
+        lez("open", "1"),
+    ]);
     let r = wallet_server(fake).wallet_accounts().await.unwrap();
     assert!(is_error(&r));
     assert!(
@@ -395,6 +404,9 @@ impl crate::logosctl::Runner for StatefulLez {
         use std::sync::atomic::Ordering::SeqCst;
         Box::pin(async move {
             tokio::task::yield_now().await;
+            if args[1] == "status" {
+                return Ok(daemon_status(1, 10));
+            }
             let result = match args[3].as_str() {
                 "get_sequencer_addr" if self.open.load(SeqCst) => {
                     r#""https://testnet.lez.logos.co/""#
@@ -459,9 +471,11 @@ async fn a_wallet_swapped_after_opening_is_flagged_in_both_tools() {
     let fake = FakeRunner::with(vec![
         // first call: nothing open, the server opens the agent wallet and remembers its accounts
         lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
         lez("open", "0"),
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", AGENT_ACCOUNTS),
+        daemon_status(80675, 301),
         lez("get_current_block_height", "78065"),
         // later the daemon restarted and someone else opened a different wallet
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
@@ -506,4 +520,281 @@ async fn zero_height_and_empty_account_lists_are_not_taken_as_data() {
             .contains("listing failed"),
         "{accounts}"
     );
+}
+
+const AGENT_FROM: &str = "Public/GjgfTEYoYVFjomLH7zRzFHHGpLNEwD4iGtf53JhwSdMY";
+const RLN_PAYER: &str = "Public/9uwkVJuXScDwLKVtQMcHFU9Hvb3uZjiEDVvDv4PYjCfM";
+
+fn transfer(from: &str, to: &str, amount: &str) -> Parameters<TransferParams> {
+    Parameters(TransferParams {
+        from: from.into(),
+        to: to.into(),
+        amount_lepta: amount.into(),
+    })
+}
+
+/// Replies for a first wallet call where the server opens the agent wallet itself.
+fn opened_by_server() -> Vec<crate::logosctl::RawOutput> {
+    vec![
+        lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
+        lez("open", "0"),
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        daemon_status(80675, 301),
+    ]
+}
+
+#[tokio::test]
+async fn transfer_sends_from_the_agent_wallet_with_encoded_arguments() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"aa11\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "100000000"),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["submitted"], true);
+    assert_eq!(b["tx_hash"], "aa11");
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(
+        calls[6][2..],
+        [
+            "lez_core",
+            "transfer_public",
+            "str:e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f",
+            "str:846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc",
+            "str:00e1f505000000000000000000000000",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn transfer_refuses_a_wallet_this_server_did_not_open() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+    ]);
+    let r = wallet_server(fake.clone())
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("not the agent wallet"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn transfer_refuses_bad_input_without_sending() {
+    let private_to = "Private/9h9o2fwbcu7Mbuq8hzVf1UVDpMQpCdCr5ZnNVo3vTsjN";
+    let foreign_from = RLN_PAYER; // a real public account, but not one of the agent wallet's
+    for (from, to, amount) in [
+        (AGENT_FROM, RLN_PAYER, "0"),
+        (AGENT_FROM, RLN_PAYER, "1.5"),
+        (AGENT_FROM, private_to, "1"),
+        (AGENT_FROM, "Public/xyz", "1"),
+        (foreign_from, AGENT_FROM, "1"),
+    ] {
+        let fake = FakeRunner::with(opened_by_server());
+        let r = wallet_server(fake.clone())
+            .wallet_transfer(CancellationToken::new(), transfer(from, to, amount))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{from} -> {to} {amount}");
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| c.get(3).map(String::as_str) != Some("transfer_public")),
+            "{from} -> {to} {amount} must not send"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transfer_reports_a_refusal_from_lez_core() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"transfer_public: wallet FFI error 5\",\"success\":false,\"tx_hash\":\"\"}""#,
+    ));
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("wallet FFI error 5"), "{}", text(&r));
+    assert!(text(&r).contains("not sent"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_timed_out_transfer_is_reported_as_unknown_not_failed() {
+    let mut replies = opened_by_server();
+    // Shape recorded from a real lez_core timeout (logosctl exits 4).
+    replies.push(crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"METHOD_FAILED","error":{"code":"timeout","message":"call to 'lez_core.transfer_public' timed out after 20000ms","origin":"lez_core"},"message":"Call to lez_core.transfer_public failed (timeout)","status":"error"}"#.into(),
+        stderr: String::new(),
+    });
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    let msg = text(&r);
+    assert!(msg.contains("may have been sent"), "{msg}");
+    assert!(msg.contains("before retrying"), "{msg}");
+}
+
+#[tokio::test]
+async fn insufficient_funds_is_named_for_the_agent() {
+    let mut replies = opened_by_server();
+    // Recorded live: lez_core 0.5.1 returns code 9 when the sender can't cover the amount.
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"transfer_public: wallet FFI error 9\",\"success\":false,\"tx_hash\":\"\"}""#,
+    ));
+    replies.push(lez("version", r#""0.5.1""#));
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("insufficient funds"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn the_error_9_hint_is_only_given_on_the_confirmed_lez_core_version() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"transfer_public: wallet FFI error 9\",\"success\":false,\"tx_hash\":\"\"}""#,
+    ));
+    replies.push(lez("version", r#""0.6.0""#));
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("not sent"), "{}", text(&r));
+    assert!(!text(&r).contains("insufficient funds"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn transfer_outcomes_that_prove_nothing_are_unknown_not_failed() {
+    let rpc_failed = crate::logosctl::RawOutput {
+        code: 4,
+        // Seen live while lez_core was busy.
+        stdout: r#"{"code":"RPC_FAILED","message":"callModuleMethod('lez_core','transfer_public') RPC call failed.","status":"error"}"#.into(),
+        stderr: String::new(),
+    };
+    let empty_hash = lez(
+        "transfer_public",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"\"}""#,
+    );
+    let unparsable = lez("transfer_public", r#""ok""#);
+    for reply in [rpc_failed, empty_hash, unparsable] {
+        let mut replies = opened_by_server();
+        replies.push(reply);
+        let r = wallet_server(FakeRunner::with(replies))
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1"),
+            )
+            .await
+            .unwrap();
+        assert!(is_error(&r));
+        assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+    }
+}
+
+#[tokio::test]
+async fn sending_to_the_same_account_is_refused() {
+    let fake = FakeRunner::with(opened_by_server());
+    let r = wallet_server(fake.clone())
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, AGENT_FROM, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+fn daemon_status(pid: u32, lez_uptime: u64) -> crate::logosctl::RawOutput {
+    out(&format!(
+        r#"{{"daemon":{{"pid":{pid},"status":"running","version":"1.0.0"}},"modules":[{{"name":"lez_core","status":"loaded","uptime_seconds":{lez_uptime},"version":"0.5.1"}}],"modules_summary":{{"crashed":0,"loaded":12,"not_loaded":0}}}}"#
+    ))
+}
+
+#[tokio::test]
+async fn a_cancelled_transfer_never_sends() {
+    let fake = FakeRunner::with(opened_by_server());
+    let ct = CancellationToken::new();
+    ct.cancel();
+    let r = wallet_server(fake.clone())
+        .wallet_transfer(ct, transfer(AGENT_FROM, RLN_PAYER, "1"))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("cancelled"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn a_restart_between_open_and_listing_is_not_trusted() {
+    for after in [daemon_status(99999, 400), daemon_status(80675, 2)] {
+        let fake = FakeRunner::with(vec![
+            lez("get_sequencer_addr", r#""""#),
+            daemon_status(80675, 300),
+            lez("open", "0"),
+            lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+            lez("list_accounts", OTHER_ACCOUNTS),
+            after,
+        ]);
+        let r = wallet_server(fake).wallet_status().await.unwrap();
+        assert!(is_error(&r));
+        assert!(text(&r).contains("restarted"), "{}", text(&r));
+    }
 }
