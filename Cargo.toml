@@ -1,0 +1,27 @@
+[package]
+name = "logos-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MCP server that lets AI agents use a running Logos node: messaging, storage and node status"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/drptbl/logos-mcp"
+readme = "README.md"
+keywords = ["mcp", "logos", "ai-agents", "p2p", "privacy"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

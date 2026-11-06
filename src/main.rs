@@ -1,0 +1,119 @@
+mod events;
+mod guard;
+mod logosctl;
+mod server;
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use anyhow::{Context, bail};
+use clap::Parser;
+use rmcp::{ServiceExt, transport::stdio};
+
+use crate::{
+    events::{EventStore, spawn_watcher},
+    guard::FilesRoot,
+    logosctl::{Logosctl, ProcessRunner},
+    server::{LogosServer, NodeSettings},
+};
+
+/// MCP server that lets AI agents use a running Logos node through logosctl.
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Cli {
+    /// Path to the logosctl binary (default: logosctl on PATH, then ~/.local/logosctl/bin/logosctl).
+    #[arg(long, env = "LOGOS_MCP_LOGOSCTL")]
+    logosctl: Option<PathBuf>,
+
+    /// logosctl session directory (default: logosctl's own default, ~/.logosctl).
+    #[arg(long, env = "LOGOSCTL_CONFIG_DIR")]
+    config_dir: Option<PathBuf>,
+
+    /// Messaging network preset: logos.test (RLN on) or logos.dev (RLN off).
+    #[arg(long, env = "LOGOS_MCP_PRESET", default_value = "logos.test")]
+    preset: String,
+
+    /// Messaging node mode: Edge (light node) or Core (relay node).
+    #[arg(long, env = "LOGOS_MCP_MODE", default_value = "Edge", value_parser = ["Edge", "Core"])]
+    mode: String,
+
+    /// Directory storage tools may read from and write to. Storage file access is off without it.
+    #[arg(long, env = "LOGOS_MCP_FILES_ROOT")]
+    files_root: Option<PathBuf>,
+
+    /// Timeout for each logosctl call, in seconds.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+}
+
+fn find_logosctl() -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("logosctl"))
+            .find(|p| p.is_file())
+    });
+    on_path.or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let p = PathBuf::from(home).join(".local/logosctl/bin/logosctl");
+        p.is_file().then_some(p)
+    })
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // stdout is the MCP channel: logs must go to stderr.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "logos_mcp=info".into()),
+        )
+        .with_ansi(false)
+        .init();
+
+    let cli = Cli::parse();
+    let bin = match cli.logosctl.or_else(find_logosctl) {
+        Some(b) if b.is_file() => b,
+        Some(b) => bail!("logosctl not found at {}", b.display()),
+        None => bail!("logosctl not found; pass --logosctl or set LOGOS_MCP_LOGOSCTL"),
+    };
+    let files = cli
+        .files_root
+        .as_deref()
+        .map(FilesRoot::new)
+        .transpose()
+        .context("--files-root must be an existing directory")?;
+
+    let events = Arc::new(EventStore::default());
+    spawn_watcher(
+        bin.clone(),
+        cli.config_dir.clone(),
+        "delivery_module",
+        events.clone(),
+    );
+    spawn_watcher(
+        bin.clone(),
+        cli.config_dir.clone(),
+        "storage_module",
+        events.clone(),
+    );
+
+    let runner = ProcessRunner {
+        bin: bin.clone(),
+        config_dir: cli.config_dir.clone(),
+        timeout: Duration::from_secs(cli.timeout_secs),
+    };
+    let settings = NodeSettings {
+        preset: cli.preset,
+        mode: cli.mode,
+        config_dir: cli.config_dir.map(|d| d.display().to_string()),
+    };
+    tracing::info!(logosctl = %bin.display(), ?settings, "starting logos-mcp");
+
+    let server = LogosServer::new(Logosctl::new(Arc::new(runner)), events, files, settings);
+    let service = server
+        .serve(stdio())
+        .await
+        .context("MCP handshake failed")?;
+    service.waiting().await?;
+    Ok(())
+}

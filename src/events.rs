@@ -1,0 +1,445 @@
+//! Event intake: one long-lived `logosctl watch <module>` per module, parsed
+//! into bounded in-memory buffers the tools read from.
+//!
+//! Events are NDJSON lines shaped `{"data":{"arg0":..},"event","module","timestamp"}`
+//! with positional `argN` fields per event. Messages that arrive while a
+//! watcher is restarting are not replayed (a known v1 gap).
+
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::Serialize;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+pub const MAX_MESSAGES_PER_TOPIC: usize = 256;
+pub const MAX_TRACKED_SENDS: usize = 1024;
+pub const MAX_TRACKED_TRANSFERS: usize = 256;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReceivedMessage {
+    pub seq: u64,
+    pub hash: String,
+    pub topic: String,
+    /// The payload as text when it is valid UTF-8.
+    pub text: Option<String>,
+    pub payload_base64: String,
+    pub source: String,
+    pub timestamp_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SendStatus {
+    pub message_hash: Option<String>,
+    pub queued: bool,
+    pub sent: bool,
+    pub propagated: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Transfer {
+    pub kind: String,
+    pub done: bool,
+    pub success: Option<bool>,
+    pub cid: Option<String>,
+    pub bytes: Option<u64>,
+    pub total: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+struct Inner {
+    next_seq: u64,
+    topics: HashMap<String, VecDeque<ReceivedMessage>>,
+    sends: HashMap<String, SendStatus>,
+    send_order: VecDeque<String>,
+    transfers: HashMap<String, Transfer>,
+    transfer_order: VecDeque<String>,
+}
+
+#[derive(Default)]
+pub struct EventStore {
+    inner: Mutex<Inner>,
+}
+
+fn arg(data: &Value, i: usize) -> Option<&Value> {
+    data.get(format!("arg{i}"))
+}
+
+fn arg_str(data: &Value, i: usize) -> Option<String> {
+    arg(data, i).and_then(Value::as_str).map(str::to_string)
+}
+
+fn decode_bytes(v: &Value) -> Option<Vec<u8>> {
+    let b = v.get("_bytes")?.as_str()?;
+    URL_SAFE_NO_PAD.decode(b.trim_end_matches('=')).ok()
+}
+
+/// Evict the oldest key once a tracked map grows past its cap.
+fn track<T: Default>(
+    map: &mut HashMap<String, T>,
+    order: &mut VecDeque<String>,
+    key: &str,
+    cap: usize,
+) {
+    if !map.contains_key(key) {
+        map.insert(key.to_string(), T::default());
+        order.push_back(key.to_string());
+        while order.len() > cap {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
+}
+
+impl EventStore {
+    /// Parse one NDJSON line and apply it. Unknown or malformed lines are ignored.
+    pub fn ingest_line(&self, line: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            return;
+        };
+        let (Some(event), Some(data)) = (v.get("event").and_then(Value::as_str), v.get("data"))
+        else {
+            return;
+        };
+        self.apply(event, data);
+    }
+
+    fn apply(&self, event: &str, data: &Value) {
+        let mut s = self.inner.lock().unwrap();
+        let s = &mut *s;
+        match event {
+            "messageReceived" => {
+                let (Some(hash), Some(topic)) = (arg_str(data, 0), arg_str(data, 1)) else {
+                    return;
+                };
+                // The same message can arrive more than once (several delivery
+                // paths, repeated subscriptions); keep the first copy only.
+                if s.topics
+                    .get(&topic)
+                    .is_some_and(|q| q.iter().any(|m| m.hash == hash))
+                {
+                    return;
+                }
+                let payload = arg(data, 2).and_then(decode_bytes).unwrap_or_default();
+                s.next_seq += 1;
+                let msg = ReceivedMessage {
+                    seq: s.next_seq,
+                    hash,
+                    text: String::from_utf8(payload.clone()).ok(),
+                    payload_base64: base64::engine::general_purpose::STANDARD.encode(&payload),
+                    source: arg_str(data, 3).unwrap_or_default(),
+                    timestamp_ns: arg(data, 4).and_then(Value::as_i64),
+                    topic: topic.clone(),
+                };
+                let q = s.topics.entry(topic).or_default();
+                q.push_back(msg);
+                while q.len() > MAX_MESSAGES_PER_TOPIC {
+                    q.pop_front();
+                }
+            }
+            "messageQueued" | "messageSent" | "messagePropagated" | "messageError" => {
+                let Some(id) = arg_str(data, 0) else { return };
+                track(&mut s.sends, &mut s.send_order, &id, MAX_TRACKED_SENDS);
+                let st = s.sends.get_mut(&id).expect("just tracked");
+                if let Some(h) = arg_str(data, 1) {
+                    st.message_hash = Some(h);
+                }
+                match event {
+                    "messageQueued" => st.queued = true,
+                    "messageSent" => st.sent = true,
+                    "messagePropagated" => st.propagated = true,
+                    _ => {
+                        st.error = Some(arg_str(data, 2).unwrap_or_else(|| "unknown error".into()))
+                    }
+                }
+            }
+            "storageUploadProgress"
+            | "storageUploadDone"
+            | "storageDownloadProgress"
+            | "storageDownloadDone" => {
+                // Storage events carry a single JSON-encoded string payload.
+                let Some(p) = arg_str(data, 0).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                else {
+                    return;
+                };
+                let Some(id) = p.get("sessionId").and_then(Value::as_str) else {
+                    return;
+                };
+                track(
+                    &mut s.transfers,
+                    &mut s.transfer_order,
+                    id,
+                    MAX_TRACKED_TRANSFERS,
+                );
+                let t = s.transfers.get_mut(id).expect("just tracked");
+                t.kind = if event.contains("Upload") {
+                    "upload"
+                } else {
+                    "download"
+                }
+                .into();
+                if let Some(b) = p.get("bytes").and_then(Value::as_u64) {
+                    t.bytes = Some(b);
+                }
+                if let Some(total) = p.get("total").and_then(Value::as_u64) {
+                    t.total = Some(total);
+                }
+                if let Some(cid) = p.get("cid").and_then(Value::as_str) {
+                    t.cid = Some(cid.into());
+                }
+                if let Some(e) = p.get("error").and_then(Value::as_str) {
+                    t.error = Some(e.into());
+                }
+                if event.ends_with("Done") {
+                    t.done = true;
+                    t.success = p.get("success").and_then(Value::as_bool);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Start tracking a transfer the moment its session id is known, so a
+    /// status query before the first event reports "in progress", not unknown.
+    pub fn expect_transfer(&self, session_id: &str, kind: &str) {
+        let mut s = self.inner.lock().unwrap();
+        let s = &mut *s;
+        track(
+            &mut s.transfers,
+            &mut s.transfer_order,
+            session_id,
+            MAX_TRACKED_TRANSFERS,
+        );
+        let t = s.transfers.get_mut(session_id).expect("just tracked");
+        if t.kind.is_empty() {
+            t.kind = kind.into();
+        }
+    }
+
+    /// Forget any earlier transfer under `session_id` before starting a new
+    /// one. Downloads use the CID as their session id, so fetching the same
+    /// CID twice would otherwise report the first run's finished result.
+    pub fn reset_transfer(&self, session_id: &str, kind: &str) {
+        let mut s = self.inner.lock().unwrap();
+        let s = &mut *s;
+        track(
+            &mut s.transfers,
+            &mut s.transfer_order,
+            session_id,
+            MAX_TRACKED_TRANSFERS,
+        );
+        *s.transfers.get_mut(session_id).expect("just tracked") = Transfer {
+            kind: kind.into(),
+            ..Transfer::default()
+        };
+    }
+
+    /// Messages on `topic` with `seq > after`, oldest first, at most `limit`.
+    pub fn read(&self, topic: &str, after: u64, limit: usize) -> Vec<ReceivedMessage> {
+        let s = self.inner.lock().unwrap();
+        s.topics
+            .get(topic)
+            .map(|q| {
+                q.iter()
+                    .filter(|m| m.seq > after)
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn send_status(&self, request_id: &str) -> Option<SendStatus> {
+        self.inner.lock().unwrap().sends.get(request_id).cloned()
+    }
+
+    pub fn transfer(&self, session_id: &str) -> Option<Transfer> {
+        self.inner
+            .lock()
+            .unwrap()
+            .transfers
+            .get(session_id)
+            .cloned()
+    }
+}
+
+/// Keep `logosctl watch <module>` running, feeding every line to `store`.
+/// Restarts with backoff when the watcher exits (it exits when the daemon stops).
+pub fn spawn_watcher(
+    bin: PathBuf,
+    config_dir: Option<PathBuf>,
+    module: &'static str,
+    store: Arc<EventStore>,
+) {
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let started = std::time::Instant::now();
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.args(["--json", "watch", module])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            if let Some(dir) = &config_dir {
+                cmd.env("LOGOSCTL_CONFIG_DIR", dir);
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    // Drain stderr concurrently: a full stderr pipe stalls stdout.
+                    if let Some(err) = child.stderr.take() {
+                        tokio::spawn(async move {
+                            let mut lines = BufReader::new(err).lines();
+                            while let Ok(Some(l)) = lines.next_line().await {
+                                tracing::debug!(target: "watch", module, "{l}");
+                            }
+                        });
+                    }
+                    if let Some(out) = child.stdout.take() {
+                        let mut lines = BufReader::new(out).lines();
+                        while let Ok(Some(l)) = lines.next_line().await {
+                            store.ingest_line(&l);
+                        }
+                    }
+                    let status = child.wait().await;
+                    tracing::warn!(module, ?status, "watcher exited; restarting in {backoff:?}");
+                }
+                Err(e) => tracing::error!(module, "cannot start watcher: {e}"),
+            }
+            // A watcher that ran a while was healthy: restart promptly. Keep the
+            // cap short so a module loaded later (messaging_connect) is picked
+            // up within seconds, since events missed meanwhile are gone.
+            if started.elapsed() >= Duration::from_secs(10) {
+                backoff = Duration::from_secs(1);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(4));
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Recorded verbatim from a logos.dev round trip (logosctl 0.3.2, delivery 0.3.3).
+    const RECEIVED: &str = r#"{"data":{"arg0":"0xe66238ad169a5a65d41eb3f10ef91312d63d9b618ec1f4cc139266e049e749d0","arg1":"/logos-mcp/1/smoke/proto","arg2":{"_bytes":"aGVsbG8gbG9nb3MuZGV2IGZyb20gbG9nb3MtbWNw"},"arg3":"live","arg4":1793978929196749824},"event":"messageReceived","module":"delivery_module","timestamp":"2026-11-06T15:28:49Z"}"#;
+    const PROPAGATED: &str = r#"{"data":{"arg0":"668f0020ca757c52784e","arg1":"0xe66238ad169a5a65d41eb3f10ef91312d63d9b618ec1f4cc139266e049e749d0","arg2":1793978929440760000},"event":"messagePropagated","module":"delivery_module","timestamp":"2026-11-06T15:28:49Z"}"#;
+    const SENT: &str = r#"{"data":{"arg0":"668f0020ca757c52784e","arg1":"0xe66238ad169a5a65d41eb3f10ef91312d63d9b618ec1f4cc139266e049e749d0","arg2":1793978933825487000},"event":"messageSent","module":"delivery_module","timestamp":"2026-11-06T15:28:53Z"}"#;
+    const CONNECTED: &str = r#"{"data":{"arg0":"Connected","arg1":1793978923805405000},"event":"connectionStateChanged","module":"delivery_module","timestamp":"2026-11-06T15:28:43Z"}"#;
+
+    #[test]
+    fn stores_received_message_with_decoded_text() {
+        let s = EventStore::default();
+        s.ingest_line(RECEIVED);
+        let msgs = s.read("/logos-mcp/1/smoke/proto", 0, 10);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].text.as_deref(),
+            Some("hello logos.dev from logos-mcp")
+        );
+        assert_eq!(msgs[0].source, "live");
+        assert_eq!(msgs[0].seq, 1);
+        assert!(s.read("/other/1/topic/proto", 0, 10).is_empty());
+    }
+
+    #[test]
+    fn duplicate_deliveries_of_one_message_are_stored_once() {
+        let s = EventStore::default();
+        s.ingest_line(RECEIVED);
+        s.ingest_line(RECEIVED);
+        s.ingest_line(RECEIVED);
+        assert_eq!(s.read("/logos-mcp/1/smoke/proto", 0, 10).len(), 1);
+    }
+
+    #[test]
+    fn send_status_merges_events_in_any_order() {
+        let s = EventStore::default();
+        s.ingest_line(PROPAGATED); // propagated arrived before sent in the real run
+        s.ingest_line(SENT);
+        let st = s.send_status("668f0020ca757c52784e").unwrap();
+        assert!(st.sent && st.propagated && st.error.is_none());
+        assert_eq!(
+            st.message_hash.as_deref(),
+            Some("0xe66238ad169a5a65d41eb3f10ef91312d63d9b618ec1f4cc139266e049e749d0")
+        );
+    }
+
+    #[test]
+    fn records_send_errors() {
+        let s = EventStore::default();
+        s.ingest_line(r#"{"data":{"arg0":"r1","arg1":"0xabc","arg2":"no_usable_membership","arg3":1},"event":"messageError","module":"delivery_module"}"#);
+        assert_eq!(
+            s.send_status("r1").unwrap().error.as_deref(),
+            Some("no_usable_membership")
+        );
+    }
+
+    #[test]
+    fn ignores_garbage_and_unrelated_events() {
+        let s = EventStore::default();
+        s.ingest_line("not json");
+        s.ingest_line(r#"{"event":"messageReceived"}"#);
+        s.ingest_line(r#"{"event":"messageReceived","data":{"arg0":"0x1"}}"#);
+        s.ingest_line(CONNECTED);
+        assert!(s.read("/logos-mcp/1/smoke/proto", 0, 10).is_empty());
+    }
+
+    #[test]
+    fn read_cursor_and_ring_buffer_bound() {
+        let s = EventStore::default();
+        for i in 0..(MAX_MESSAGES_PER_TOPIC + 10) {
+            s.ingest_line(&RECEIVED.replace("0xe662", &format!("0x{i:04}")));
+        }
+        let all = s.read("/logos-mcp/1/smoke/proto", 0, usize::MAX);
+        assert_eq!(all.len(), MAX_MESSAGES_PER_TOPIC);
+        assert_eq!(all[0].seq, 11, "oldest entries are evicted first");
+        let after = s.read("/logos-mcp/1/smoke/proto", all[100].seq, 5);
+        assert_eq!(after.len(), 5);
+        assert_eq!(after[0].seq, all[101].seq);
+    }
+
+    #[test]
+    fn tracks_upload_to_completion_with_cid() {
+        let s = EventStore::default();
+        s.expect_transfer("sess-1", "upload");
+        assert!(!s.transfer("sess-1").unwrap().done);
+        s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"bytes\":10,\"total\":20}"},"event":"storageUploadProgress","module":"storage_module"}"#);
+        s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"cid\":\"zDvZRwzm\"}"},"event":"storageUploadDone","module":"storage_module"}"#);
+        let t = s.transfer("sess-1").unwrap();
+        assert_eq!(
+            (t.done, t.success, t.cid.as_deref(), t.bytes),
+            (true, Some(true), Some("zDvZRwzm"), Some(10))
+        );
+    }
+
+    #[test]
+    fn reset_transfer_clears_a_finished_run_under_the_same_id() {
+        let s = EventStore::default();
+        s.reset_transfer("zCid", "download");
+        s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"zCid\"}"},"event":"storageDownloadDone","module":"storage_module"}"#);
+        assert!(s.transfer("zCid").unwrap().done);
+        s.reset_transfer("zCid", "download");
+        let t = s.transfer("zCid").unwrap();
+        assert!(!t.done && t.success.is_none());
+    }
+
+    #[test]
+    fn evicts_oldest_tracked_sends() {
+        let s = EventStore::default();
+        for i in 0..(MAX_TRACKED_SENDS + 1) {
+            s.ingest_line(&SENT.replace("668f0020ca757c52784e", &format!("req{i}")));
+        }
+        assert!(s.send_status("req0").is_none());
+        assert!(s.send_status(&format!("req{MAX_TRACKED_SENDS}")).is_some());
+    }
+}
