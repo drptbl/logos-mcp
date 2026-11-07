@@ -29,10 +29,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features --locked
       # The library alone, as the Basecamp module uses it.
-      - run: cargo clippy --lib --no-default-features --locked -- -D warnings
+      - run: cargo clippy --lib --no-default-features --features module --locked -- -D warnings
 
   msrv:
     runs-on: ubuntu-latest
@@ -45,3 +45,26 @@ jobs:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --all-targets --locked
+
+  # The Basecamp packages, built the way a release builds them, on the same three
+  # platforms it publishes. A release only runs once these are green. Reads the
+  # public Logos Nix cache, so nothing is pushed and no secrets are needed.
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        package: [basecamp, basecamp/app]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Nix refuses a shallow repository as a flake source.
+          fetch-depth: 0
+      - uses: logos-co/setup-nix-cache-action@bc3136708c99ea52e2ad4573afdd05731ec779ef # v1.2.1
+      - name: Ensure Metal Toolchain
+        if: runner.os == 'macOS'
+        run: |
+          /usr/bin/xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - run: nix build "./${{ matrix.package }}#lgx-portable" --print-build-logs
