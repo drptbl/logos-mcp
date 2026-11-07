@@ -1576,3 +1576,162 @@ async fn send_is_refused_up_front_when_rln_cannot_send() {
         "nothing was handed to the node"
     );
 }
+
+const PRIVATE_ACCOUNT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+fn wallet_with_a_private_account() -> String {
+    format!(
+        r#"[{{"account_id":"{USER_ACCOUNT}","is_public":true}},{{"account_id":"{AGENT_ACCOUNT}","is_public":true}},{{"account_id":"{PRIVATE_ACCOUNT}","is_public":false}}]"#
+    )
+}
+
+#[tokio::test]
+async fn the_user_can_hand_an_existing_account_to_the_agent_and_take_it_back() {
+    let open = || {
+        [
+            lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+            lez("list_accounts", &user_wallet_accounts()),
+        ]
+    };
+    let mut replies = Vec::new();
+    replies.extend(open()); // designate USER_ACCOUNT
+    replies.extend(open()); // transfer from it
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"cc33\"}""#,
+    ));
+    // releasing touches no wallet
+    replies.extend(open()); // transfer from it again
+    let fake = FakeRunner::with(replies);
+    let (s, _dir) = shared_server(fake.clone(), &[]);
+
+    s.set_agent_account(USER_ACCOUNT, true).await.unwrap();
+    let sent = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(RLN_PAYER, AGENT_FROM, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&sent), "{}", text(&sent));
+
+    s.set_agent_account(USER_ACCOUNT, false).await.unwrap();
+    let refused = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(RLN_PAYER, AGENT_FROM, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&refused));
+    let sends = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("transfer_public"))
+        .count();
+    assert_eq!(sends, 1, "only the send made while it was an agent account");
+}
+
+#[tokio::test]
+async fn only_public_accounts_in_the_open_wallet_can_be_handed_over() {
+    let open = || {
+        [
+            lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+            lez("list_accounts", &wallet_with_a_private_account()),
+        ]
+    };
+    let mut replies = Vec::new();
+    replies.extend(open());
+    replies.extend(open());
+    let (s, dir) = shared_server(FakeRunner::with(replies), &[]);
+    let private = s
+        .set_agent_account(PRIVATE_ACCOUNT, true)
+        .await
+        .unwrap_err();
+    assert!(private.contains("public"), "{private}");
+    let absent = s
+        .set_agent_account(&"3".repeat(64), true)
+        .await
+        .unwrap_err();
+    assert!(absent.contains("open wallet"), "{absent}");
+    let saved = std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap();
+    assert_eq!(saved.trim(), "[]");
+}
+
+#[tokio::test]
+async fn a_wallet_without_the_agent_accounts_can_only_release_them() {
+    // The agent's account is in another wallet: handing over one from this wallet
+    // would split the agent across two wallets and block every send.
+    let open = || {
+        [
+            lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+            lez("list_accounts", OTHER_ACCOUNTS),
+        ]
+    };
+    let (s, dir) = shared_server(FakeRunner::with(open().to_vec()), &[AGENT_ACCOUNT]);
+    let other = "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc";
+    let e = s.set_agent_account(other, true).await.unwrap_err();
+    assert!(e.contains("open the wallet that has them"), "{e}");
+    // Releasing the missing one is how the user gets out of that state.
+    s.set_agent_account(AGENT_ACCOUNT, false).await.unwrap();
+    let saved: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(saved.is_empty(), "{saved:?}");
+}
+
+#[tokio::test]
+async fn the_app_sees_the_open_wallet_and_which_accounts_are_the_agents() {
+    let fake = FakeRunner::with(vec![
+        // wallet_status
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("get_current_block_height", "78120"),
+        // wallet_accounts
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("get_balance", r#""5000""#),
+        lez("get_balance", r#""100""#),
+    ]);
+    let (s, _dir) = shared_server(fake, &[AGENT_ACCOUNT]);
+    let w = s.wallet_overview().await.unwrap();
+    assert_eq!(w["status"]["block_height"], 78120);
+    let accounts = w["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2);
+    let agent: Vec<bool> = accounts.iter().map(|a| a["agent"] == true).collect();
+    assert_eq!(agent, [false, true]);
+    assert_eq!(accounts[1]["balance_lepta"], "100");
+}
+
+#[tokio::test]
+async fn the_app_hears_why_the_wallet_cannot_be_shown() {
+    let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#)]);
+    let (s, _dir) = shared_server(fake, &[]);
+    let e = s.wallet_overview().await.unwrap_err();
+    assert!(e.contains("open your wallet in Basecamp"), "{e}");
+}
+
+#[tokio::test]
+async fn the_app_sees_agent_accounts_the_open_wallet_lacks_so_it_can_release_them() {
+    // Another wallet is open: nothing is usable, but the grant is still on disk.
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_current_block_height", "78120"),
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_balance", r#""7""#),
+    ]);
+    let (s, _dir) = shared_server(fake, &[AGENT_ACCOUNT]);
+    let w = s.wallet_overview().await.unwrap();
+    assert_eq!(
+        w["missing_agent_accounts"],
+        serde_json::json!([AGENT_ACCOUNT])
+    );
+    let shown = &w["accounts"][0];
+    assert_eq!(shown["designated"], false);
+    assert_eq!(shown["agent"], false);
+}

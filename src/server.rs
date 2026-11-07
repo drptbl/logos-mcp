@@ -277,6 +277,21 @@ fn ok(value: Value) -> Result<CallToolResult, McpError> {
 }
 
 /// Tool-level failure: reported to the agent as an error result it can act on.
+/// A tool's answer as JSON, or its error text: how the Agent app reuses the tools.
+fn tool_json(result: Result<CallToolResult, McpError>) -> Result<Value, String> {
+    let result = result.map_err(|e| e.message.to_string())?;
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    if result.is_error == Some(true) {
+        return Err(text);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("unreadable tool reply: {e}"))
+}
+
 fn fail(message: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![ContentBlock::text(
         message.into(),
@@ -328,14 +343,92 @@ impl LogosServer {
         self
     }
 
+    /// The open wallet for the Agent app: its status and every account, exactly as
+    /// the wallet_status and wallet_accounts tools report them.
+    pub async fn wallet_overview(&self) -> Result<Value, String> {
+        let status = tool_json(self.wallet_status().await)?;
+        let mut accounts = tool_json(self.wallet_accounts().await)?;
+        // What the user handed over, whether or not the agent can use it right now
+        // (`agent`): a grant on an account this wallet lacks must stay visible, so
+        // the user can take it back.
+        let designated = match &self.settings.wallet {
+            Some(WalletMode::Shared {
+                agent_accounts_file,
+            }) => load_agent_accounts(agent_accounts_file)?,
+            _ => BTreeSet::new(),
+        };
+        let mut shown = BTreeSet::new();
+        if let Some(list) = accounts["accounts"].as_array_mut() {
+            for account in list {
+                let id = account["account_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                account["designated"] = json!(designated.contains(&id));
+                shown.insert(id);
+            }
+        }
+        let missing: Vec<&String> = designated.difference(&shown).collect();
+        Ok(json!({
+            "status": status,
+            "accounts": accounts["accounts"],
+            "missing_agent_accounts": missing,
+            "warning": accounts["warning"],
+            "note": accounts["note"],
+        }))
+    }
+
+    /// A fresh agent account for the Agent app, as wallet_new_account makes it.
+    pub async fn new_agent_account(&self) -> Result<Value, String> {
+        tool_json(self.wallet_new_account().await)
+    }
+
+    /// Hand an account in the open wallet to the agent, or take it back. Only for a
+    /// shared (Basecamp) wallet, where the user picks which of their accounts the
+    /// agent may spend from. The agent itself can't call this: it is no tool.
+    /// Returns the agent accounts after the change.
+    pub async fn set_agent_account(&self, account_id: &str, agent: bool) -> Result<Value, String> {
+        let Some(WalletMode::Shared {
+            agent_accounts_file,
+        }) = &self.settings.wallet
+        else {
+            return Err("only a shared Basecamp wallet has accounts to hand to the agent".into());
+        };
+        // Held throughout, so no transfer is checked against a half-made change.
+        let mut agent_accounts = self.agent_accounts.lock().await;
+        let mut ids = load_agent_accounts(agent_accounts_file)?;
+        if agent {
+            let w = self.ensure_wallet_locked(&mut agent_accounts).await?;
+            // Adding one from a wallet without the others would split the agent
+            // across two wallets, and no wallet would then be trusted to send.
+            if !w.trusted {
+                return Err(w.warning().unwrap_or_default().to_string());
+            }
+            let account = w
+                .accounts
+                .iter()
+                .find(|a| a.get("account_id").and_then(Value::as_str) == Some(account_id))
+                .ok_or("that account isn't in the open wallet")?;
+            if account.get("is_public").and_then(Value::as_bool) != Some(true) {
+                return Err(
+                    "only public accounts can be agent accounts: transfers send from public accounts"
+                        .into(),
+                );
+            }
+            ids.insert(account_id.to_string());
+        } else {
+            // Releasing needs no open wallet: it must always be possible to take an
+            // account back, including one the open wallet no longer holds.
+            ids.remove(account_id);
+        }
+        save_agent_accounts(agent_accounts_file, &ids).map_err(|e| e.to_string())?;
+        Ok(json!({ "agent_accounts": ids }))
+    }
+
     /// Why the node can't send right now, as `rln_status` reports it. `None`
     /// when it can, or when that can't be told (the send then reports its own error).
     async fn cannot_send(&self) -> Option<String> {
-        let status = self.rln_status().await.ok()?;
-        if status.is_error == Some(true) {
-            return None;
-        }
-        let report: Value = serde_json::from_str(&status.content.first()?.as_text()?.text).ok()?;
+        let report = tool_json(self.rln_status().await).ok()?;
         (report["can_send"] == false).then(|| {
             report["reason"]
                 .as_str()
