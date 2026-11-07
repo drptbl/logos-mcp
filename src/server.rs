@@ -32,6 +32,8 @@ const RLN: &str = "liblogos_rln_module";
 const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHUNK_SIZE: i64 = 65_536;
+/// How often an idle tool-list watcher checks that its agent is still connected.
+const WATCH_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the operator chose at launch. Agents cannot change these.
 #[derive(Debug, Clone)]
@@ -175,10 +177,14 @@ pub struct LogosServer {
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
-    /// The tool groups the user allows, read on every list and call.
-    tool_groups: Arc<Mutex<ToolGroups>>,
+    /// The tool groups the user allows, read on every list and call, and
+    /// watched so connected agents hear when the list changes.
+    tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
     /// Where each tool call is recorded, when the user can review them.
     activity: Option<Arc<ActivityLog>>,
+    /// Set once this session's tool-list watcher runs: one per session, however
+    /// many `initialized` notifications a client sends. Not shared between sessions.
+    watching: std::sync::OnceLock<()>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -302,14 +308,16 @@ impl LogosServer {
             agent_accounts: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
-            tool_groups: Arc::default(),
+            tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
+            watching: std::sync::OnceLock::new(),
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Share the user's tool-group switches: changes apply to the next list or call.
-    pub fn with_tool_groups(mut self, groups: Arc<Mutex<ToolGroups>>) -> Self {
+    /// Follow the user's tool-group switches: a change applies to the next list
+    /// or call, and every connected agent is told its tool list changed.
+    pub fn with_tool_groups(mut self, groups: tokio::sync::watch::Receiver<ToolGroups>) -> Self {
         self.tool_groups = groups;
         self
     }
@@ -321,10 +329,7 @@ impl LogosServer {
     }
 
     fn allows(&self, tool: &str) -> bool {
-        self.tool_groups
-            .lock()
-            .map(|g| g.allows(tool))
-            .unwrap_or(false)
+        self.tool_groups.borrow().allows(tool)
     }
 
     fn node_config(&self) -> String {
@@ -1269,6 +1274,35 @@ impl LogosServer {
 
 #[tool_handler]
 impl ServerHandler for LogosServer {
+    /// Tell this agent whenever the user switches a tool group, for as long as
+    /// it stays connected. A switch made while it was connecting counts too, so
+    /// at worst it re-lists once for nothing rather than missing a change.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        if self.watching.set(()).is_err() {
+            return;
+        }
+        let mut groups = self.tool_groups.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = groups.changed() => {
+                        // A client that stops reading must not hold this task forever.
+                        let sent = tokio::time::timeout(WATCH_CHECK, context.peer.notify_tool_list_changed()).await;
+                        if changed.is_err() || !matches!(sent, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                    // An agent can leave while nothing changes: stop watching then too.
+                    () = tokio::time::sleep(WATCH_CHECK) => {
+                        if context.peer.is_transport_closed() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -1333,7 +1367,13 @@ impl ServerHandler for LogosServer {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_instructions(
             "Tools for a running Logos node. Call messaging_connect before messaging tools, \
              subscribe before reading, and poll messaging_send_status / storage_transfer_status \
              for asynchronous results.",
