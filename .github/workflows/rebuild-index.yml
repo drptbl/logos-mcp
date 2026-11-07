@@ -1,0 +1,21 @@
+name: Rebuild catalog index
+
+# Gathers every module release into index.json on the rolling `index` release,
+# which logos-repo.json points Basecamp at. The release workflow dispatches it.
+on:
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [rebuild-index]
+  # Heals a rebuild that failed after a release.
+  schedule:
+    - cron: "23 */6 * * *"
+
+concurrency:
+  group: logos-mcp-catalog-index
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    permissions:
+      contents: write
+    uses: logos-co/logos-modules-release-action/.github/workflows/rebuild-index.yml@00ad4e5adb7aac75b3e3f3acc6b8d7a466294e9c # v1.9

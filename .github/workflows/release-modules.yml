@@ -1,0 +1,68 @@
+name: Release Basecamp packages
+
+# Publishes logos_mcp and the AI Agent app to this repository's Basecamp
+# catalog once `main` is green. A version that already has a release is
+# skipped, so only a bumped metadata.json version publishes anything. Bump
+# both together when the app's calls into logos_mcp change.
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# One release at a time: two runs must not write the same tag and assets.
+concurrency:
+  group: release-modules-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # The release action builds main's current tip, so publish only while that tip
+  # is the commit CI just passed on every platform. If main has moved on, its own
+  # green CI run releases instead.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      verified: ${{ steps.tip.outputs.verified }}
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && github.event.workflow_run.head_repository.full_name == github.repository)
+    steps:
+      - name: main is still the verified commit
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          tip=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+          if [[ "$tip" == "$VERIFIED" ]]; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main is at $tip, not the verified $VERIFIED; its own CI run releases it"
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  module:
+    needs: gate
+    if: needs.gate.outputs.verified == 'true'
+    permissions:
+      contents: write
+    uses: logos-co/logos-modules-release-action/.github/workflows/release.yml@00ad4e5adb7aac75b3e3f3acc6b8d7a466294e9c # v1.9
+    with:
+      module_path: basecamp
+
+  # After the module: the app depends on logos_mcp, which Basecamp resolves
+  # from the catalog.
+  app:
+    needs: module
+    permissions:
+      contents: write
+    uses: logos-co/logos-modules-release-action/.github/workflows/release.yml@00ad4e5adb7aac75b3e3f3acc6b8d7a466294e9c # v1.9
+    with:
+      module_path: basecamp/app
