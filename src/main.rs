@@ -9,7 +9,7 @@ use logos_mcp::{
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
     node::Node,
-    server::{LogosServer, NodeSettings, WalletPaths},
+    server::{LogosServer, NodeSettings, WalletMode, WalletPaths},
 };
 
 /// MCP server that lets AI agents use a running Logos node through logosctl.
@@ -105,10 +105,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 anyhow::Ok(full)
             };
-            Some(WalletPaths {
+            Some(WalletMode::Dedicated(WalletPaths {
                 config: absolute(&config)?,
                 storage: absolute(&storage)?,
-            })
+            }))
         }
         _ => None,
     };
@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         config_dir: cli.config_dir.as_ref().map(|d| d.display().to_string()),
         wallet,
         discovery_bootstrap: cli.discovery_bootstrap,
+        host_owns_messaging: false,
     };
     tracing::info!(logosctl = %bin.display(), ?settings, "starting logos-mcp");
 

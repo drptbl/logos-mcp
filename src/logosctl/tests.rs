@@ -59,6 +59,18 @@ fn encodes_args_as_logosctl_expects() {
 }
 
 #[test]
+fn encodes_args_as_json_values_for_in_process_calls() {
+    // A string stays a string however it looks: no prefix, no coercion.
+    assert_eq!(Arg::str("42").to_json(), json!("42"));
+    assert_eq!(Arg::Int(65536).to_json(), json!(65536));
+    assert_eq!(Arg::Bool(false).to_json(), json!(false));
+    assert_eq!(
+        Arg::Bytes(b"hello logos".to_vec()).to_json(),
+        json!({ "_bytes": "aGVsbG8gbG9nb3M" })
+    );
+}
+
+#[test]
 fn unwraps_ok_envelope_from_real_output() {
     let raw = ok(r#"{"method":"isRunning","module":"storage_module","result":true,"status":"ok"}"#);
     assert_eq!(parse_output(&raw).unwrap(), Value::Bool(true));
