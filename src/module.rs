@@ -211,7 +211,9 @@ pub struct Control {
     dir: PathBuf,
     config: ModuleConfig,
     tokens: Tokens,
-    groups: Arc<std::sync::Mutex<ToolGroups>>,
+    groups: tokio::sync::watch::Sender<ToolGroups>,
+    /// Held while a switch is saved, so two saves can't interleave.
+    saving: std::sync::Mutex<()>,
     activity: Arc<ActivityLog>,
 }
 
@@ -222,7 +224,8 @@ impl Control {
         Ok(Self {
             dir: dir.to_path_buf(),
             tokens: Tokens::load_or_create(dir).map_err(|e| e.to_string())?,
-            groups: Arc::new(std::sync::Mutex::new(config.tools.clone())),
+            groups: tokio::sync::watch::Sender::new(config.tools.clone()),
+            saving: std::sync::Mutex::new(()),
             activity: Arc::new(ActivityLog::open(dir.join(ACTIVITY_FILE))?),
             config,
         })
@@ -237,8 +240,8 @@ impl Control {
         &self.tokens
     }
 
-    pub fn tool_groups(&self) -> Arc<std::sync::Mutex<ToolGroups>> {
-        self.groups.clone()
+    pub fn tool_groups(&self) -> tokio::sync::watch::Receiver<ToolGroups> {
+        self.groups.subscribe()
     }
 
     pub fn activity_log(&self) -> Arc<ActivityLog> {
@@ -265,23 +268,22 @@ impl Control {
     }
 
     pub fn permissions(&self) -> Value {
-        let groups = self
-            .groups
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        serde_json::to_value(groups).unwrap_or_default()
+        serde_json::to_value(&*self.groups.borrow()).unwrap_or_default()
     }
 
     /// Switch one tool group and save it. Only that group changes in the file,
     /// so other edits there are kept, and the file's groups then apply live.
     pub fn set_permission(&self, group: &str, on: bool) -> Result<Value, String> {
-        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ModuleConfig::load_or_create(&self.dir)?;
         config.tools.set(group, on)?;
         config.save(&self.dir)?;
-        *groups = config.tools;
-        drop(groups);
+        // Only a real change tells connected agents to re-list.
+        self.groups.send_if_modified(|groups| {
+            let changed = *groups != config.tools;
+            *groups = config.tools;
+            changed
+        });
         Ok(self.permissions())
     }
 

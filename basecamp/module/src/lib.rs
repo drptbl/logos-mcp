@@ -163,20 +163,34 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
             Ok(rt) => rt,
             Err(e) => return tx.send(Err(e.to_string())).unwrap_or(()),
         };
-        rt.block_on(async move {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    return tx
-                        .send(Err(format!("cannot listen on 127.0.0.1:{port}: {e}")))
-                        .unwrap_or(())
+        // A panic in the serving loop must reach `status` too, not just end the thread.
+        let serving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async move {
+                let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return tx
+                            .send(Err(format!("cannot listen on 127.0.0.1:{port}: {e}")))
+                            .unwrap_or(())
+                    }
+                };
+                let _ = tx.send(Ok(()));
+                let served = axum::serve(listener, app)
+                    .with_graceful_shutdown(stop.clone().cancelled_owned())
+                    .await;
+                // Anything but our own unload stopping the endpoint is a failure
+                // `status` must report, not keep calling "running".
+                if !stop.is_cancelled() {
+                    not_serving(match served {
+                        Ok(()) => "the MCP endpoint stopped unexpectedly".to_string(),
+                        Err(e) => format!("the MCP endpoint stopped: {e}"),
+                    });
                 }
-            };
-            let _ = tx.send(Ok(()));
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await;
-        });
+            })
+        }));
+        if serving.is_err() {
+            not_serving("the MCP endpoint crashed".to_string());
+        }
     });
     rx.recv().map_err(|e| e.to_string())??;
     // Only once serving: a module that failed to start keeps no subscriptions.
@@ -184,6 +198,14 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
         node.watch(module, events.clone());
     }
     Ok(())
+}
+
+/// Record why the endpoint isn't serving, for `status` and Basecamp's log.
+fn not_serving(why: String) {
+    eprintln!("logos_mcp: {why}");
+    if let Ok(mut err) = ERROR.lock() {
+        *err = Some(why);
+    }
 }
 
 fn error_json(e: impl std::fmt::Display) -> String {
@@ -197,6 +219,9 @@ const APP_BACKEND: &str = "logos_mcp_app_backend";
 /// `f` on the control surface, for the Agent app only.
 fn for_app(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     if !logos_rust_sdk::current_caller().is_module(APP_BACKEND) {
+        // Visible in Basecamp's log, so a module probing for the token shows up.
+        let who = logos_rust_sdk::current_caller_json().unwrap_or_else(|| "unknown".into());
+        eprintln!("logos_mcp: refused a control call from {who}");
         return error_json(format!("only {APP_BACKEND} may call this"));
     }
     with_control(f)

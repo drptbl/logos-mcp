@@ -189,15 +189,12 @@ fn a_permission_change_is_saved_and_applies_live() {
 
     let now = control.set_permission("transfers", false).unwrap();
     assert_eq!(now["transfers"], false);
-    assert!(!live.lock().unwrap().allows("wallet_transfer"));
+    assert!(!live.borrow().allows("wallet_transfer"));
     let saved = ModuleConfig::load_or_create(dir.path()).unwrap();
     assert!(!saved.tools.transfers);
     assert_eq!(saved.port, 9000);
     assert!(!saved.tools.storage, "a hand edit to another group is kept");
-    assert!(
-        !live.lock().unwrap().allows("storage_upload"),
-        "and applies live"
-    );
+    assert!(!live.borrow().allows("storage_upload"), "and applies live");
 
     assert!(control.set_permission("everything", false).is_err());
     assert_eq!(control.permissions()["transfers"], false);

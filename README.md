@@ -139,7 +139,7 @@ nix build .#lgx-portable
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
 2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery). A group you turn off disappears from the agent's list and is refused if called
-3. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder
+3. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message text shows in the app only, the file keeps its size
 
 ## Networks
 

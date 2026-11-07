@@ -77,9 +77,12 @@ async fn send_rejects_bad_input_without_touching_the_node() {
 
 #[tokio::test]
 async fn send_passes_payload_as_tagged_bytes() {
-    let fake = FakeRunner::with(vec![out(
-        r#"{"method":"send","module":"delivery_module","result":{"error":null,"success":true,"value":"req-9"},"status":"ok"}"#,
-    )]);
+    let fake = FakeRunner::with(vec![
+        out(RLN_DISABLED),
+        out(
+            r#"{"method":"send","module":"delivery_module","result":{"error":null,"success":true,"value":"req-9"},"status":"ok"}"#,
+        ),
+    ]);
     let s = server(fake.clone(), None);
     let r = s
         .messaging_send(Parameters(SendParams {
@@ -91,7 +94,7 @@ async fn send_passes_payload_as_tagged_bytes() {
         .unwrap();
     assert!(!is_error(&r));
     assert_eq!(
-        fake.calls.lock().unwrap()[0].last().unwrap(),
+        fake.calls.lock().unwrap()[1].last().unwrap(),
         r#"json:{"_bytes":"aGk"}"#
     );
 }
@@ -1409,9 +1412,9 @@ async fn connected(s: LogosServer) -> rmcp::service::RunningService<rmcp::RoleCl
 #[tokio::test]
 async fn a_tool_group_the_user_turned_off_is_hidden_and_refused() {
     let fake = FakeRunner::with(vec![]);
-    let groups = Arc::new(Mutex::new(ToolGroups::default()));
-    groups.lock().unwrap().set("transfers", false).unwrap();
-    let client = connected(wallet_server(fake.clone()).with_tool_groups(groups.clone())).await;
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    groups.send_modify(|g| g.set("transfers", false).unwrap());
+    let client = connected(wallet_server(fake.clone()).with_tool_groups(rx)).await;
 
     let names: Vec<String> = client
         .list_all_tools()
@@ -1439,7 +1442,7 @@ async fn a_tool_group_the_user_turned_off_is_hidden_and_refused() {
     );
 
     // Turning it back on takes effect without reconnecting.
-    groups.lock().unwrap().set("transfers", true).unwrap();
+    groups.send_modify(|g| g.set("transfers", true).unwrap());
     let names = client.list_all_tools().await.unwrap();
     assert!(names.iter().any(|t| t.name == "wallet_transfer"));
 }
@@ -1448,10 +1451,10 @@ async fn a_tool_group_the_user_turned_off_is_hidden_and_refused() {
 async fn every_call_lands_in_the_activity_log() {
     let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#)]);
     let (s, _dir) = shared_server(fake, &[]);
-    let groups = Arc::new(Mutex::new(ToolGroups::default()));
-    groups.lock().unwrap().set("storage", false).unwrap();
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    groups.send_modify(|g| g.set("storage", false).unwrap());
     let log = Arc::new(ActivityLog::in_memory());
-    let client = connected(s.with_tool_groups(groups).with_activity(log.clone())).await;
+    let client = connected(s.with_tool_groups(rx).with_activity(log.clone())).await;
 
     client
         .call_tool(rmcp::model::CallToolRequestParams::new("wallet_status"))
@@ -1477,5 +1480,99 @@ async fn every_call_lands_in_the_activity_log() {
         entries[1].result.contains("turned off"),
         "{}",
         entries[1].result
+    );
+}
+
+/// A client that counts tools/list_changed notifications.
+#[derive(Clone, Default)]
+struct ListWatcher(Arc<tokio::sync::Notify>);
+
+impl rmcp::ClientHandler for ListWatcher {
+    async fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn connected_agents_are_told_when_a_group_is_switched() {
+    use rmcp::ServiceExt as _;
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = server(FakeRunner::with(vec![]), None).with_tool_groups(rx);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = s.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let watcher = ListWatcher::default();
+    let client = watcher.clone().serve(client_io).await.unwrap();
+    assert!(
+        client
+            .peer_info()
+            .and_then(|i| i.capabilities.tools.clone())
+            .and_then(|t| t.list_changed)
+            .unwrap_or(false),
+        "the server says its tool list can change"
+    );
+
+    groups.send_modify(|g| g.set("storage", false).unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(2), watcher.0.notified())
+        .await
+        .expect("a tools/list_changed notification");
+    let names = client.list_all_tools().await.unwrap();
+    assert!(!names.iter().any(|t| t.name.starts_with("storage_")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_disconnected_agent_stops_watching_the_switches() {
+    use rmcp::ServiceExt as _;
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = server(FakeRunner::with(vec![]), None).with_tool_groups(rx);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = s.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.unwrap();
+    client.list_all_tools().await.unwrap(); // the session is up and watching
+    assert!(groups.receiver_count() > 0);
+
+    client.cancel().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+    assert_eq!(
+        groups.receiver_count(),
+        0,
+        "nothing still watches for a gone agent"
+    );
+}
+
+// A logos.test node with no RLN membership, as Basecamp's reported it on 2026-11-07.
+const MEMBERSHIP_UNKNOWN: &str = r#"{"method":"get_membership_state","module":"liblogos_rln_module","result":"{\"leaf_index\":null,\"rate_limit\":null,\"state\":\"unknown\"}","status":"ok"}"#;
+
+#[tokio::test]
+async fn send_is_refused_up_front_when_rln_cannot_send() {
+    // The node would accept it, then never send it or report an error.
+    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_UNKNOWN), out(QUOTA_99)]);
+    let r = server(fake.clone(), None)
+        .messaging_send(Parameters(SendParams {
+            topic: "/a/1/b/proto".into(),
+            text: Some("hi".into()),
+            base64: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("membership is unknown"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.iter().any(|a| a == "send")),
+        "nothing was handed to the node"
     );
 }
