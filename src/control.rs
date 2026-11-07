@@ -111,6 +111,41 @@ struct Inner {
     file: Option<PathBuf>,
 }
 
+/// What the log keeps of a call: everything but message contents. A sent
+/// message keeps its topic and size, a read keeps how many messages came back.
+fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
+    let mut args = args.clone();
+    if tool == "messaging_send"
+        && let Some(map) = args.as_object_mut()
+    {
+        // Whatever the type: a malformed payload is still someone's message.
+        for key in ["text", "base64"] {
+            if let Some(body) = map.get(key) {
+                let size = match body {
+                    Value::String(text) => text.chars().count(),
+                    other => other.to_string().chars().count(),
+                };
+                map.insert(
+                    key.to_string(),
+                    Value::String(format!("<hidden, {size} chars>")),
+                );
+            }
+        }
+    }
+    let result = match serde_json::from_str::<Value>(result) {
+        Ok(read) if tool == "messaging_read" => match read["messages"].as_array() {
+            Some(messages) => format!(
+                "{} messages, next_after {}",
+                messages.len(),
+                read["next_after"]
+            ),
+            None => result.to_string(),
+        },
+        _ => result.to_string(),
+    };
+    (args, result)
+}
+
 fn cut(text: &str) -> String {
     let mut chars = text.chars();
     let mut out: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
@@ -157,6 +192,7 @@ impl ActivityLog {
     }
 
     pub fn record(&self, tool: &str, args: &Value, ok: bool, result: &str) {
+        let (args, result) = redact(tool, args, result);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -168,7 +204,7 @@ impl ActivityLog {
             tool: cut(tool),
             ok,
             args: cut(&args.to_string()),
-            result: cut(result),
+            result: cut(&result),
         };
         inner.next_seq += 1;
         if let Some(file) = &inner.file

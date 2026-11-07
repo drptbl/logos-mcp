@@ -166,3 +166,64 @@ fn an_oversized_tool_name_is_cut_too() {
     );
     assert!(log.since(0)[0].tool.chars().count() <= MAX_DETAIL_CHARS + 1);
 }
+
+#[test]
+fn message_contents_never_reach_the_log() {
+    let log = ActivityLog::in_memory();
+    log.record(
+        "messaging_send",
+        &serde_json::json!({ "topic": "/a/1/b/proto", "text": "meet at the old mill" }),
+        true,
+        r#"{"request_id":"r1"}"#,
+    );
+    log.record(
+        "messaging_send",
+        &serde_json::json!({ "topic": "/a/1/b/proto", "base64": "c2VjcmV0" }),
+        true,
+        r#"{"request_id":"r2"}"#,
+    );
+    let read = serde_json::json!({
+        "messages": [
+            { "text": "the password is swordfish", "payload_base64": "eA==", "seq": 1 },
+            { "text": "see you", "payload_base64": "eQ==", "seq": 2 }
+        ],
+        "next_after": 2
+    });
+    log.record(
+        "messaging_read",
+        &serde_json::json!({ "topic": "/a/1/b/proto" }),
+        true,
+        &read.to_string(),
+    );
+
+    let entries = log.since(0);
+    let all = format!("{entries:?}");
+    for secret in ["old mill", "c2VjcmV0", "swordfish", "see you"] {
+        assert!(!all.contains(secret), "{secret} leaked: {all}");
+    }
+    // What happened stays visible: the topic, the sizes, how many messages.
+    assert!(
+        entries[0].args.contains("/a/1/b/proto"),
+        "{}",
+        entries[0].args
+    );
+    assert!(entries[0].args.contains("20 chars"), "{}", entries[0].args);
+    assert_eq!(entries[2].result, "2 messages, next_after 2");
+}
+
+#[test]
+fn a_malformed_payload_is_hidden_too() {
+    // A call that fails validation still records its arguments.
+    let log = ActivityLog::in_memory();
+    log.record(
+        "messaging_send",
+        &serde_json::json!({ "topic": "/a/1/b/proto", "text": ["private note"], "base64": { "x": "c2VjcmV0" } }),
+        false,
+        "give exactly one of `text` or `base64`",
+    );
+    let args = &log.since(0)[0].args;
+    assert!(
+        !args.contains("private note") && !args.contains("c2VjcmV0"),
+        "{args}"
+    );
+}
