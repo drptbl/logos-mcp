@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    control::{ActivityLog, ToolGroups},
+    control::{APPROVAL_EXPIRES, ActivityLog, Approvals, Decision, ToolGroups},
     events::EventStore,
     guard::{self, FilesRoot},
     logosctl::{Arg, LogosError, embedded_json},
@@ -32,6 +32,8 @@ const RLN: &str = "liblogos_rln_module";
 const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHUNK_SIZE: i64 = 65_536;
+/// How long wallet_transfer waits for the user before returning the request id.
+const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
 const WATCH_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -182,6 +184,8 @@ pub struct LogosServer {
     tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
     /// Where each tool call is recorded, when the user can review them.
     activity: Option<Arc<ActivityLog>>,
+    /// Transfers waiting for the user, when they ask to approve each one.
+    approvals: Arc<Approvals>,
     /// Set once this session's tool-list watcher runs: one per session, however
     /// many `initialized` notifications a client sends. Not shared between sessions.
     watching: std::sync::OnceLock<()>,
@@ -218,6 +222,12 @@ pub struct ReadParams {
     pub after_seq: Option<u64>,
     /// Max messages to return (default 50, max 256).
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TransferStatusParams {
+    /// The request_id wallet_transfer returned while it waited for the user's approval.
+    pub request_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -277,6 +287,58 @@ fn ok(value: Value) -> Result<CallToolResult, McpError> {
 }
 
 /// Tool-level failure: reported to the agent as an error result it can act on.
+/// How far `send_checked` goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendMode {
+    /// Every check, no send: before asking the user.
+    CheckOnly,
+    /// Sent as the agent asked, which only stands while approvals are off.
+    Direct,
+    /// Sent because the user approved it.
+    Approved,
+}
+
+/// Why a transfer didn't clearly go through.
+#[derive(Debug)]
+enum SendError {
+    /// Refused before or by the wallet: nothing was sent.
+    NotSent(String),
+    /// Handed to the wallet without a clear answer: it may have been sent.
+    MaybeSent(String),
+}
+
+impl SendError {
+    fn message(self) -> String {
+        match self {
+            Self::NotSent(m) | Self::MaybeSent(m) => m,
+        }
+    }
+}
+
+impl From<String> for SendError {
+    fn from(message: String) -> Self {
+        Self::NotSent(message)
+    }
+}
+
+impl From<&str> for SendError {
+    fn from(message: &str) -> Self {
+        Self::NotSent(message.to_string())
+    }
+}
+
+/// A submitted transfer, as wallet_transfer reports it.
+fn submitted(p: &TransferParams, tx_hash: &str) -> Value {
+    json!({
+        "submitted": true,
+        "tx_hash": tx_hash,
+        "from": p.from,
+        "to": p.to,
+        "amount_lepta": p.amount_lepta,
+        "note": "submitted, not yet confirmed: inclusion can take several minutes, then wallet_accounts shows the new balances",
+    })
+}
+
 /// A tool's answer as JSON, or its error text: how the Agent app reuses the tools.
 fn tool_json(result: Result<CallToolResult, McpError>) -> Result<Value, String> {
     let result = result.map_err(|e| e.message.to_string())?;
@@ -325,6 +387,7 @@ impl LogosServer {
             interests: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
+            approvals: Arc::default(),
             watching: std::sync::OnceLock::new(),
             tool_router: Self::tool_router(),
         }
@@ -334,6 +397,12 @@ impl LogosServer {
     /// or call, and every connected agent is told its tool list changed.
     pub fn with_tool_groups(mut self, groups: tokio::sync::watch::Receiver<ToolGroups>) -> Self {
         self.tool_groups = groups;
+        self
+    }
+
+    /// Share the transfer requests with the app that answers them.
+    pub fn with_approvals(mut self, approvals: Arc<Approvals>) -> Self {
+        self.approvals = approvals;
         self
     }
 
@@ -376,6 +445,55 @@ impl LogosServer {
             "warning": accounts["warning"],
             "note": accounts["note"],
         }))
+    }
+
+    /// Transfers waiting for the user, for the Agent app.
+    pub fn approvals(&self) -> Value {
+        json!({ "waiting": self.approvals.waiting() })
+    }
+
+    /// The user approves a waiting transfer. It is checked again and sent on the
+    /// server's runtime, so a slow send never holds up the app; the agent hears
+    /// the outcome, from its waiting call or from wallet_transfer_status.
+    pub async fn approve_transfer(&self, id: &str) -> Result<Value, String> {
+        let request = self.approvals.approve(id)?;
+        self.record_decision("approve_transfer", id);
+        let server = self.clone();
+        let id = id.to_string();
+        let reply = json!({ "request_id": id, "state": "approved" });
+        tokio::spawn(async move {
+            let p = TransferParams {
+                from: request.from,
+                to: request.to,
+                amount_lepta: request.amount_lepta,
+            };
+            let outcome = match server
+                .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
+                .await
+            {
+                Ok(sent) => Decision::Sent {
+                    tx_hash: sent["tx_hash"].as_str().unwrap_or_default().to_string(),
+                },
+                Err(SendError::NotSent(reason)) => Decision::Failed { reason },
+                Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
+            };
+            server.approvals.finish(&id, outcome);
+        });
+        Ok(reply)
+    }
+
+    /// The user denies a waiting transfer: it is never sent.
+    pub fn deny_transfer(&self, id: &str) -> Result<Value, String> {
+        self.approvals.deny(id)?;
+        self.record_decision("deny_transfer", id);
+        Ok(json!({ "request_id": id, "state": "denied" }))
+    }
+
+    /// The user's answers belong in the activity next to the agent's calls.
+    fn record_decision(&self, decision: &str, id: &str) {
+        if let Some(log) = &self.activity {
+            log.record(decision, &json!({ "request_id": id }), true, "by the user");
+        }
     }
 
     /// A fresh agent account for the Agent app, as wallet_new_account makes it.
@@ -967,35 +1085,113 @@ impl LogosServer {
         ct: CancellationToken,
         Parameters(p): Parameters<TransferParams>,
     ) -> Result<CallToolResult, McpError> {
-        let to = match guard::public_account_hex(&p.to) {
-            Ok(hex) => hex,
-            Err(e) => return fail(format!("recipient: {e}")),
-        };
-        let amount = match guard::amount_le16_hex(&p.amount_lepta) {
-            Ok(hex) => hex,
+        if !self.tool_groups.borrow().ask_before_transfer {
+            return match self.send_checked(&ct, &p, SendMode::Direct).await {
+                Ok(sent) => ok(sent),
+                Err(e) => fail(e.message()),
+            };
+        }
+        // The user approves each transfer: check now, so a hopeless request never
+        // bothers them, then wait. Approving checks everything again before sending.
+        if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
+            return fail(e.message());
+        }
+        let (id, mut decision) = match self.approvals.request(&p.from, &p.to, &p.amount_lepta) {
+            Ok(filed) => filed,
             Err(e) => return fail(e),
         };
-        let from = match guard::public_account_hex(&p.from) {
-            Ok(hex) => hex,
-            Err(e) => return fail(format!("sender: {e}")),
+        let answered = async {
+            loop {
+                let now = decision.borrow_and_update().clone();
+                if now.is_final() {
+                    return now;
+                }
+                if decision.changed().await.is_err() {
+                    return Decision::Cancelled;
+                }
+            }
         };
+        tokio::select! {
+            outcome = answered => match outcome {
+                Decision::Sent { tx_hash } => ok(submitted(&p, &tx_hash)),
+                Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
+                Decision::Denied => fail("the user denied this transfer: nothing was sent"),
+                Decision::Expired => fail("the user did not answer in time: nothing was sent"),
+                _ => fail("this transfer was cancelled: nothing was sent"),
+            },
+            () = tokio::time::sleep(APPROVAL_WAIT) => {
+                if *decision.borrow() == Decision::Approved {
+                    ok(json!({
+                        "status": "approved_sending",
+                        "request_id": id,
+                        "note": "the user approved it and it is being sent: check wallet_transfer_status with this request_id for the tx_hash",
+                    }))
+                } else {
+                    ok(json!({
+                        "status": "awaiting_approval",
+                        "request_id": id,
+                        "note": format!(
+                            "the user hasn't answered yet. Check wallet_transfer_status with this request_id. If they don't answer within {} minutes of the request, it expires and is never sent",
+                            APPROVAL_EXPIRES.as_secs() / 60
+                        ),
+                    }))
+                }
+            }
+            () = ct.cancelled() => {
+                // A request still waiting is cancelled: no approval may send behind
+                // the agent's back. One the user already approved goes ahead, so say so.
+                match self.approvals.cancel(&id) {
+                    Decision::Cancelled => fail("transfer cancelled: it will not be sent"),
+                    _ => fail(format!(
+                        "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Where a transfer that waited for the user's approval stands: waiting, approved (sending), sent with its tx_hash, failed, denied, expired or cancelled."
+    )]
+    async fn wallet_transfer_status(
+        &self,
+        Parameters(p): Parameters<TransferStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.approvals.status(&p.request_id) {
+            Some(status) => ok(status),
+            None => fail(
+                "no such transfer request: it may be from before a restart or one of many older ones. Check wallet_accounts to see whether it was sent before trying again",
+            ),
+        }
+    }
+
+    /// Check a transfer and, unless only checking, send it: the one path every
+    /// transfer takes, whether or not the user approves it first.
+    async fn send_checked(
+        &self,
+        ct: &CancellationToken,
+        p: &TransferParams,
+        mode: SendMode,
+    ) -> Result<Value, SendError> {
+        let to = guard::public_account_hex(&p.to).map_err(|e| format!("recipient: {e}"))?;
+        let amount = guard::amount_le16_hex(&p.amount_lepta)?;
+        let from = guard::public_account_hex(&p.from).map_err(|e| format!("sender: {e}"))?;
         // Held until the send returns: one transfer at a time, checked and sent as one step.
         // rmcp only signals a cancelled request, it keeps running the handler, so a
         // transfer queued behind another must notice the cancel itself.
         let mut agent_accounts = tokio::select! {
             guard = self.agent_accounts.lock() => guard,
-            () = ct.cancelled() => return fail("transfer cancelled before sending: nothing was sent"),
+            () = ct.cancelled() => return Err("transfer cancelled before sending: nothing was sent".into()),
         };
         // The user may have switched transfers off while this call waited.
         if !self.allows("wallet_transfer") {
-            return fail("transfer cancelled: the user turned off transfers; nothing was sent");
+            return Err(
+                "transfer cancelled: the user turned off transfers; nothing was sent".into(),
+            );
         }
-        let w = match self.ensure_wallet_locked(&mut agent_accounts).await {
-            Ok(w) => w,
-            Err(e) => return fail(e),
-        };
+        let w = self.ensure_wallet_locked(&mut agent_accounts).await?;
         if let Some(warning) = w.warning() {
-            return fail(format!("refusing to send: {warning}"));
+            return Err(format!("refusing to send: {warning}").into());
         }
         let sender_is_ours = w.agent_ids.contains(&from)
             && w.accounts.iter().any(|a| {
@@ -1003,15 +1199,28 @@ impl LogosServer {
                     && a.get("is_public").and_then(Value::as_bool) == Some(true)
             });
         if !sender_is_ours {
-            return fail(
-                "sender must be one of the agent accounts, marked agent in wallet_accounts",
+            return Err(
+                "sender must be one of the agent accounts, marked agent in wallet_accounts".into(),
             );
         }
         if from == to {
-            return fail("sender and recipient are the same account");
+            return Err("sender and recipient are the same account".into());
         }
         if ct.is_cancelled() {
-            return fail("transfer cancelled before sending: nothing was sent");
+            return Err("transfer cancelled before sending: nothing was sent".into());
+        }
+        if mode == SendMode::CheckOnly {
+            return Ok(Value::Null);
+        }
+        // Last look before submitting: the switches may have changed while this
+        // waited for the wallet.
+        if !self.allows("wallet_transfer") {
+            return Err(
+                "transfer cancelled: the user turned off transfers; nothing was sent".into(),
+            );
+        }
+        if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
+            return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
         }
         let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
         let outcome = match self.node.call(LEZ, "transfer_public", &args).await {
@@ -1023,9 +1232,9 @@ impl LogosServer {
         let tx_hash = match outcome {
             TransferOutcome::Submitted(tx_hash) => tx_hash,
             TransferOutcome::Unknown(detail) => {
-                return fail(format!(
+                return Err(SendError::MaybeSent(format!(
                     "outcome unknown: the transfer may have been sent. Inclusion can take several minutes, so watch wallet_accounts over a few blocks before retrying ({detail})"
-                ));
+                )));
             }
             TransferOutcome::Refused(reason) => {
                 // lez_core says it refused and gives no transaction hash.
@@ -1038,17 +1247,10 @@ impl LogosServer {
                 } else {
                     ""
                 };
-                return fail(format!("transfer not sent: {reason}{hint}"));
+                return Err(format!("transfer not sent: {reason}{hint}").into());
             }
         };
-        ok(json!({
-            "submitted": true,
-            "tx_hash": tx_hash,
-            "from": p.from,
-            "to": p.to,
-            "amount_lepta": p.amount_lepta,
-            "note": "submitted, not yet confirmed: inclusion can take several minutes, then wallet_accounts shows the new balances",
-        }))
+        Ok(submitted(p, &tx_hash))
     }
 
     #[tool(

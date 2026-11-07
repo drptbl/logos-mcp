@@ -1735,3 +1735,288 @@ async fn the_app_sees_agent_accounts_the_open_wallet_lacks_so_it_can_release_the
     assert_eq!(shown["designated"], false);
     assert_eq!(shown["agent"], false);
 }
+
+// ---- transfer approvals ---------------------------------------------------
+
+fn wallet_open() -> [crate::logosctl::RawOutput; 2] {
+    [
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+    ]
+}
+
+fn sent(hash: &str) -> crate::logosctl::RawOutput {
+    lez(
+        "transfer_public",
+        &format!(r#""{{\"error\":\"\",\"success\":true,\"tx_hash\":\"{hash}\"}}""#),
+    )
+}
+
+/// A shared-wallet server with approvals on, whose agent account is AGENT_ACCOUNT.
+fn asking_server(
+    replies: Vec<crate::logosctl::RawOutput>,
+) -> (
+    LogosServer,
+    tokio::sync::watch::Sender<ToolGroups>,
+    Arc<FakeRunner>,
+    tempfile::TempDir,
+) {
+    let fake = FakeRunner::with(replies);
+    let (s, dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    let mut groups = ToolGroups::default();
+    groups.set("ask_before_transfer", true).unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(groups);
+    (s.with_tool_groups(rx), tx, fake, dir)
+}
+
+/// Start an agent's transfer and wait until it is waiting for the user.
+async fn request_transfer(s: &LogosServer) -> (tokio::task::JoinHandle<CallToolResult>, String) {
+    let agent = s.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1"),
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..100 {
+        if let Some(id) = s.approvals()["waiting"][0]["id"].as_str() {
+            return (call, id.to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no request appeared");
+}
+
+fn sends(fake: &FakeRunner) -> usize {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("transfer_public"))
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_transfer_returns_its_hash_to_the_waiting_agent() {
+    let mut replies = wallet_open().to_vec(); // checks before asking
+    replies.extend(wallet_open()); // checks again when approved
+    replies.push(sent("dd44"));
+    let (s, _groups, fake, _dir) = asking_server(replies);
+    let (call, id) = request_transfer(&s).await;
+    assert_eq!(sends(&fake), 0, "nothing sent before the user answers");
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], "dd44");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_denied_transfer_is_never_sent() {
+    let (s, _groups, fake, _dir) = asking_server(wallet_open().to_vec());
+    let (call, id) = request_transfer(&s).await;
+    s.deny_transfer(&id).unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("denied"), "{}", text(&r));
+    assert_eq!(sends(&fake), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_request_comes_back_pending_and_a_later_approval_still_sends() {
+    let mut replies = wallet_open().to_vec();
+    replies.extend(wallet_open());
+    replies.push(sent("ee55"));
+    let (s, _groups, fake, _dir) = asking_server(replies);
+    let (call, id) = request_transfer(&s).await;
+    let r = call.await.unwrap(); // after the 60 s wait
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["status"], "awaiting_approval");
+    assert_eq!(body(&r)["request_id"], id);
+
+    s.approve_transfer(&id).await.unwrap();
+    for _ in 0..100 {
+        if sends(&fake) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let status = s
+        .wallet_transfer_status(Parameters(TransferStatusParams { request_id: id }))
+        .await
+        .unwrap();
+    assert_eq!(body(&status)["state"], "sent", "{}", text(&status));
+    assert_eq!(body(&status)["tx_hash"], "ee55");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_request_can_no_longer_be_approved() {
+    let (s, _groups, fake, _dir) = asking_server(wallet_open().to_vec());
+    let (call, id) = request_transfer(&s).await;
+    call.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(11 * 60)).await;
+    let e = s.approve_transfer(&id).await.unwrap_err();
+    assert!(e.contains("expired"), "{e}");
+    assert_eq!(sends(&fake), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_rechecks_and_refuses_what_changed_meanwhile() {
+    // Transfers were switched off between the request and the approval.
+    let (s, groups, fake, _dir) = asking_server(wallet_open().to_vec());
+    let (call, id) = request_transfer(&s).await;
+    groups.send_modify(|g| g.set("transfers", false).unwrap());
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("turned off transfers"), "{}", text(&r));
+    assert_eq!(sends(&fake), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_request_is_never_sent() {
+    let (s, _groups, fake, _dir) = asking_server(wallet_open().to_vec());
+    let agent = s.clone();
+    let ct = CancellationToken::new();
+    let cancel = ct.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .wallet_transfer(ct, transfer(AGENT_FROM, RLN_PAYER, "1"))
+            .await
+            .unwrap()
+    });
+    let mut id = None;
+    for _ in 0..100 {
+        if let Some(found) = s.approvals()["waiting"][0]["id"].as_str() {
+            id = Some(found.to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    assert!(is_error(&call.await.unwrap()));
+    // The agent never learned the id: a later approval must not send behind its back.
+    assert!(s.approve_transfer(&id.unwrap()).await.is_err());
+    assert_eq!(sends(&fake), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agent_has_no_tool_to_approve_its_own_transfer() {
+    let client = connected(server(FakeRunner::with(vec![]), None)).await;
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.iter().any(|n| n == "wallet_transfer_status"));
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("approve") || n.contains("deny")),
+        "{names:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn switching_approvals_on_stops_a_transfer_already_on_its_way() {
+    // Approvals off; the transfer waits for the wallet while the user switches them on.
+    let fake = FakeRunner::with(wallet_open().to_vec());
+    let (s, _dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = s.with_tool_groups(rx);
+    let busy = s.agent_accounts.clone();
+    let held = busy.lock().await;
+    let agent = s.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1"),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    groups.send_modify(|g| g.set("ask_before_transfer", true).unwrap());
+    drop(held);
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("approves each transfer"), "{}", text(&r));
+    assert_eq!(sends(&fake), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_gives_up_after_approval_is_told_it_may_be_sent() {
+    let mut replies = wallet_open().to_vec();
+    replies.extend(wallet_open());
+    replies.push(sent("ff66"));
+    let (s, _groups, _fake, _dir) = asking_server(replies);
+    let agent = s.clone();
+    let ct = CancellationToken::new();
+    let cancel = ct.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .wallet_transfer(ct, transfer(AGENT_FROM, RLN_PAYER, "1"))
+            .await
+            .unwrap()
+    });
+    let mut id = String::new();
+    for _ in 0..100 {
+        if let Some(found) = s.approvals()["waiting"][0]["id"].as_str() {
+            id = found.to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Approve while the wallet is busy, so the send is still queued when the agent gives up.
+    let held = s.agent_accounts.lock().await;
+    s.approve_transfer(&id).await.unwrap();
+    cancel.cancel();
+    let r = call.await.unwrap();
+    drop(held);
+    assert!(text(&r).contains("may be sent"), "{}", text(&r));
+    assert!(
+        text(&r).contains(&id),
+        "the agent can follow it up: {}",
+        text(&r)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_send_with_an_unknown_outcome_is_not_reported_as_failed() {
+    let mut replies = wallet_open().to_vec();
+    replies.extend(wallet_open());
+    replies.push(crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"METHOD_FAILED","error":{"code":"timeout","message":"timed out"},"message":"timeout","status":"error"}"#.into(),
+        stderr: String::new(),
+    });
+    let (s, _groups, _fake, _dir) = asking_server(replies);
+    let (call, id) = request_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+    let status = s
+        .wallet_transfer_status(Parameters(TransferStatusParams { request_id: id }))
+        .await
+        .unwrap();
+    assert_eq!(body(&status)["state"], "unknown", "{}", text(&status));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_request_never_claims_nothing_was_sent() {
+    let s = server(FakeRunner::with(vec![]), None);
+    let r = s
+        .wallet_transfer_status(Parameters(TransferStatusParams {
+            request_id: "nope".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("wallet_accounts"), "{}", text(&r));
+    assert!(!text(&r).contains("never sent"), "{}", text(&r));
+}
