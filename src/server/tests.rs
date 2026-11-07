@@ -77,9 +77,12 @@ async fn send_rejects_bad_input_without_touching_the_node() {
 
 #[tokio::test]
 async fn send_passes_payload_as_tagged_bytes() {
-    let fake = FakeRunner::with(vec![out(
-        r#"{"method":"send","module":"delivery_module","result":{"error":null,"success":true,"value":"req-9"},"status":"ok"}"#,
-    )]);
+    let fake = FakeRunner::with(vec![
+        out(RLN_DISABLED),
+        out(
+            r#"{"method":"send","module":"delivery_module","result":{"error":null,"success":true,"value":"req-9"},"status":"ok"}"#,
+        ),
+    ]);
     let s = server(fake.clone(), None);
     let r = s
         .messaging_send(Parameters(SendParams {
@@ -91,7 +94,7 @@ async fn send_passes_payload_as_tagged_bytes() {
         .unwrap();
     assert!(!is_error(&r));
     assert_eq!(
-        fake.calls.lock().unwrap()[0].last().unwrap(),
+        fake.calls.lock().unwrap()[1].last().unwrap(),
         r#"json:{"_bytes":"aGk"}"#
     );
 }
@@ -1544,5 +1547,32 @@ async fn a_disconnected_agent_stops_watching_the_switches() {
         groups.receiver_count(),
         0,
         "nothing still watches for a gone agent"
+    );
+}
+
+// A logos.test node with no RLN membership, as Basecamp's reported it on 2026-11-07.
+const MEMBERSHIP_UNKNOWN: &str = r#"{"method":"get_membership_state","module":"liblogos_rln_module","result":"{\"leaf_index\":null,\"rate_limit\":null,\"state\":\"unknown\"}","status":"ok"}"#;
+
+#[tokio::test]
+async fn send_is_refused_up_front_when_rln_cannot_send() {
+    // The node would accept it, then never send it or report an error.
+    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_UNKNOWN), out(QUOTA_99)]);
+    let r = server(fake.clone(), None)
+        .messaging_send(Parameters(SendParams {
+            topic: "/a/1/b/proto".into(),
+            text: Some("hi".into()),
+            base64: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("membership is unknown"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.iter().any(|a| a == "send")),
+        "nothing was handed to the node"
     );
 }

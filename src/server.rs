@@ -328,6 +328,22 @@ impl LogosServer {
         self
     }
 
+    /// Why the node can't send right now, as `rln_status` reports it. `None`
+    /// when it can, or when that can't be told (the send then reports its own error).
+    async fn cannot_send(&self) -> Option<String> {
+        let status = self.rln_status().await.ok()?;
+        if status.is_error == Some(true) {
+            return None;
+        }
+        let report: Value = serde_json::from_str(&status.content.first()?.as_text()?.text).ok()?;
+        (report["can_send"] == false).then(|| {
+            report["reason"]
+                .as_str()
+                .unwrap_or("RLN can't send right now")
+                .to_string()
+        })
+    }
+
     fn allows(&self, tool: &str) -> bool {
         self.tool_groups.borrow().allows(tool)
     }
@@ -711,6 +727,11 @@ impl LogosServer {
         };
         if let Err(e) = guard::validate_payload(&payload) {
             return fail(e);
+        }
+        // With RLN on, a node that can't make a proof still accepts the send,
+        // then never sends it or reports an error. Say so now instead.
+        if let Some(reason) = self.cannot_send().await {
+            return fail(format!("not sending: {reason} (see rln_status)"));
         }
         match self
             .node
