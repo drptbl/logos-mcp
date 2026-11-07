@@ -119,6 +119,10 @@ impl Node for InProcessNode {
 
 /// The module's control surface, once its data folder has been read.
 static CONTROL: std::sync::OnceLock<Control> = std::sync::OnceLock::new();
+/// The MCP server and the runtime it runs on, for the app's wallet calls. Clones
+/// share the server's wallet lock and state, so the app and agents never race.
+static WALLET: std::sync::OnceLock<(LogosServer, tokio::runtime::Handle)> =
+    std::sync::OnceLock::new();
 /// Why the endpoint isn't serving, when it isn't.
 static ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
@@ -148,6 +152,7 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
         files,
         settings,
     ));
+    let for_wallet = server.clone();
     let app = router(move || Ok(server.clone()), control.tokens());
 
     let stop = STOP
@@ -163,6 +168,7 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
             Ok(rt) => rt,
             Err(e) => return tx.send(Err(e.to_string())).unwrap_or(()),
         };
+        let _ = WALLET.set((for_wallet, rt.handle().clone()));
         // A panic in the serving loop must reach `status` too, not just end the thread.
         let serving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async move {
@@ -227,6 +233,16 @@ fn for_app(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     with_control(f)
 }
 
+/// Run one of the server's wallet calls on its runtime, from the SDK's thread.
+fn on_server<F, Fut>(f: F) -> Result<Value, String>
+where
+    F: FnOnce(LogosServer) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let (server, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
+    runtime.block_on(f(server.clone()))
+}
+
 /// `f` on the control surface, or why there is none.
 fn with_control(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     match CONTROL.get() {
@@ -289,6 +305,18 @@ impl LogosMcpModule for ModuleImpl {
 
     fn set_permission(&self, group: String, enabled: bool) -> String {
         for_app(|c| c.set_permission(&group, enabled))
+    }
+
+    fn wallet(&self) -> String {
+        for_app(|_| on_server(|s| async move { s.wallet_overview().await }))
+    }
+
+    fn set_agent_account(&self, account_id: String, agent: bool) -> String {
+        for_app(|_| on_server(|s| async move { s.set_agent_account(&account_id, agent).await }))
+    }
+
+    fn new_agent_account(&self) -> String {
+        for_app(|_| on_server(|s| async move { s.new_agent_account().await }))
     }
 
     fn activity(&self, after: i64) -> String {
