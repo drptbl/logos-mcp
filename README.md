@@ -111,7 +111,15 @@ The reply carries the wallet's recovery phrase, so keep it somewhere safe.
 
 You can also install it into Basecamp as a module. It then uses Basecamp's own messaging node, storage and wallet, so your agent drives the Basecamp you already run.
 
-Build the package with Nix and install `result/logos-logos_mcp-module-lib.lgx` from Basecamp's Package Manager:
+Add this repository to Basecamp: in Package Repositories, paste
+
+```text
+https://raw.githubusercontent.com/drptbl/logos-mcp/main/logos-repo.json
+```
+
+and install `logos_mcp` and the AI Agent app from the catalog. Updates show up there too.
+
+To build the module yourself, build it with Nix and install `result/logos-logos_mcp-module-lib.lgx` from Basecamp's Package Manager:
 
 ```bash
 cd basecamp
@@ -130,7 +138,7 @@ Start messaging in Basecamp first. The module never creates or starts the node.
 
 The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
 
-The AI Agent app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. Build it and install `result/logos-logos_mcp_app-module.lgx` after the module:
+The AI Agent app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. To build it yourself, install `result/logos-logos_mcp_app-module.lgx` after the module:
 
 ```bash
 cd basecamp/app
