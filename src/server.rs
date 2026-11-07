@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    control::{ActivityLog, ToolGroups},
     events::EventStore,
     guard::{self, FilesRoot},
     logosctl::{Arg, LogosError, embedded_json},
@@ -174,7 +175,10 @@ pub struct LogosServer {
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
-    #[expect(dead_code, reason = "read by the tool_handler macro")]
+    /// The tool groups the user allows, read on every list and call.
+    tool_groups: Arc<Mutex<ToolGroups>>,
+    /// Where each tool call is recorded, when the user can review them.
+    activity: Option<Arc<ActivityLog>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -298,8 +302,29 @@ impl LogosServer {
             agent_accounts: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
+            tool_groups: Arc::default(),
+            activity: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Share the user's tool-group switches: changes apply to the next list or call.
+    pub fn with_tool_groups(mut self, groups: Arc<Mutex<ToolGroups>>) -> Self {
+        self.tool_groups = groups;
+        self
+    }
+
+    /// Record every tool call in `log`.
+    pub fn with_activity(mut self, log: Arc<ActivityLog>) -> Self {
+        self.activity = Some(log);
+        self
+    }
+
+    fn allows(&self, tool: &str) -> bool {
+        self.tool_groups
+            .lock()
+            .map(|g| g.allows(tool))
+            .unwrap_or(false)
     }
 
     fn node_config(&self) -> String {
@@ -842,6 +867,10 @@ impl LogosServer {
             guard = self.agent_accounts.lock() => guard,
             () = ct.cancelled() => return fail("transfer cancelled before sending: nothing was sent"),
         };
+        // The user may have switched transfers off while this call waited.
+        if !self.allows("wallet_transfer") {
+            return fail("transfer cancelled: the user turned off transfers; nothing was sent");
+        }
         let w = match self.ensure_wallet_locked(&mut agent_accounts).await {
             Ok(w) => w,
             Err(e) => return fail(e),
@@ -1240,6 +1269,69 @@ impl LogosServer {
 
 #[tool_handler]
 impl ServerHandler for LogosServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        tools.retain(|t| self.allows(&t.name));
+        // The list changes when the user switches a group: tell clients that
+        // understand cache hints not to keep it (what rmcp's own handler sends).
+        let hints = context
+            .protocol_version()
+            .is_some_and(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.allows(name)
+            .then(|| self.tool_router.get(name).cloned())
+            .flatten()
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let args = Value::Object(request.arguments.clone().unwrap_or_default());
+        let response = if self.allows(&tool) {
+            let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+            self.tool_router.call(tcc).await
+        } else {
+            let group = ToolGroups::group_of(&tool).unwrap_or("this");
+            fail(format!(
+                "the user turned off the {group} tools in the Agent app"
+            ))
+            .map(Into::into)
+        };
+        if let Some(log) = &self.activity {
+            let (ok, result) = match &response {
+                Ok(rmcp::model::CallToolResponse::Complete(r)) => (
+                    r.is_error != Some(true),
+                    r.content
+                        .first()
+                        .and_then(|c| c.as_text())
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default(),
+                ),
+                Ok(_) => (true, "waiting for input".to_string()),
+                Err(e) => (false, e.message.to_string()),
+            };
+            log.record(&tool, &args, ok, &result);
+        }
+        response
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Tools for a running Logos node. Call messaging_connect before messaging tools, \

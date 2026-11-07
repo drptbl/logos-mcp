@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::{ActivityLog, ToolGroups};
 use crate::logosctl::Logosctl;
 use crate::logosctl::tests::{FakeRunner, ok as out};
 use tokio_util::sync::CancellationToken;
@@ -1390,5 +1391,91 @@ async fn when_the_host_owns_messaging_connect_only_reports() {
         calls.len(),
         1,
         "no module load, no createNode, no start: {calls:?}"
+    );
+}
+
+/// An MCP client connected to `s` in memory, so tests cross the real protocol.
+async fn connected(s: LogosServer) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    use rmcp::ServiceExt as _;
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = s.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    ().serve(client_io).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_tool_group_the_user_turned_off_is_hidden_and_refused() {
+    let fake = FakeRunner::with(vec![]);
+    let groups = Arc::new(Mutex::new(ToolGroups::default()));
+    groups.lock().unwrap().set("transfers", false).unwrap();
+    let client = connected(wallet_server(fake.clone()).with_tool_groups(groups.clone())).await;
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n == "wallet_transfer"), "{names:?}");
+    assert!(names.iter().any(|n| n == "wallet_status"), "{names:?}");
+
+    let args = serde_json::json!({ "from": AGENT_FROM, "to": RLN_PAYER, "amount_lepta": "1" });
+    let r = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("wallet_transfer")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    assert!(text(&r).contains("turned off"), "{}", text(&r));
+    assert!(
+        fake.calls.lock().unwrap().is_empty(),
+        "nothing reached the node"
+    );
+
+    // Turning it back on takes effect without reconnecting.
+    groups.lock().unwrap().set("transfers", true).unwrap();
+    let names = client.list_all_tools().await.unwrap();
+    assert!(names.iter().any(|t| t.name == "wallet_transfer"));
+}
+
+#[tokio::test]
+async fn every_call_lands_in_the_activity_log() {
+    let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#)]);
+    let (s, _dir) = shared_server(fake, &[]);
+    let groups = Arc::new(Mutex::new(ToolGroups::default()));
+    groups.lock().unwrap().set("storage", false).unwrap();
+    let log = Arc::new(ActivityLog::in_memory());
+    let client = connected(s.with_tool_groups(groups).with_activity(log.clone())).await;
+
+    client
+        .call_tool(rmcp::model::CallToolRequestParams::new("wallet_status"))
+        .await
+        .unwrap();
+    client
+        .call_tool(rmcp::model::CallToolRequestParams::new("storage_space"))
+        .await
+        .unwrap();
+
+    let entries = log.since(0);
+    let summary: Vec<(&str, bool)> = entries.iter().map(|e| (e.tool.as_str(), e.ok)).collect();
+    assert_eq!(
+        summary,
+        [("wallet_status", false), ("storage_space", false)]
+    );
+    assert!(
+        entries[0].result.contains("Basecamp"),
+        "{}",
+        entries[0].result
+    );
+    assert!(
+        entries[1].result.contains("turned off"),
+        "{}",
+        entries[1].result
     );
 }
