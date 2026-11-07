@@ -235,3 +235,28 @@ impl FilesRoot {
 
 #[cfg(test)]
 mod tests;
+
+/// Write a file readable and writable by this user only. Written beside it and
+/// renamed into place, so a crash leaves the old contents or the new, never half.
+pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    // A leftover temp file (or a link planted there) is replaced, never written through.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)
+}

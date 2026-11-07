@@ -111,3 +111,22 @@ fn evicts_oldest_tracked_sends() {
     assert!(s.send_status("req0").is_none());
     assert!(s.send_status(&format!("req{MAX_TRACKED_SENDS}")).is_some());
 }
+
+#[test]
+fn in_process_events_are_accepted_with_named_or_positional_args() {
+    let s = EventStore::default();
+    // logosctl watch shape
+    s.apply_event(
+        "messageReceived",
+        &serde_json::json!({"arg0": "0xaa", "arg1": "/a/1/b/proto", "arg2": {"_bytes": "aGk"}, "arg3": "live", "arg4": 1}),
+    );
+    // a positional array, as an SDK event may carry it
+    s.apply_event(
+        "messageReceived",
+        &serde_json::json!(["0xbb", "/a/1/b/proto", {"_bytes": "aGk"}, "live", 2]),
+    );
+    let got = s.read("/a/1/b/proto", 0, 10);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1].hash, "0xbb");
+    assert_eq!(got[1].text.as_deref(), Some("hi"));
+}

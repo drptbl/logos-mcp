@@ -14,6 +14,8 @@ categories = ["command-line-utilities", "network-programming"]
 default = ["cli"]
 # The standalone binary. Library users (the Basecamp module) turn it off.
 cli = ["dep:anyhow", "dep:clap", "dep:tracing-subscriber"]
+# What the Basecamp module needs: MCP over HTTP with a token, and its config file.
+module = ["dep:axum", "dep:getrandom", "rmcp/transport-streamable-http-server"]
 
 [lib]
 path = "src/lib.rs"
@@ -25,8 +27,10 @@ required-features = ["cli"]
 
 [dependencies]
 anyhow = { version = "1.0.104", optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"], optional = true }
+getrandom = { version = "0.3", optional = true }
 rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -38,4 +42,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
+http-body-util = "0.1"
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }

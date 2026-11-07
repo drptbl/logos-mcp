@@ -14,6 +14,7 @@ fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
             config_dir: None,
             wallet: None,
             discovery_bootstrap: vec![],
+            host_owns_messaging: false,
         },
     )
 }
@@ -28,11 +29,12 @@ fn wallet_server(fake: Arc<FakeRunner>) -> LogosServer {
             preset: "logos.test".into(),
             mode: "Edge".into(),
             config_dir: None,
-            wallet: Some(WalletPaths {
+            wallet: Some(WalletMode::Dedicated(WalletPaths {
                 config: "/agent/wallet_config.json".into(),
                 storage: "/agent/storage.json".into(),
-            }),
+            })),
             discovery_bootstrap: vec![FLEET_PEER.into()],
+            host_owns_messaging: false,
         },
     )
 }
@@ -594,7 +596,11 @@ async fn transfer_refuses_a_wallet_this_server_did_not_open() {
         .await
         .unwrap();
     assert!(is_error(&r));
-    assert!(text(&r).contains("not the agent wallet"), "{}", text(&r));
+    assert!(
+        text(&r).contains("not opened by this server"),
+        "{}",
+        text(&r)
+    );
     assert!(
         fake.calls
             .lock()
@@ -1078,4 +1084,311 @@ async fn advertised_tags_from_peers_are_sanitised() {
     assert!(!tag.chars().any(char::is_control), "{tag:?}");
     assert!(tag.chars().count() <= 64, "{}", tag.chars().count());
     assert!(b["note"].as_str().unwrap().contains("untrusted"), "{b}");
+}
+
+// ---- shared wallet mode (Basecamp): the user's open wallet, designated agent accounts ----
+
+const USER_ACCOUNT: &str = "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc";
+const AGENT_ACCOUNT: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
+
+fn user_wallet_accounts() -> String {
+    format!(
+        r#"[{{"account_id":"{USER_ACCOUNT}","is_public":true}},{{"account_id":"{AGENT_ACCOUNT}","is_public":true}}]"#
+    )
+}
+
+/// A server in shared mode whose agent-accounts file starts with `designated`.
+fn shared_server(fake: Arc<FakeRunner>, designated: &[&str]) -> (LogosServer, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("agent-accounts.json");
+    std::fs::write(&file, serde_json::to_string(designated).unwrap()).unwrap();
+    let server = LogosServer::new(
+        Arc::new(Logosctl::new(fake)),
+        Arc::new(EventStore::default()),
+        None,
+        NodeSettings {
+            preset: "logos.test".into(),
+            mode: "Edge".into(),
+            config_dir: None,
+            wallet: Some(WalletMode::Shared {
+                agent_accounts_file: file,
+            }),
+            discovery_bootstrap: vec![],
+            host_owns_messaging: false,
+        },
+    );
+    (server, dir)
+}
+
+#[tokio::test]
+async fn shared_mode_needs_a_wallet_open_and_never_opens_one() {
+    let fake = FakeRunner::with(vec![lez("get_sequencer_addr", r#""""#)]);
+    let (s, _dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    let r = s.wallet_status().await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("Basecamp"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("open"))
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_marks_agent_accounts_and_trusts_the_wallet_that_holds_them() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("get_balance", r#""5000""#),
+        lez("get_balance", r#""100""#),
+    ]);
+    let (s, _dir) = shared_server(fake, &[AGENT_ACCOUNT]);
+    let b = body(&s.wallet_accounts().await.unwrap());
+    assert_eq!(b["warning"], Value::Null, "{b}");
+    let accounts = b["accounts"].as_array().unwrap();
+    let agent =
+        |id: &str| accounts.iter().find(|a| a["account_id"] == id).unwrap()["agent"].clone();
+    assert_eq!(agent(AGENT_ACCOUNT), true);
+    assert_eq!(agent(USER_ACCOUNT), false);
+}
+
+#[tokio::test]
+async fn shared_mode_refuses_to_send_from_the_users_own_accounts() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+    ]);
+    let (s, _dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(RLN_PAYER, AGENT_FROM, "1"), // RLN_PAYER is USER_ACCOUNT, not designated
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("agent account"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_without_agent_accounts_says_how_to_get_one() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+    ]);
+    let (s, _dir) = shared_server(fake.clone(), &[]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(RLN_PAYER, AGENT_FROM, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    // Not the dedicated wallet's "not the agent wallet this server opened".
+    assert!(text(&r).contains("wallet_new_account"), "{}", text(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_sends_from_a_designated_agent_account() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez(
+            "transfer_public",
+            r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,
+        ),
+    ]);
+    let (s, _dir) = shared_server(fake, &[AGENT_ACCOUNT]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], "bb22");
+}
+
+#[tokio::test]
+async fn shared_mode_new_accounts_are_designated_and_remembered() {
+    let new_id = "8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1";
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("create_account_public", &format!(r#""{new_id}""#)),
+        lez("save", "0"),
+    ]);
+    // no agent account yet: creating one is how the agent gets its first
+    let (s, dir) = shared_server(fake, &[]);
+    let r = s.wallet_new_account().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let saved: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, vec![new_id.to_string()]);
+}
+
+fn never_called(fake: &FakeRunner, method: &str) -> bool {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|c| c.get(3).map(String::as_str) != Some(method))
+}
+
+#[tokio::test]
+async fn shared_mode_never_designates_accounts_in_another_wallet() {
+    // The agent's account lives in another wallet than the one open now.
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+    ]);
+    let (s, dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    let r = s.wallet_new_account().await.unwrap();
+    assert!(is_error(&r));
+    assert!(
+        text(&r).contains("open the wallet that has them"),
+        "{}",
+        text(&r)
+    );
+    assert!(never_called(&fake, "create_account_public"));
+    let saved: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, vec![AGENT_ACCOUNT.to_string()]);
+}
+
+#[tokio::test]
+async fn shared_mode_refuses_a_designation_file_it_cannot_read() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+    ]);
+    let (s, dir) = shared_server(fake.clone(), &[AGENT_ACCOUNT]);
+    std::fs::write(dir.path().join("agent-accounts.json"), "[\"e9ce").unwrap();
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("agent-accounts.json"), "{}", text(&r));
+    assert!(never_called(&fake, "transfer_public"));
+}
+
+#[tokio::test]
+async fn shared_mode_status_never_claims_to_have_opened_the_wallet() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("get_current_block_height", "78120"),
+    ]);
+    let (s, _dir) = shared_server(fake, &[AGENT_ACCOUNT]);
+    let b = body(&s.wallet_status().await.unwrap());
+    assert_eq!(b["opened_by_this_server"], false, "{b}");
+    assert_eq!(b["warning"], Value::Null, "{b}");
+}
+
+#[tokio::test]
+async fn shared_mode_designates_an_account_only_once_the_wallet_saved_it() {
+    // An unsaved account vanishes on restart: designating it would leave the
+    // designation pointing at an account the wallet no longer holds.
+    let new_id = "8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1";
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        lez("create_account_public", &format!(r#""{new_id}""#)),
+        lez("save", "1"),
+    ]);
+    let (s, dir) = shared_server(fake, &[]);
+    let r = s.wallet_new_account().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["saved"], false);
+    let saved = std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap();
+    assert_eq!(saved.trim(), "[]", "not designated: {saved}");
+}
+
+#[tokio::test]
+async fn an_unclear_create_reply_never_designates_the_users_accounts() {
+    let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+        crate::logosctl::RawOutput {
+            code: 4,
+            stdout: r#"{"code":"METHOD_FAILED","error":{"code":"timeout","message":"timed out"},"message":"timeout","status":"error"}"#.into(),
+            stderr: String::new(),
+        },
+        // a later transfer attempt from the user's own account
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", &user_wallet_accounts()),
+    ]);
+    let (s, dir) = shared_server(fake.clone(), &[]);
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let saved = std::fs::read_to_string(dir.path().join("agent-accounts.json")).unwrap();
+    assert_eq!(saved.trim(), "[]", "nothing designated: {saved}");
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(RLN_PAYER, AGENT_FROM, "1"),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.get(3).map(String::as_str) != Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn when_the_host_owns_messaging_connect_only_reports() {
+    let uninit = r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let fake = FakeRunner::with(vec![out(uninit)]);
+    let s = LogosServer::new(
+        Arc::new(Logosctl::new(fake.clone())),
+        Arc::new(EventStore::default()),
+        None,
+        NodeSettings {
+            preset: "logos.test".into(),
+            mode: "Edge".into(),
+            config_dir: None,
+            wallet: None,
+            discovery_bootstrap: vec![],
+            host_owns_messaging: true,
+        },
+    );
+    let r = s.messaging_connect().await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("Basecamp"), "{}", text(&r));
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "no module load, no createNode, no start: {calls:?}"
+    );
 }

@@ -79,7 +79,18 @@ impl Arg {
             Arg::Str(s) => format!("str:{s}"),
             Arg::Int(i) => i.to_string(),
             Arg::Bool(b) => b.to_string(),
-            Arg::Bytes(b) => format!("json:{}", json!({ "_bytes": URL_SAFE_NO_PAD.encode(b) })),
+            Arg::Bytes(_) => format!("json:{}", self.to_json()),
+        }
+    }
+
+    /// The argument as a JSON value, the form in-process SDK calls take. Bytes
+    /// use the protocol's tagged form, `{"_bytes": <unpadded base64url>}`.
+    pub fn to_json(&self) -> Value {
+        match self {
+            Arg::Str(s) => json!(s),
+            Arg::Int(i) => json!(i),
+            Arg::Bool(b) => json!(b),
+            Arg::Bytes(b) => json!({ "_bytes": URL_SAFE_NO_PAD.encode(b) }),
         }
     }
 }
@@ -283,8 +294,11 @@ impl crate::node::Node for Logosctl {
         Box::pin(Logosctl::call(self, module, method, args))
     }
 
-    fn status(&self) -> crate::node::NodeFuture<'_, Value> {
-        Box::pin(self.command(&["status"]))
+    fn status(&self) -> crate::node::NodeFuture<'_, crate::node::NodeStatus> {
+        Box::pin(async move {
+            let v = self.command(&["status"]).await?;
+            Ok(crate::node::NodeStatus::from_logosctl(&v))
+        })
     }
 
     fn ensure_loaded<'a>(&'a self, module: &'a str) -> crate::node::NodeFuture<'a, bool> {

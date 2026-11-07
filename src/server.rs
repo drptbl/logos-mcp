@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -38,26 +38,67 @@ pub struct NodeSettings {
     pub preset: String,
     pub mode: String,
     pub config_dir: Option<String>,
-    /// The dedicated agent wallet. Wallet tools are off without it.
-    pub wallet: Option<WalletPaths>,
+    /// Which wallet the agent uses. Wallet tools are off without one.
+    pub wallet: Option<WalletMode>,
     /// `/.../p2p/<peer id>` addresses of discovery peers. Discovery tools are off without them.
     pub discovery_bootstrap: Vec<String>,
+    /// The host (Basecamp) runs the messaging node: never create or start it, only report on it.
+    pub host_owns_messaging: bool,
 }
 
 /// The open agent wallet, as `ensure_wallet` found or left it.
 struct WalletHandle {
     sequencer: String,
     opened_now: bool,
-    opened_by_this_server: bool,
+    /// The agent may act on this wallet: dedicated mode, it is the wallet this
+    /// server opened; shared mode, it holds every designated agent account.
+    trusted: bool,
     accounts: Vec<Value>,
+    /// Accounts the agent may send from.
+    agent_ids: BTreeSet<String>,
+    shared: bool,
 }
 
 impl WalletHandle {
     fn warning(&self) -> Option<&'static str> {
-        (!self.opened_by_this_server).then_some(
-            "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
-        )
+        match (self.trusted, self.shared) {
+            (false, false) => Some(
+                "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
+            ),
+            (false, true) => Some(
+                "the open wallet doesn't hold the agent accounts: open the wallet that has them",
+            ),
+            (true, true) if self.agent_ids.is_empty() => {
+                Some("no agent account yet: create one with wallet_new_account")
+            }
+            (true, _) => None,
+        }
     }
+}
+
+/// Read the designated agent accounts of shared mode. A missing file means none
+/// yet; a file that can't be read is an error, never an empty designation.
+fn load_agent_accounts(file: &Path) -> Result<BTreeSet<String>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|e| format!("{} is not valid, fix or restore it: {e}", file.display()))
+}
+
+/// Add `id` to the designation, re-reading the file in case it changed meanwhile.
+fn designate(file: &Path, id: &str) -> Result<(), String> {
+    let mut ids = load_agent_accounts(file)?;
+    ids.insert(id.to_string());
+    save_agent_accounts(file, &ids).map_err(|e| e.to_string())
+}
+
+fn save_agent_accounts(file: &Path, ids: &BTreeSet<String>) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(&ids.iter().collect::<Vec<_>>())?;
+    guard::write_private(file, text.as_bytes())
 }
 
 /// What a `transfer_public` reply proves. Only an explained refusal proves nothing
@@ -100,6 +141,16 @@ fn account_ids(accounts: &[Value]) -> BTreeSet<String> {
                 .map(str::to_string)
         })
         .collect()
+}
+
+/// How the agent gets a wallet.
+#[derive(Debug, Clone)]
+pub enum WalletMode {
+    /// Its own wallet files, which this server opens (the standalone binary).
+    Dedicated(WalletPaths),
+    /// The wallet the user has open (Basecamp). The agent may only send from the
+    /// accounts listed in `agent_accounts_file`, which it adds to by creating new ones.
+    Shared { agent_accounts_file: PathBuf },
 }
 
 /// Where the operator's agent wallet lives: the `lez_core` config and key storage.
@@ -261,7 +312,7 @@ impl LogosServer {
         })
     }
 
-    fn wallet(&self) -> Result<&WalletPaths, String> {
+    fn wallet(&self) -> Result<&WalletMode, String> {
         self.settings.wallet.as_ref().ok_or_else(|| {
             "wallet tools are disabled: start the server with --wallet-config and --wallet-storage"
                 .to_string()
@@ -276,23 +327,14 @@ impl LogosServer {
         }
     }
 
-    /// The daemon's pid and lez_core's uptime, to tell whether either restarted.
-    async fn lez_instance(&self) -> Result<(u64, u64), String> {
+    /// The runtime instance and lez_core's uptime, to tell whether either restarted.
+    async fn lez_instance(&self) -> Result<(String, u64), String> {
         let status = self.node.status().await.map_err(|e| e.to_string())?;
-        let pid = status.pointer("/daemon/pid").and_then(Value::as_u64);
-        let uptime = status
-            .get("modules")
-            .and_then(Value::as_array)
-            .and_then(|m| {
-                m.iter()
-                    .find(|m| m.get("name").and_then(Value::as_str) == Some(LEZ))
-            })
-            .and_then(|m| m.get("uptime_seconds"))
-            .and_then(Value::as_u64);
-        match (pid, uptime) {
-            (Some(pid), Some(uptime)) => Ok((pid, uptime)),
-            _ => Err("could not read the daemon and lez_core status".into()),
-        }
+        let uptime = status.module(LEZ).and_then(|m| m.uptime_seconds);
+        status
+            .instance
+            .zip(uptime)
+            .ok_or_else(|| "could not read the daemon and lez_core status".into())
     }
 
     async fn list_accounts(&self) -> Result<Vec<Value>, String> {
@@ -320,18 +362,42 @@ impl LogosServer {
         &self,
         agent_accounts: &mut Option<BTreeSet<String>>,
     ) -> Result<WalletHandle, String> {
-        let paths = self.wallet()?;
+        let paths = match self.wallet()? {
+            WalletMode::Dedicated(paths) => paths,
+            WalletMode::Shared {
+                agent_accounts_file,
+            } => {
+                // Basecamp's wallet: never opened here, only used when the user has it open.
+                // The file is the designation's one source, read under the wallet lock.
+                let designated = load_agent_accounts(agent_accounts_file)?;
+                let addr = self.sequencer_addr().await?;
+                if addr.is_empty() {
+                    return Err("no wallet is open: open your wallet in Basecamp first".into());
+                }
+                let accounts = self.list_accounts().await?;
+                let trusted = designated.is_subset(&account_ids(&accounts));
+                return Ok(WalletHandle {
+                    sequencer: addr,
+                    opened_now: false,
+                    trusted,
+                    agent_ids: if trusted { designated } else { BTreeSet::new() },
+                    accounts,
+                    shared: true,
+                });
+            }
+        };
         let addr = self.sequencer_addr().await?;
         if !addr.is_empty() {
             let accounts = self.list_accounts().await?;
-            let is_agent = agent_accounts
-                .as_ref()
-                .is_some_and(|known| *known == account_ids(&accounts));
+            let ids = account_ids(&accounts);
+            let is_agent = agent_accounts.as_ref().is_some_and(|known| *known == ids);
             return Ok(WalletHandle {
                 sequencer: addr,
                 opened_now: false,
-                opened_by_this_server: is_agent,
+                trusted: is_agent,
+                agent_ids: if is_agent { ids } else { BTreeSet::new() },
                 accounts,
+                shared: false,
             });
         }
         let before = self.lez_instance().await?;
@@ -361,12 +427,15 @@ impl LogosServer {
                 "lez_core restarted while the agent wallet was being opened; try again".into(),
             );
         }
-        *agent_accounts = Some(account_ids(&accounts));
+        let ids = account_ids(&accounts);
+        *agent_accounts = Some(ids.clone());
         Ok(WalletHandle {
             sequencer: addr,
             opened_now: true,
-            opened_by_this_server: true,
+            trusted: true,
+            agent_ids: ids,
             accounts,
+            shared: false,
         })
     }
 
@@ -386,7 +455,7 @@ impl LogosServer {
         ok(json!({
             "open": true,
             "opened_now": w.opened_now,
-            "opened_by_this_server": w.opened_by_this_server,
+            "opened_by_this_server": w.trusted && !w.shared,
             "warning": w.warning(),
             "sequencer": w.sequencer,
             "block_height": height,
@@ -428,6 +497,7 @@ impl LogosServer {
                 _ => None,
             };
             accounts.push(json!({
+                "agent": w.agent_ids.contains(id),
                 "address": address,
                 "account_id": id,
                 "public": public,
@@ -451,7 +521,7 @@ impl LogosServer {
     )]
     async fn node_status(&self) -> Result<CallToolResult, McpError> {
         let daemon = match self.node.status().await {
-            Ok(v) => v,
+            Ok(s) => s.details,
             Err(e) => return logos_fail(e),
         };
         let connection = match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
@@ -477,6 +547,21 @@ impl LogosServer {
         description = "Bring up the messaging node on the configured network. Safe to call repeatedly: it only creates and starts a node when none exists, and leaves an existing node as it is."
     )]
     async fn messaging_connect(&self) -> Result<CallToolResult, McpError> {
+        if self.settings.host_owns_messaging {
+            return match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
+                Ok(connection) => ok(json!({
+                    "network": self.settings.preset,
+                    "created": false,
+                    "started": false,
+                    "connection": connection,
+                    "note": "Basecamp runs the messaging node; this server only uses it",
+                })),
+                Err(e) if is_uninitialized(&e) => fail(
+                    "messaging isn't running: start it in Basecamp (this server never starts Basecamp's node)",
+                ),
+                Err(e) => logos_fail(e),
+            };
+        }
         match self.node.ensure_loaded(DELIVERY).await {
             // Calls right after a load can fail while the module settles.
             Ok(true) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
@@ -761,18 +846,17 @@ impl LogosServer {
             Ok(w) => w,
             Err(e) => return fail(e),
         };
-        if !w.opened_by_this_server {
-            return fail(
-                "refusing to send: the wallet open in lez_core is not the agent wallet this server opened",
-            );
+        if let Some(warning) = w.warning() {
+            return fail(format!("refusing to send: {warning}"));
         }
-        let sender_is_ours = w.accounts.iter().any(|a| {
-            a.get("account_id").and_then(Value::as_str) == Some(from.as_str())
-                && a.get("is_public").and_then(Value::as_bool) == Some(true)
-        });
+        let sender_is_ours = w.agent_ids.contains(&from)
+            && w.accounts.iter().any(|a| {
+                a.get("account_id").and_then(Value::as_str) == Some(from.as_str())
+                    && a.get("is_public").and_then(Value::as_bool) == Some(true)
+            });
         if !sender_is_ours {
             return fail(
-                "sender must be one of the agent wallet's public accounts (see wallet_accounts)",
+                "sender must be one of the agent accounts, marked agent in wallet_accounts",
             );
         }
         if from == to {
@@ -828,10 +912,10 @@ impl LogosServer {
             Ok(w) => w,
             Err(e) => return fail(e),
         };
-        if !w.opened_by_this_server {
-            return fail(
-                "refusing: the wallet open in lez_core is not the agent wallet this server opened",
-            );
+        // Shared mode with nothing designated yet is trusted: this is how the agent
+        // gets its first account. Never in a wallet that lacks the existing ones.
+        if !w.trusted {
+            return fail(format!("refusing: {}", w.warning().unwrap_or_default()));
         }
         // lez_core returns an empty string when it can't create the account.
         let id = match self.node.call(LEZ, "create_account_public", &[]).await {
@@ -839,8 +923,11 @@ impl LogosServer {
             unclear => {
                 // The account may exist even though the reply doesn't say so. Still
                 // holding the wallet lock, adopt the wallet's current accounts so the
-                // identity check doesn't lock the agent out.
-                if let Ok(accounts) = self.list_accounts().await {
+                // identity check doesn't lock the agent out. Never in shared mode:
+                // that would designate the user's own accounts as the agent's.
+                if !w.shared
+                    && let Ok(accounts) = self.list_accounts().await
+                {
                     *agent_accounts = Some(account_ids(&accounts));
                 }
                 let detail = match unclear {
@@ -852,17 +939,37 @@ impl LogosServer {
                 ));
             }
         };
-        // Keep the identity check in step with the wallet's new account set.
-        if let Some(known) = agent_accounts.as_mut() {
+        let saved = matches!(self.node.call(LEZ, "save", &[]).await, Ok(v) if v == json!(0));
+        // Keep the designation (shared) or the identity check (dedicated) in step.
+        // Shared mode designates only a saved account: one lost on restart would
+        // leave the designation pointing at an account the wallet no longer holds.
+        let mut designated = !w.shared;
+        if let Some(WalletMode::Shared {
+            agent_accounts_file,
+        }) = &self.settings.wallet
+        {
+            designated = saved
+                && match designate(agent_accounts_file, &id) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("could not save the agent accounts: {e}");
+                        false
+                    }
+                };
+        } else if let Some(known) = agent_accounts.as_mut() {
             known.insert(id.clone());
         }
-        let saved = matches!(self.node.call(LEZ, "save", &[]).await, Ok(v) if v == json!(0));
         let address = guard::account_id_base58(&id).map(|b58| format!("Public/{b58}"));
         ok(json!({
             "address": address,
             "account_id": id,
             "saved": saved,
-            "note": (!saved).then_some("lez_core did not confirm saving the wallet; the account may be lost on restart"),
+            "note": match (saved, designated) {
+                (false, false) => Some("lez_core did not confirm saving the wallet, so the account may be lost on restart and was not made an agent account"),
+                (false, true) => Some("lez_core did not confirm saving the wallet; the account may be lost on restart"),
+                (true, false) => Some("the account exists, but marking it as an agent account could not be saved"),
+                (true, true) => None,
+            },
         }))
     }
 

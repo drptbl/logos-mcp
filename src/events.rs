@@ -113,6 +113,22 @@ impl EventStore {
         self.apply(event, data);
     }
 
+    /// Apply one event from any source. `data` holds the event's arguments, either
+    /// named `arg0`, `arg1`… (logosctl watch) or as a positional array.
+    pub fn apply_event(&self, event: &str, data: &Value) {
+        match data {
+            Value::Array(args) => {
+                let named: serde_json::Map<String, Value> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (format!("arg{i}"), v.clone()))
+                    .collect();
+                self.apply(event, &Value::Object(named));
+            }
+            other => self.apply(event, other),
+        }
+    }
+
     fn apply(&self, event: &str, data: &Value) {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
