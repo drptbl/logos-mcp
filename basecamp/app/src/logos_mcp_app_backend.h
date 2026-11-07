@@ -18,6 +18,8 @@ public:
     QString setAgentAccount(QString accountId, bool agent) override;
     QString newAgentAccount() override;
     void refreshWallet() override;
+    QString approve(QString requestId) override;
+    QString deny(QString requestId) override;
 
     void onContextReady() override;
 

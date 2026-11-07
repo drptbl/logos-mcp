@@ -59,6 +59,20 @@ QString LogosMcpAppBackend::newAgentAccount()
     return reply;
 }
 
+QString LogosMcpAppBackend::approve(QString requestId)
+{
+    const QString reply = checked(modules().logos_mcp.approve(requestId));
+    setApprovals(checked(modules().logos_mcp.approvals()));
+    return reply;
+}
+
+QString LogosMcpAppBackend::deny(QString requestId)
+{
+    const QString reply = checked(modules().logos_mcp.deny(requestId));
+    setApprovals(checked(modules().logos_mcp.approvals()));
+    return reply;
+}
+
 void LogosMcpAppBackend::refreshWallet()
 {
     setWallet(checked(modules().logos_mcp.wallet()));
@@ -84,6 +98,8 @@ void LogosMcpAppBackend::refresh()
     const QString permissions = checked(modules().logos_mcp.permissions());
     if (!isError(permissions))
         setPermissions(permissions);
+    // Every poll: a waiting agent gives up after a minute.
+    setApprovals(checked(modules().logos_mcp.approvals()));
 
     const QString reply = checked(modules().logos_mcp.activity(m_after));
     if (isError(reply))

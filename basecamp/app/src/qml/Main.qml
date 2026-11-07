@@ -17,6 +17,7 @@ Item {
     readonly property var permissions: parse(backend ? backend.permissions : "{}", {})
     readonly property var activity: parse(backend ? backend.activity : "[]", [])
     readonly property var wallet: parse(backend ? backend.wallet : "{}", {})
+    readonly property var approvals: parse(backend ? backend.approvals : "{}", {})
     // The account waiting for the user to confirm handing it over.
     property var handOver: null
 
@@ -29,7 +30,8 @@ Item {
         { key: "storage", title: qsTr("Storage"), detail: qsTr("Upload and download files in the files folder") },
         { key: "wallet", title: qsTr("Wallet"), detail: qsTr("See accounts and balances, create agent accounts") },
         { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts") },
-        { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services") }
+        { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services") },
+        { key: "ask_before_transfer", title: qsTr("Ask me before each transfer"), detail: qsTr("Every transfer waits for your OK in the Wallet tab. Off: the agent sends on its own") }
     ]
 
     function parse(text, fallback) {
@@ -205,7 +207,10 @@ Item {
                         // Always shows what logos_mcp saved: any flip by input snaps back,
                         // and a click only asks for the change.
                         Switch {
-                            readonly property bool saved: root.permissions[modelData.key] !== false
+                            // Asking is off unless saved on; tool groups are on unless saved off.
+                            readonly property bool saved: modelData.key === "ask_before_transfer"
+                                ? root.permissions[modelData.key] === true
+                                : root.permissions[modelData.key] !== false
                             checked: saved
                             onCheckedChanged: if (checked !== saved) checked = Qt.binding(function () { return saved })
                             enabled: root.ready
@@ -253,6 +258,42 @@ Item {
                         onClicked: root.call(root.backend.newAgentAccount(), function (reply) {
                             root.notice = reply.note || qsTr("New agent account %1").arg(reply.address)
                         })
+                    }
+                }
+
+                // Transfers the agent asked for, waiting for the user's answer.
+                LogosText {
+                    visible: (root.approvals.waiting || []).length > 0
+                    font.weight: Theme.typography.weightBold
+                    color: Theme.palette.warning
+                    text: qsTr("Waiting for you")
+                }
+                Repeater {
+                    model: root.approvals.waiting || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        LogosText {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: qsTr("%1 from %2 to %3, asked at %4")
+                                .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
+                                .arg(modelData.to).arg(root.time(modelData.requested_at))
+                        }
+                        LogosButton {
+                            text: qsTr("Deny")
+                            enabled: root.ready
+                            onClicked: root.call(root.backend.deny(modelData.id), function () {
+                                root.notice = qsTr("Denied: the transfer will not be sent.")
+                            })
+                        }
+                        LogosButton {
+                            text: qsTr("Approve")
+                            enabled: root.ready
+                            onClicked: root.call(root.backend.approve(modelData.id), function () {
+                                root.notice = qsTr("Approved: sending it now.")
+                            })
+                        }
                     }
                 }
 
