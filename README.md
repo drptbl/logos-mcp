@@ -1,10 +1,10 @@
 # logos-mcp
 
-MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Your agent can send and receive messages over Logos Messaging, store and fetch files on Logos Storage and check node health, from Claude Code, Codex or any other MCP client.
+MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Your agent can send and receive messages over Logos Messaging, store and fetch files on Logos Storage, find other nodes through discovery, hold and send LEZ from its own accounts and check node health, from Claude Code, Codex or any other MCP client.
 
-It talks to the node through `logosctl`, the official headless Logos runtime, so it works with the same modules and session as your node.
+It runs two ways: as a standalone binary that talks to your node through `logosctl`, the official headless Logos runtime, or as a module inside Basecamp, with the AI Agent app to control what the agent may do.
 
-Early release. Logos itself is on testnet (`v0.3`) and is not meant for real funds yet. Tested on macOS (Apple Silicon) with `logosctl` `0.3.2`, `delivery_module` `0.3.3` and `storage_module` `3.0.2`.
+Early release. Logos itself is on testnet (`v0.3`) and is not meant for real funds yet. Tested on macOS (Apple Silicon) with `logosctl` `0.3.2`, `delivery_module` `0.3.3`, `storage_module` `3.0.2` and Basecamp `0.4.0-rc.2`.
 
 ## Tools
 
@@ -13,13 +13,14 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `node_status` | daemon health, loaded modules, messaging connection and server settings |
 | `messaging_connect` | creates and starts the messaging node when none exists. Leaves an existing node as it is |
 | `messaging_subscribe` / `messaging_unsubscribe` | follow or stop following a content topic |
-| `messaging_send` | publishes text or base64 bytes to a topic and returns a `request_id` |
+| `messaging_send` | publishes text or base64 bytes to a topic and returns a `request_id`. Refused up front when RLN can't send right now |
 | `messaging_send_status` | queued, sent, propagated or error for a `request_id` |
 | `messaging_read` | messages received on a subscribed topic, paged with `after_seq` |
 | `rln_status` | whether the node can send right now: RLN membership state and messages left in this epoch |
 | `wallet_status` | whether the agent wallet is open, its sequencer and the chain height |
-| `wallet_accounts` | the agent wallet's accounts with their addresses and balances in lepta |
-| `wallet_transfer` | sends lepta from one of the agent wallet's public accounts to a public account |
+| `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts |
+| `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app |
+| `wallet_transfer_status` | where a transfer that waited for approval stands, with its `tx_hash` once sent |
 | `wallet_new_account` | creates a public account in the agent wallet, for example a fresh receive address per job |
 | `discovery_advertise` / `discovery_stop` | advertises a service on the Logos discovery network, or stops |
 | `discovery_lookup` | finds nodes that advertise a service |
