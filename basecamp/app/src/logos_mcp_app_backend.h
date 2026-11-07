@@ -15,6 +15,9 @@ public:
     QString token() override;
     QString rotateToken() override;
     QString setPermission(QString group, bool enabled) override;
+    QString setAgentAccount(QString accountId, bool agent) override;
+    QString newAgentAccount() override;
+    void refreshWallet() override;
 
     void onContextReady() override;
 
@@ -22,6 +25,8 @@ private:
     void refresh();
 
     QTimer m_poll;
+    // Slower than m_poll: reading the wallet reads one balance per account.
+    QTimer m_walletPoll;
     // Newest calls last, at most kKeep of them.
     QJsonArray m_activity;
     qlonglong m_after = 0;

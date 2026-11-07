@@ -7,6 +7,7 @@
 
 namespace {
 constexpr int kPollMs = 2000;
+constexpr int kWalletPollMs = 10000;
 constexpr int kFirstPollMs = 250;
 constexpr int kKeep = 200;
 
@@ -43,13 +44,38 @@ QString LogosMcpAppBackend::setPermission(QString group, bool enabled)
     return reply;
 }
 
+QString LogosMcpAppBackend::setAgentAccount(QString accountId, bool agent)
+{
+    const QString reply = checked(modules().logos_mcp.set_agent_account(accountId, agent));
+    // After replying: reading every balance first could make a saved change time out.
+    QTimer::singleShot(0, [this]() { refreshWallet(); });
+    return reply;
+}
+
+QString LogosMcpAppBackend::newAgentAccount()
+{
+    const QString reply = checked(modules().logos_mcp.new_agent_account());
+    QTimer::singleShot(0, [this]() { refreshWallet(); });
+    return reply;
+}
+
+void LogosMcpAppBackend::refreshWallet()
+{
+    setWallet(checked(modules().logos_mcp.wallet()));
+}
+
 void LogosMcpAppBackend::onContextReady()
 {
     QObject::connect(&m_poll, &QTimer::timeout, [this]() { refresh(); });
     m_poll.start(kPollMs);
+    QObject::connect(&m_walletPoll, &QTimer::timeout, [this]() { refreshWallet(); });
+    m_walletPoll.start(kWalletPollMs);
     // Not from inside the hook: on Basecamp 0.4.0-rc.2 calls made this early are
     // refused because the backend's token isn't registered yet.
-    QTimer::singleShot(kFirstPollMs, [this]() { refresh(); });
+    QTimer::singleShot(kFirstPollMs, [this]() {
+        refresh();
+        refreshWallet();
+    });
 }
 
 void LogosMcpAppBackend::refresh()

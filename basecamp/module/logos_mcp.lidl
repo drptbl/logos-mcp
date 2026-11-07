@@ -1,5 +1,5 @@
 module logos_mcp {
-  version "0.2.1"
+  version "0.3.0"
   description "MCP server for AI agents, inside Basecamp: messaging, storage, wallet and discovery"
   method status() -> tstr
   method token() -> tstr
@@ -7,4 +7,7 @@ module logos_mcp {
   method permissions() -> tstr
   method set_permission(group: tstr, enabled: bool) -> tstr
   method activity(after: int) -> tstr
+  method wallet() -> tstr
+  method set_agent_account(account_id: tstr, agent: bool) -> tstr
+  method new_agent_account() -> tstr
 }
