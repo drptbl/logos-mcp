@@ -8,3 +8,6 @@ pub mod guard;
 pub mod logosctl;
 pub mod node;
 pub mod server;
+
+#[cfg(feature = "module")]
+pub mod module;
