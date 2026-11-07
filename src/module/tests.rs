@@ -33,7 +33,10 @@ async fn requests_without_the_right_token_are_refused() {
         with_token(initialize(), &"cd".repeat(32)),
         with_token(initialize(), ""),
     ] {
-        let resp = router(|| Ok(Probe), &token).oneshot(req).await.unwrap();
+        let resp = router(|| Ok(Probe), &Tokens::from(token.clone()))
+            .oneshot(req)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 401);
     }
 }
@@ -41,7 +44,7 @@ async fn requests_without_the_right_token_are_refused() {
 #[tokio::test]
 async fn the_right_token_reaches_the_mcp_server() {
     let token = Token::from_hex("ab".repeat(32)).unwrap();
-    let resp = router(|| Ok(Probe), &token)
+    let resp = router(|| Ok(Probe), &Tokens::from(token.clone()))
         .oneshot(with_token(initialize(), &"ab".repeat(32)))
         .await
         .unwrap();
@@ -95,7 +98,10 @@ async fn a_web_page_is_refused_even_with_the_token() {
     let mut req = with_token(initialize(), &"ab".repeat(32));
     req.headers_mut()
         .insert("origin", "https://evil.example".parse().unwrap());
-    let resp = router(|| Ok(Probe), &token).oneshot(req).await.unwrap();
+    let resp = router(|| Ok(Probe), &Tokens::from(token.clone()))
+        .oneshot(req)
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 403);
 }
 
@@ -139,4 +145,110 @@ fn a_module_basecamp_has_not_loaded_is_named_plainly() {
     // Anything else keeps its detail.
     let other = sdk_error("lez_core", "timed out".into());
     assert!(matches!(other, LogosError::Method(m) if m == "timed out"));
+}
+
+#[tokio::test]
+async fn a_rotated_token_replaces_the_old_one_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = Tokens::load_or_create(dir.path()).unwrap();
+    let old = tokens.current();
+    let app = router(|| Ok(Probe), &tokens);
+    let status = |t: &str| {
+        let app = app.clone();
+        let req = with_token(initialize(), t);
+        async move { app.oneshot(req).await.unwrap().status() }
+    };
+    assert_eq!(status(old.as_str()).await, 200);
+
+    let new = tokens.rotate().unwrap();
+    assert_ne!(new.as_str(), old.as_str());
+    assert_eq!(status(old.as_str()).await, 401);
+    assert_eq!(status(new.as_str()).await, 200);
+    // The file holds the new one, so a restart keeps it.
+    assert_eq!(
+        Tokens::load_or_create(dir.path())
+            .unwrap()
+            .current()
+            .as_str(),
+        new.as_str()
+    );
+}
+
+#[test]
+fn a_permission_change_is_saved_and_applies_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let live = control.tool_groups();
+    // A hand edit made after the module started is kept.
+    let path = dir.path().join(CONFIG_FILE);
+    let edited = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("8765", "9000")
+        .replace("\"storage\": true", "\"storage\": false");
+    std::fs::write(&path, edited).unwrap();
+
+    let now = control.set_permission("transfers", false).unwrap();
+    assert_eq!(now["transfers"], false);
+    assert!(!live.lock().unwrap().allows("wallet_transfer"));
+    let saved = ModuleConfig::load_or_create(dir.path()).unwrap();
+    assert!(!saved.tools.transfers);
+    assert_eq!(saved.port, 9000);
+    assert!(!saved.tools.storage, "a hand edit to another group is kept");
+    assert!(
+        !live.lock().unwrap().allows("storage_upload"),
+        "and applies live"
+    );
+
+    assert!(control.set_permission("everything", false).is_err());
+    assert_eq!(control.permissions()["transfers"], false);
+}
+
+#[test]
+fn activity_is_reported_after_a_sequence_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let log = control.activity_log();
+    log.record("node_status", &serde_json::json!({}), true, "ok");
+    log.record("wallet_status", &serde_json::json!({}), false, "no wallet");
+    let page = control.activity(1);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(page["entries"][0]["tool"], "wallet_status");
+    assert_eq!(page["next"], 2);
+    assert_eq!(
+        control.activity(2)["next"],
+        2,
+        "nothing newer keeps the cursor"
+    );
+}
+
+#[test]
+fn status_names_the_endpoint_and_where_its_files_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let s = control.status(None);
+    assert_eq!(s["url"], "http://127.0.0.1:8765/mcp");
+    assert_eq!(s["running"], true);
+    assert!(s["token_file"].as_str().unwrap().ends_with(TOKEN_FILE));
+    assert!(
+        s.get("token").is_none(),
+        "the token itself is never in status"
+    );
+    let failed = control.status(Some("port in use"));
+    assert_eq!(
+        (failed["running"].clone(), failed["error"].clone()),
+        (false.into(), "port in use".into())
+    );
+}
+
+#[test]
+fn a_cursor_past_the_log_starts_over() {
+    // The activity file was deleted and the sequence restarted below the app's cursor.
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    control
+        .activity_log()
+        .record("node_status", &serde_json::json!({}), true, "ok");
+    let page = control.activity(57);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(page["next"], 1);
 }

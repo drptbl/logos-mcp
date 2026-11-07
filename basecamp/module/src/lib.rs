@@ -12,7 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 use logos_mcp::{
     events::EventStore,
     logosctl::{unwrap_std_result, Arg, LogosError},
-    module::{router, sdk_error, ModuleConfig, Token},
+    module::{router, sdk_error, Control},
     node::{Node, NodeFuture, NodeStatus},
     server::{LogosServer, NodeSettings, WalletMode},
 };
@@ -117,13 +117,15 @@ impl Node for InProcessNode {
     }
 }
 
-/// What `status()` reports, set once the server is up (or failed to start).
-static STATE: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+/// The module's control surface, once its data folder has been read.
+static CONTROL: std::sync::OnceLock<Control> = std::sync::OnceLock::new();
+/// Why the endpoint isn't serving, when it isn't.
+static ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
 
-fn start(data_dir: PathBuf) -> Result<Value, String> {
-    let config = ModuleConfig::load_or_create(&data_dir)?;
-    let token = Token::load_or_create(&data_dir).map_err(|e| e.to_string())?;
+fn start(data_dir: PathBuf) -> Result<(), String> {
+    let control = CONTROL.get().ok_or("the data folder was not opened")?;
+    let config = control.config();
     let files = config.files_root(&data_dir)?;
     for peer in &config.discovery_bootstrap {
         logos_mcp::guard::bootstrap_node(peer)?;
@@ -140,8 +142,13 @@ fn start(data_dir: PathBuf) -> Result<Value, String> {
     };
     let events = Arc::new(EventStore::default());
     let node: Arc<dyn Node> = Arc::new(InProcessNode);
-    let server = LogosServer::new(node.clone(), events.clone(), files, settings);
-    let app = router(move || Ok(server.clone()), &token);
+    let server = control.attach(LogosServer::new(
+        node.clone(),
+        events.clone(),
+        files,
+        settings,
+    ));
+    let app = router(move || Ok(server.clone()), control.tokens());
 
     let stop = STOP
         .get_or_init(tokio_util::sync::CancellationToken::new)
@@ -176,11 +183,37 @@ fn start(data_dir: PathBuf) -> Result<Value, String> {
     for (module, _) in WATCHED {
         node.watch(module, events.clone());
     }
-    Ok(json!({
-        "url": format!("http://127.0.0.1:{port}/mcp"),
-        "token_file": data_dir.join(logos_mcp::module::TOKEN_FILE),
-        "config_file": data_dir.join(logos_mcp::module::CONFIG_FILE),
-    }))
+    Ok(())
+}
+
+fn error_json(e: impl std::fmt::Display) -> String {
+    json!({ "error": e.to_string() }).to_string()
+}
+
+/// The only module allowed to read the token, change permissions or read activity:
+/// the Agent app's backend. Anything else, including an unnamed caller, is refused.
+const APP_BACKEND: &str = "logos_mcp_app_backend";
+
+/// `f` on the control surface, for the Agent app only.
+fn for_app(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
+    if !logos_rust_sdk::current_caller().is_module(APP_BACKEND) {
+        return error_json(format!("only {APP_BACKEND} may call this"));
+    }
+    with_control(f)
+}
+
+/// `f` on the control surface, or why there is none.
+fn with_control(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
+    match CONTROL.get() {
+        Some(control) => f(control).map_or_else(error_json, |v| v.to_string()),
+        None => error_json(
+            ERROR
+                .lock()
+                .ok()
+                .and_then(|e| e.clone())
+                .unwrap_or_else(|| "starting".into()),
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -188,12 +221,17 @@ struct ModuleImpl;
 
 impl LogosMcpModule for ModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
-        let state = match start(PathBuf::from(&ctx.instance_persistence_path)) {
-            Ok(v) => v,
-            Err(e) => json!({ "error": e }),
-        };
-        if let Ok(mut s) = STATE.lock() {
-            *s = Some(state);
+        let dir = PathBuf::from(&ctx.instance_persistence_path);
+        // Open the data folder first, so a broken config is reported, not a panic.
+        let result = Control::open(&dir).and_then(|control| {
+            let _ = CONTROL.set(control);
+            start(dir)
+        });
+        if let Err(e) = result {
+            eprintln!("logos_mcp: not serving: {e}");
+            if let Ok(mut err) = ERROR.lock() {
+                *err = Some(e);
+            }
         }
     }
 
@@ -205,12 +243,31 @@ impl LogosMcpModule for ModuleImpl {
     }
 
     fn status(&self) -> String {
-        STATE
-            .lock()
-            .ok()
-            .and_then(|s| s.clone())
-            .unwrap_or_else(|| json!({ "state": "starting" }))
-            .to_string()
+        let error = ERROR.lock().ok().and_then(|e| e.clone());
+        with_control(|c| Ok(c.status(error.as_deref())))
+    }
+
+    fn token(&self) -> String {
+        for_app(|c| Ok(json!({ "token": c.tokens().current().as_str() })))
+    }
+
+    fn rotate_token(&self) -> String {
+        for_app(|c| {
+            let token = c.tokens().rotate().map_err(|e| e.to_string())?;
+            Ok(json!({ "token": token.as_str() }))
+        })
+    }
+
+    fn permissions(&self) -> String {
+        with_control(|c| Ok(c.permissions()))
+    }
+
+    fn set_permission(&self, group: String, enabled: bool) -> String {
+        for_app(|c| c.set_permission(&group, enabled))
+    }
+
+    fn activity(&self, after: i64) -> String {
+        for_app(|c| Ok(c.activity(u64::try_from(after).unwrap_or(0))))
     }
 }
 
