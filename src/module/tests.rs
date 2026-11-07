@@ -249,3 +249,19 @@ fn a_cursor_past_the_log_starts_over() {
     assert_eq!(page["entries"].as_array().unwrap().len(), 1);
     assert_eq!(page["next"], 1);
 }
+
+#[test]
+fn asking_before_each_transfer_is_off_until_switched_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    assert_eq!(control.permissions()["ask_before_transfer"], false);
+    let now = control.set_permission("ask_before_transfer", true).unwrap();
+    assert_eq!(now["ask_before_transfer"], true);
+    assert!(control.tool_groups().borrow().ask_before_transfer);
+    assert!(
+        ModuleConfig::load_or_create(dir.path())
+            .unwrap()
+            .tools
+            .ask_before_transfer
+    );
+}

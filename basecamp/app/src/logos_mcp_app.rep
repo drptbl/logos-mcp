@@ -6,10 +6,14 @@ class LogosMcpApp
     PROP(QString activity="[]" READONLY)
     // The open wallet: its status and accounts, which of them are the agent's.
     PROP(QString wallet="{}" READONLY)
+    // Transfers waiting for the user's approval.
+    PROP(QString approvals="{}" READONLY)
     SLOT(QString token())
     SLOT(QString rotateToken())
     SLOT(QString setPermission(QString group, bool enabled))
     SLOT(QString setAgentAccount(QString accountId, bool agent))
     SLOT(QString newAgentAccount())
     SLOT(void refreshWallet())
+    SLOT(QString approve(QString requestId))
+    SLOT(QString deny(QString requestId))
 }

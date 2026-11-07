@@ -238,3 +238,13 @@ fn message_text_shows_in_the_app_but_never_reaches_the_file() {
     );
     assert_eq!(reopened[2].result, "2 messages, next_after 2");
 }
+
+#[tokio::test]
+async fn waiting_requests_are_capped() {
+    let approvals = Approvals::default();
+    for _ in 0..MAX_WAITING {
+        approvals.request("Public/a", "Public/b", "1").unwrap();
+    }
+    let e = approvals.request("Public/a", "Public/b", "1").unwrap_err();
+    assert!(e.contains("waiting"), "{e}");
+}

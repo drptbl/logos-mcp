@@ -146,7 +146,7 @@ nix build .#lgx-portable
 ```
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
-2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery). A group you turn off disappears from the agent's list and is refused if called
+2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery). A group you turn off disappears from the agent's list and is refused if called. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab
 3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account
 4. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message text shows in the app only, the file keeps its size
 

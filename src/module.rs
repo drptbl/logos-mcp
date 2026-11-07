@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    control::{ActivityLog, ToolGroups},
+    control::{ActivityLog, Approvals, ToolGroups},
     guard::FilesRoot,
     logosctl::LogosError,
     server::LogosServer,
@@ -215,6 +215,8 @@ pub struct Control {
     /// Held while a switch is saved, so two saves can't interleave.
     saving: std::sync::Mutex<()>,
     activity: Arc<ActivityLog>,
+    /// Transfers waiting for the user: one store for every session and the app.
+    approvals: Arc<Approvals>,
 }
 
 impl Control {
@@ -227,6 +229,7 @@ impl Control {
             groups: tokio::sync::watch::Sender::new(config.tools.clone()),
             saving: std::sync::Mutex::new(()),
             activity: Arc::new(ActivityLog::open(dir.join(ACTIVITY_FILE))?),
+            approvals: Arc::default(),
             config,
         })
     }
@@ -253,6 +256,7 @@ impl Control {
         server
             .with_tool_groups(self.tool_groups())
             .with_activity(self.activity_log())
+            .with_approvals(self.approvals.clone())
     }
 
     /// Where clients connect and where the files are. `error` is why the

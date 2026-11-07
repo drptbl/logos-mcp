@@ -319,6 +319,18 @@ impl LogosMcpModule for ModuleImpl {
         for_app(|_| on_server(|s| async move { s.new_agent_account().await }))
     }
 
+    fn approvals(&self) -> String {
+        for_app(|_| on_server(|s| async move { Ok(s.approvals()) }))
+    }
+
+    fn approve(&self, request_id: String) -> String {
+        for_app(|_| on_server(|s| async move { s.approve_transfer(&request_id).await }))
+    }
+
+    fn deny(&self, request_id: String) -> String {
+        for_app(|_| on_server(|s| async move { s.deny_transfer(&request_id) }))
+    }
+
     fn activity(&self, after: i64) -> String {
         for_app(|c| Ok(c.activity(u64::try_from(after).unwrap_or(0))))
     }
