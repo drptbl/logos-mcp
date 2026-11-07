@@ -136,7 +136,7 @@ claude mcp add --transport http logos http://127.0.0.1:8765/mcp --header "Author
 
 Start messaging in Basecamp first. The module never creates or starts the node.
 
-The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
+The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`, or you hand it one of your own accounts in the AI Agent app. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
 
 The AI Agent app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. To build it yourself, install `result/logos-logos_mcp_app-module.lgx` after the module:
 
@@ -147,7 +147,8 @@ nix build .#lgx-portable
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
 2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery). A group you turn off disappears from the agent's list and is refused if called
-3. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message text shows in the app only, the file keeps its size
+3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account
+4. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message text shows in the app only, the file keeps its size
 
 ## Networks
 
