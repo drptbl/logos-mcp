@@ -1,0 +1,24 @@
+{
+  "name": "logos_mcp",
+  "display_name": "logos-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for AI agents: messaging, storage, wallet and discovery through Basecamp",
+  "author": "drptbl",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "general",
+  "main": "logos_mcp_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "module/logos_mcp.lidl",
+    "rust": { "crate": "module", "staticlib": "logos_mcp_module" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
