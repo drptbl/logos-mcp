@@ -16,6 +16,9 @@ Item {
     readonly property var status: parse(backend ? backend.status : "{}", {})
     readonly property var permissions: parse(backend ? backend.permissions : "{}", {})
     readonly property var activity: parse(backend ? backend.activity : "[]", [])
+    readonly property var wallet: parse(backend ? backend.wallet : "{}", {})
+    // The account waiting for the user to confirm handing it over.
+    property var handOver: null
 
     property string token: ""
     property bool tokenShown: false
@@ -55,6 +58,16 @@ Item {
     function connectCommand() {
         return "claude mcp add --transport http logos " + (status.url || "")
             + " --header \"Authorization: Bearer " + token + "\""
+    }
+
+    // lepta as LEZ (1 LEZ = 10^9 lepta), from the integer string itself: no
+    // floating point, so small and very large balances both show exactly.
+    function lez(lepta) {
+        if (lepta === null || lepta === undefined || !/^[0-9]+$/.test(String(lepta))) return "?"
+        const digits = String(lepta).replace(/^0+(?=.)/, "").padStart(10, "0")
+        const whole = digits.slice(0, -9)
+        const fraction = digits.slice(-9).replace(/0+$/, "")
+        return whole + (fraction ? "." + fraction : "") + " LEZ"
     }
 
     function time(seconds) {
@@ -104,6 +117,7 @@ Item {
             Layout.fillWidth: true
             TabButton { text: qsTr("Connect") }
             TabButton { text: qsTr("Permissions") }
+            TabButton { text: qsTr("Wallet") }
             TabButton { text: qsTr("Activity") }
         }
 
@@ -188,20 +202,137 @@ Item {
                             LogosText { Layout.fillWidth: true; text: modelData.title; font.weight: Theme.typography.weightMedium }
                             LogosText { Layout.fillWidth: true; text: modelData.detail; color: Theme.palette.textSecondary; font.pixelSize: Theme.typography.secondaryText }
                         }
+                        // Always shows what logos_mcp saved: any flip by input snaps back,
+                        // and a click only asks for the change.
                         Switch {
-                            checked: root.permissions[modelData.key] !== false
+                            readonly property bool saved: root.permissions[modelData.key] !== false
+                            checked: saved
+                            onCheckedChanged: if (checked !== saved) checked = Qt.binding(function () { return saved })
                             enabled: root.ready
-                            onToggled: {
-                                root.call(root.backend.setPermission(modelData.key, checked), function () {})
-                                // A toggle replaces the binding: put it back, so the switch
-                                // always shows what logos_mcp saved, even if saving failed.
-                                checked = Qt.binding(function () { return root.permissions[modelData.key] !== false })
-                            }
+                            onClicked: root.call(root.backend.setPermission(modelData.key, !saved), function () {})
                         }
                     }
                 }
 
                 Item { Layout.fillHeight: true }
+            }
+
+            // ---- Wallet --------------------------------------------------
+            ColumnLayout {
+                spacing: Theme.spacing.medium
+
+                LogosText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: root.wallet.error ? Theme.palette.warning : Theme.palette.textSecondary
+                    text: root.wallet.error ? root.wallet.error
+                        : qsTr("The agent sends only from its agent accounts. Fund them with what it may spend.")
+                }
+
+                LogosText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    visible: !!root.wallet.warning
+                    color: Theme.palette.warning
+                    text: root.wallet.warning || ""
+                }
+
+                RowLayout {
+                    visible: !root.wallet.error
+                    Layout.fillWidth: true
+                    LogosText {
+                        Layout.fillWidth: true
+                        color: Theme.palette.textTertiary
+                        text: root.wallet.status
+                            ? qsTr("%1, block %2").arg(root.wallet.status.sequencer).arg(root.wallet.status.block_height || "?")
+                            : ""
+                    }
+                    LogosButton {
+                        text: qsTr("New agent account")
+                        enabled: root.ready
+                        onClicked: root.call(root.backend.newAgentAccount(), function (reply) {
+                            root.notice = reply.note || qsTr("New agent account %1").arg(reply.address)
+                        })
+                    }
+                }
+
+                // Agent accounts this wallet doesn't hold: still granted, and back
+                // in force when their wallet opens, so they can be taken back here.
+                Repeater {
+                    model: root.wallet.missing_agent_accounts || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        LogosText {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            color: Theme.palette.warning
+                            text: qsTr("Agent account not in this wallet: %1").arg(modelData)
+                        }
+                        LogosButton {
+                            text: qsTr("Take back")
+                            enabled: root.ready
+                            onClicked: root.call(root.backend.setAgentAccount(modelData, false), function () {
+                                root.notice = qsTr("The agent can no longer send from that account.")
+                            })
+                        }
+                    }
+                }
+
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: Theme.spacing.small
+                    model: root.wallet.accounts || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        width: ListView.view.width
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+                            LogosText {
+                                Layout.fillWidth: true
+                                elide: Text.ElideMiddle
+                                font.family: "monospace"
+                                text: modelData.address || modelData.account_id
+                            }
+                            LogosText {
+                                Layout.fillWidth: true
+                                color: Theme.palette.textSecondary
+                                font.pixelSize: Theme.typography.secondaryText
+                                wrapMode: Text.WordWrap
+                                text: root.lez(modelData.balance_lepta)
+                                    + (modelData["public"] ? "" : qsTr(", private"))
+                                    + (modelData.designated ? qsTr(", agent account") : "")
+                                    + (modelData.note ? " (" + modelData.note + ")" : "")
+                            }
+                        }
+                        LogosButton {
+                            text: qsTr("Copy")
+                            onClicked: root.copy(modelData.address || modelData.account_id)
+                        }
+                        // Transfers send from public accounts only.
+                        // Same rule as the permission switches: it shows what was saved,
+                        // and a click asks. Handing over needs a confirmation; taking back does not.
+                        Switch {
+                            readonly property bool saved: modelData.designated === true
+                            visible: modelData["public"]
+                            checked: saved
+                            onCheckedChanged: if (checked !== saved) checked = Qt.binding(function () { return saved })
+                            enabled: root.ready
+                            onClicked: {
+                                if (!saved) {
+                                    root.handOver = modelData
+                                } else {
+                                    root.call(root.backend.setAgentAccount(modelData.account_id, false), function () {
+                                        root.notice = qsTr("The agent can no longer send from this account.")
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // ---- Activity ------------------------------------------------
@@ -250,6 +381,65 @@ Item {
             visible: root.notice !== ""
             color: Theme.palette.textSecondary
             text: root.notice
+        }
+    }
+
+    // Confirmation before handing an account to the agent. Built in-app from
+    // Basecamp's own controls (a popup Dialog drew its text invisibly there), and
+    // it blocks the view behind it until answered.
+    Rectangle {
+        anchors.fill: parent
+        visible: root.handOver !== null
+        color: "#b3000000"
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 2 * Theme.spacing.xlarge, 520)
+            height: confirmCard.implicitHeight + 2 * Theme.spacing.xlarge
+            radius: Theme.spacing.radiusLarge
+            color: Theme.palette.backgroundTertiary
+            border.color: Theme.palette.border
+
+            ColumnLayout {
+                id: confirmCard
+                anchors.fill: parent
+                anchors.margins: Theme.spacing.xlarge
+                spacing: Theme.spacing.large
+
+                LogosText {
+                    Layout.fillWidth: true
+                    font.weight: Theme.typography.weightBold
+                    text: qsTr("Hand this account to the agent?")
+                }
+                LogosText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: Theme.palette.textSecondary
+                    text: root.handOver
+                        ? qsTr("The agent will be able to spend everything in %1, now %2, without asking you.")
+                            .arg(root.handOver.address).arg(root.lez(root.handOver.balance_lepta))
+                        : ""
+                }
+                RowLayout {
+                    Layout.alignment: Qt.AlignRight
+                    spacing: Theme.spacing.medium
+                    LogosButton {
+                        text: qsTr("Cancel")
+                        onClicked: root.handOver = null
+                    }
+                    LogosButton {
+                        text: qsTr("Hand over")
+                        onClicked: {
+                            const account = root.handOver
+                            root.handOver = null
+                            root.call(root.backend.setAgentAccount(account.account_id, true), function () {
+                                root.notice = qsTr("The agent can now send from this account.")
+                            })
+                        }
+                    }
+                }
+            }
         }
     }
 }

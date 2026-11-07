@@ -4,7 +4,12 @@ class LogosMcpApp
     PROP(QString status="{}" READONLY)
     PROP(QString permissions="{}" READONLY)
     PROP(QString activity="[]" READONLY)
+    // The open wallet: its status and accounts, which of them are the agent's.
+    PROP(QString wallet="{}" READONLY)
     SLOT(QString token())
     SLOT(QString rotateToken())
     SLOT(QString setPermission(QString group, bool enabled))
+    SLOT(QString setAgentAccount(QString accountId, bool agent))
+    SLOT(QString newAgentAccount())
+    SLOT(void refreshWallet())
 }
