@@ -111,7 +111,7 @@ struct Inner {
     file: Option<PathBuf>,
 }
 
-/// What the log keeps of a call: everything but message contents. A sent
+/// What the file keeps of a call: everything but message contents. A sent
 /// message keeps its topic and size, a read keeps how many messages came back.
 fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
     let mut args = args.clone();
@@ -191,8 +191,9 @@ impl ActivityLog {
         }
     }
 
+    /// Record a call. The app's view keeps message text while the module runs;
+    /// the file gets a copy without it, so it never outlives the session.
     pub fn record(&self, tool: &str, args: &Value, ok: bool, result: &str) {
-        let (args, result) = redact(tool, args, result);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -204,13 +205,19 @@ impl ActivityLog {
             tool: cut(tool),
             ok,
             args: cut(&args.to_string()),
-            result: cut(&result),
+            result: cut(result),
         };
         inner.next_seq += 1;
-        if let Some(file) = &inner.file
-            && let Err(e) = append(file, &entry)
-        {
-            tracing::warn!("could not write the activity log: {e}");
+        if let Some(file) = &inner.file {
+            let (args, result) = redact(tool, args, result);
+            let on_disk = Entry {
+                args: cut(&args.to_string()),
+                result: cut(&result),
+                ..entry.clone()
+            };
+            if let Err(e) = append(file, &on_disk) {
+                tracing::warn!("could not write the activity log: {e}");
+            }
         }
         inner.entries.push_back(entry);
         if inner.entries.len() > KEEP {

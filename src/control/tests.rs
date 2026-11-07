@@ -168,8 +168,10 @@ fn an_oversized_tool_name_is_cut_too() {
 }
 
 #[test]
-fn message_contents_never_reach_the_log() {
-    let log = ActivityLog::in_memory();
+fn message_text_shows_in_the_app_but_never_reaches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("activity.jsonl");
+    let log = ActivityLog::open(file.clone()).unwrap();
     log.record(
         "messaging_send",
         &serde_json::json!({ "topic": "/a/1/b/proto", "text": "meet at the old mill" }),
@@ -195,35 +197,44 @@ fn message_contents_never_reach_the_log() {
         true,
         &read.to_string(),
     );
-
-    let entries = log.since(0);
-    let all = format!("{entries:?}");
-    for secret in ["old mill", "c2VjcmV0", "swordfish", "see you"] {
-        assert!(!all.contains(secret), "{secret} leaked: {all}");
-    }
-    // What happened stays visible: the topic, the sizes, how many messages.
-    assert!(
-        entries[0].args.contains("/a/1/b/proto"),
-        "{}",
-        entries[0].args
-    );
-    assert!(entries[0].args.contains("20 chars"), "{}", entries[0].args);
-    assert_eq!(entries[2].result, "2 messages, next_after 2");
-}
-
-#[test]
-fn a_malformed_payload_is_hidden_too() {
-    // A call that fails validation still records its arguments.
-    let log = ActivityLog::in_memory();
+    // A malformed payload is still someone's message.
     log.record(
         "messaging_send",
-        &serde_json::json!({ "topic": "/a/1/b/proto", "text": ["private note"], "base64": { "x": "c2VjcmV0" } }),
+        &serde_json::json!({ "topic": "/a/1/b/proto", "text": ["private note"] }),
         false,
         "give exactly one of `text` or `base64`",
     );
-    let args = &log.since(0)[0].args;
+
+    // The app sees what the agent said, while the module runs.
+    let live = format!("{:?}", log.since(0));
+    for said in ["old mill", "swordfish", "private note"] {
+        assert!(live.contains(said), "{said} missing from the app view");
+    }
+
+    // The file, and so everything after a restart, keeps only what happened.
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    for secret in [
+        "old mill",
+        "c2VjcmV0",
+        "swordfish",
+        "see you",
+        "private note",
+    ] {
+        assert!(
+            !on_disk.contains(secret),
+            "{secret} reached the file: {on_disk}"
+        );
+    }
+    let reopened = ActivityLog::open(file).unwrap().since(0);
     assert!(
-        !args.contains("private note") && !args.contains("c2VjcmV0"),
-        "{args}"
+        reopened[0].args.contains("/a/1/b/proto"),
+        "{}",
+        reopened[0].args
     );
+    assert!(
+        reopened[0].args.contains("<hidden, 20 chars>"),
+        "{}",
+        reopened[0].args
+    );
+    assert_eq!(reopened[2].result, "2 messages, next_after 2");
 }
