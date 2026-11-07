@@ -68,3 +68,16 @@ jobs:
         run: |
           /usr/bin/xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
       - run: nix build "./${{ matrix.package }}#lgx-portable" --print-build-logs
+
+  # A package that changed without a version bump would never be released.
+  versions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - env:
+          BASE: origin/${{ github.base_ref }}
+        run: scripts/check-package-versions.sh "$BASE"
