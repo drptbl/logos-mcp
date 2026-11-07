@@ -219,6 +219,9 @@ const APP_BACKEND: &str = "logos_mcp_app_backend";
 /// `f` on the control surface, for the Agent app only.
 fn for_app(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     if !logos_rust_sdk::current_caller().is_module(APP_BACKEND) {
+        // Visible in Basecamp's log, so a module probing for the token shows up.
+        let who = logos_rust_sdk::current_caller_json().unwrap_or_else(|| "unknown".into());
+        eprintln!("logos_mcp: refused a control call from {who}");
         return error_json(format!("only {APP_BACKEND} may call this"));
     }
     with_control(f)
