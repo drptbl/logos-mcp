@@ -124,11 +124,22 @@ Once loaded, it serves MCP at `http://127.0.0.1:8765/mcp` and writes a bearer to
 claude mcp add --transport http logos http://127.0.0.1:8765/mcp --header "Authorization: Bearer $(cat /path/to/token)"
 ```
 
-`config.json` next to the token sets `port`, `files_root` and `discovery_bootstrap`. Reload the module after you edit it. Delete `token` and reload to disconnect every client.
+`config.json` next to the token sets `port`, `files_root`, `discovery_bootstrap` and the `tools` switches. Reload the module after you edit it. Delete `token` and reload to cut off every client.
 
 Start messaging in Basecamp first. The module never creates or starts the node.
 
 The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
+
+The AI Agent app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. Build it and install `result/logos-logos_mcp_app-module.lgx` after the module:
+
+```bash
+cd basecamp/app
+nix build .#lgx-portable
+```
+
+1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
+2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery). A group you turn off disappears from the agent's list and is refused if called
+3. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder
 
 ## Networks
 
@@ -153,6 +164,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - there is no tool that calls arbitrary module methods
 - `wallet_transfer` only sends from the agent wallet this server opened. If `lez_core` has another wallet open, it refuses
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
+- only the AI Agent app can read the token, flip the tool switches or read the activity through the module
 - `lez_core` `0.5.1` can only open unencrypted key storage, so lock the wallet folder down (`chmod 700`)
 
 Uploaded files are announced to the network and anyone with the CID can fetch them. Don't put anything in the files root you wouldn't publish.
