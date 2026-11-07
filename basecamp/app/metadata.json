@@ -1,0 +1,28 @@
+{
+  "name": "logos_mcp_app",
+  "display_name": "AI Agent",
+  "version": "0.1.0",
+  "type": "ui_qml",
+  "interface": "universal",
+  "category": "general",
+  "description": "Connect an AI agent to Basecamp over MCP, choose what it may do, and see what it did",
+  "author": "drptbl",
+  "main": "logos_mcp_app_plugin",
+  "backend": "module",
+  "icon": "src/icons/logos_mcp_app.png",
+  "view": "qml/Main.qml",
+  "dependencies": ["logos_mcp"],
+  "provides": [],
+  "uses": [],
+  "codegen": { "rep": "src/logos_mcp_app.rep" },
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": []
+    }
+  }
+}

@@ -1,0 +1,10 @@
+class LogosMcpApp
+{
+    // JSON from logos_mcp: the endpoint, the tool groups, the latest calls.
+    PROP(QString status="{}" READONLY)
+    PROP(QString permissions="{}" READONLY)
+    PROP(QString activity="[]" READONLY)
+    SLOT(QString token())
+    SLOT(QString rotateToken())
+    SLOT(QString setPermission(QString group, bool enabled))
+}
