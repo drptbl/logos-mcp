@@ -118,7 +118,7 @@ Add this repository to Basecamp: in Package Repositories, paste
 https://raw.githubusercontent.com/drptbl/logos-mcp/main/logos-repo.json
 ```
 
-and install `logos_mcp` and the AI Agent app from the catalog. Updates show up there too.
+and install `logos_mcp` and the AI Agent app from the catalog. Updates show up there too. Both are signed, and `logos-repo.json` lists the signer's DID as trusted.
 
 To build the module yourself, build it with Nix and install `result/logos-logos_mcp-module-lib.lgx` from Basecamp's Package Manager:
 

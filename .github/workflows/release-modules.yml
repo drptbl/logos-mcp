@@ -56,6 +56,10 @@ jobs:
     uses: logos-co/logos-modules-release-action/.github/workflows/release.yml@00ad4e5adb7aac75b3e3f3acc6b8d7a466294e9c # v1.9
     with:
       module_path: basecamp
+      # Signed with the key whose DID logos-repo.json lists as trusted.
+      signing_mode: inline
+    secrets:
+      signing_key: ${{ secrets.LOGOS_SIGNING_KEY }}
 
   # After the module: the app depends on logos_mcp, which Basecamp resolves
   # from the catalog.
@@ -66,3 +70,6 @@ jobs:
     uses: logos-co/logos-modules-release-action/.github/workflows/release.yml@00ad4e5adb7aac75b3e3f3acc6b8d7a466294e9c # v1.9
     with:
       module_path: basecamp/app
+      signing_mode: inline
+    secrets:
+      signing_key: ${{ secrets.LOGOS_SIGNING_KEY }}

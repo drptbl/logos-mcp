@@ -5,5 +5,10 @@
   "description": "Let AI agents use Basecamp over MCP: the logos_mcp module and the AI Agent app to connect a client, choose what it may do and see what it did.",
   "homepage": "https://github.com/drptbl/logos-mcp",
   "indexUrl": "https://github.com/drptbl/logos-mcp/releases/download/index/index.json",
-  "trustedSigners": []
+  "trustedSigners": [
+    {
+      "did": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6ImFRYlVIOGRfMGF3a00tV0doQWUzamJuaV8tUFBRQjNTQWhCZlVGckdTNTgifQ",
+      "name": "drptbl (logos-mcp releases)"
+    }
+  ]
 }
