@@ -36,6 +36,8 @@ const CHAT: &str = "chat_module";
 /// network's message limit once encrypted.
 const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
+/// How many seconds chat waits for a messaging node it just created to connect.
+const CONNECT_WAIT_TRIES: usize = 60;
 /// How long a new conversation settles before chat_start returns. A first
 /// message sent right away was lost twice in three live tries on chat_module
 /// 0.3.0; one sent 10 seconds later always arrived.
@@ -1127,7 +1129,26 @@ impl LogosServer {
         // Chat joins whatever messaging node exists and creates one otherwise, so
         // bring that node up first: on the operator's settings standalone, and
         // never in Basecamp, which runs its own.
-        tool_json(self.messaging_connect().await)?;
+        let connect = tool_json(self.messaging_connect().await)?;
+        // chat_module starts a node it joins while that node is still starting,
+        // and a second start crashes delivery_module (seen live on 0.3.3): give
+        // a node this call created time to connect first.
+        if connect["created"] == true {
+            let mut connected = false;
+            for _ in 0..CONNECT_WAIT_TRIES {
+                let state = self.node.call(DELIVERY, "getConnectionStatus", &[]).await;
+                if matches!(&state, Ok(Value::String(s)) if s != "Disconnected") {
+                    connected = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            if !connected {
+                return Err(
+                    "messaging is still connecting: call chat_status again in a minute to start chat".into(),
+                );
+            }
+        }
         let config = json!({ "delivery_preset": self.settings.preset });
         self.node
             .call(CHAT, "init", &[Arg::Json(config)])

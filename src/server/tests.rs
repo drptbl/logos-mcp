@@ -2515,6 +2515,9 @@ async fn concurrent_first_chat_status_calls_start_chat_once() {
             r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
         ),
         node_enr(ENR_LOGOS_DEV),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
         chat_ok("init", "null"),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
@@ -2723,3 +2726,59 @@ async fn node_status_shows_the_real_and_the_configured_network() {
 }
 
 mod services;
+
+#[tokio::test(start_paused = true)]
+async fn chat_waits_for_a_new_messaging_node_to_connect_before_starting() {
+    // chat_module starts a node it joins while that node is still starting,
+    // and starting it twice crashes delivery_module (seen live on 0.3.3).
+    let status = |value: &str| {
+        out(&format!(
+            r#"{{"method":"getConnectionStatus","module":"delivery_module","result":{{"error":null,"success":true,"value":"{value}"}},"status":"ok"}}"#
+        ))
+    };
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", r#""""#),
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_DEV),
+        status("Disconnected"),
+        status("Disconnected"),
+        status("Connected"),
+        chat_ok("init", "null"),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_DEV),
+    ]);
+    let s = server(fake.clone(), None);
+    let r = s.chat_status().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let calls = fake.calls.lock().unwrap();
+    let init = calls
+        .iter()
+        .position(|c| c.get(3).map(String::as_str) == Some("init"))
+        .unwrap();
+    let connected = calls
+        .iter()
+        .rposition(|c| c.get(3).map(String::as_str) == Some("getConnectionStatus"))
+        .unwrap();
+    assert!(
+        connected < init,
+        "init only after the node connected: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.get(3).map(String::as_str) == Some("getConnectionStatus"))
+            .count(),
+        4
+    );
+}
