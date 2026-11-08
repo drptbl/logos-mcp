@@ -2566,6 +2566,71 @@ fn node_enr(enr: &str) -> crate::logosctl::RawOutput {
 }
 
 #[tokio::test]
+async fn a_send_is_refused_while_rln_is_not_ready() {
+    let not_ready = r#"{"method":"rlnState","module":"delivery_module","result":{"error":null,"success":true,"value":{"message":"waiting for the chain","state":"Initializing"}},"status":"ok"}"#;
+    let fake = FakeRunner::with(vec![out(not_ready)]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chat_send(Parameters(ChatSendParams {
+            conversation_id: "c1".into(),
+            text: "hi".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("not ready"), "{}", text(&r));
+    assert_eq!(fake.calls.lock().unwrap().len(), 1, "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_send_is_refused_when_the_membership_cannot_be_read() {
+    let broken = crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"METHOD_FAILED","message":"rln module crashed","status":"error"}"#
+            .into(),
+        stderr: String::new(),
+    };
+    let fake = FakeRunner::with(vec![out(RLN_READY), broken]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .messaging_send(Parameters(SendParams {
+            topic: "/a/1/b/proto".into(),
+            text: Some("hi".into()),
+            base64: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("rln module crashed"), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"send".to_string())),
+        "nothing was sent"
+    );
+}
+
+#[tokio::test]
+async fn a_send_before_the_node_exists_still_reports_its_own_error() {
+    let uninit = r#"{"method":"rlnState","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let send_uninit = r#"{"method":"send","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let fake = FakeRunner::with(vec![out(uninit), out(send_uninit)]);
+    let r = server(fake, None)
+        .messaging_send(Parameters(SendParams {
+            topic: "/a/1/b/proto".into(),
+            text: Some("hi".into()),
+            base64: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("not initialized"), "{}", text(&r));
+}
+
+#[tokio::test]
 async fn connect_names_the_network_an_existing_node_is_on() {
     // Configured for logos.dev, but the node was already running on logos.test.
     let fake = FakeRunner::with(vec![

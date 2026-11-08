@@ -36,6 +36,9 @@ const CHAT: &str = "chat_module";
 /// network's message limit once encrypted.
 const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
+/// What rln_status says before the messaging node exists. A send then fails
+/// with its own clear error, so the RLN check lets it through.
+const NO_NODE: &str = "messaging node not created yet";
 /// How long wallet_transfer waits for the user before returning the request id.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
@@ -596,15 +599,20 @@ impl LogosServer {
     }
 
     /// Why the node can't send right now, as `rln_status` reports it. `None`
-    /// when it can, or when that can't be told (the send then reports its own error).
+    /// when it can, or when there is no node yet: the send then reports that
+    /// itself. A check that can't finish counts as can't send, since the node
+    /// accepts and then drops a message it has no RLN proof for.
     async fn cannot_send(&self) -> Option<String> {
-        let report = tool_json(self.rln_report().await).ok()?;
-        (report["can_send"] == false).then(|| {
-            report["reason"]
-                .as_str()
-                .unwrap_or("RLN can't send right now")
-                .to_string()
-        })
+        match tool_json(self.rln_report().await) {
+            Ok(report) => (report["can_send"] == false).then(|| {
+                report["reason"]
+                    .as_str()
+                    .unwrap_or("RLN can't send right now")
+                    .to_string()
+            }),
+            Err(e) if e.starts_with(NO_NODE) => None,
+            Err(e) => Some(format!("RLN could not be checked: {e}")),
+        }
     }
 
     /// The network the messaging node is really on, read from its ENR, which
@@ -1298,7 +1306,7 @@ impl LogosServer {
         let rln = match self.node.call(DELIVERY, "rlnState", &[]).await {
             Ok(v) => v,
             Err(e) if is_uninitialized(&e) => {
-                return fail("messaging node not created yet: call messaging_connect");
+                return fail(format!("{NO_NODE}: call messaging_connect"));
             }
             Err(e) => return logos_fail(e),
         };
