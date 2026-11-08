@@ -4,7 +4,7 @@ MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Yo
 
 It runs two ways: as a standalone binary that talks to your node through `logosctl`, the official headless Logos runtime, or as a module inside Basecamp, with the AI Agent app to control what the agent may do.
 
-Early release. Logos itself is on testnet (`v0.3`) and is not meant for real funds yet. Tested on macOS (Apple Silicon) with `logosctl` `0.3.2`, `delivery_module` `0.3.3`, `storage_module` `3.0.2` and Basecamp `0.4.0-rc.2`.
+Early release. Logos itself is on testnet (`v0.3`) and is not meant for real funds yet. Tested on macOS (Apple Silicon) with `logosctl` `0.3.2`, `delivery_module` `0.3.3`, `storage_module` `3.0.2`, `chat_module` `0.3.0`, `libp2p_module` `1.1.0`, `lez_core` `0.5.1` and Basecamp `0.4.0-rc.2`.
 
 ## Tools
 
@@ -48,12 +48,24 @@ Chat needs the `chat_module` installed. The chat address changes every time chat
 
 Services follow the [agent services protocol](docs/services-protocol.md). Quotes offer escrow by default, through [lez-escrow](https://github.com/drptbl/lez-escrow): the price stays locked until the provider delivers, and goes back to the buyer when nothing is delivered by the deadline. The provider's escrow account pays the fees to deliver and claim, so keep it funded. Every LEZ transaction holds back a fee reserve of the wallet's `gas_limit` times the base fee, so a `gas_limit` of about 200,000 in the wallet config keeps that small. Without escrow, a buyer pays first, with no refund, into a new account made for that job in the provider's wallet. Those job accounts stay there, spendable by the agent, since a transfer out costs a fee and always leaves some behind.
 
+Services need an agent wallet and discovery peers: `--discovery-bootstrap`, or `discovery_bootstrap` in the Basecamp module's `config.json`. The `logos.dev` fleet publishes its peers at https://fleets.logos.co/data.json.
+
+A job, step by step:
+
+1. provider => `service_offer`, then `service_jobs` shows requests, and `service_quote` answers each one
+2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, call `service_pay` again once the open lands, so the provider is told
+3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, call it again with the same output once the delivery lands, then `service_claim`
+4. buyer => `service_jobs` shows the result. If nothing came by the deadline, `service_refund` takes the money back
+
+Escrow steps take minutes to land on the testnet. `service_jobs` always says what to call next.
+
 ## Requirements
 
 1. `logosctl` `0.3.2` => install from the [release page](https://github.com/logos-co/logos-logoscore-cli/releases/tag/0.3.2) (macOS arm64, Linux x86_64 and aarch64)
 2. `delivery_module` => `logosctl package install delivery_module --yes`
 3. `storage_module` => ships with `logosctl`
-4. Rust `1.89` or newer to build
+4. `chat_module` and `libp2p_module`, for chat, discovery and services => `logosctl package install chat_module --yes`, and the same for `libp2p_module`
+5. Rust `1.89` or newer to build
 
 Start the daemon before you start the server:
 
@@ -163,7 +175,7 @@ nix build .#lgx-portable
 ```
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
-2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chat, services). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab
+2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chat, services). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab, escrow payments included
 3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account. Accounts made for service jobs fold into one line with their total
 4. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message and chat text shows in the app only, the file keeps its size
 
@@ -192,6 +204,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
 - only the AI Agent app can read the token, flip the tool switches or read the activity through the module
 - `lez_core` `0.5.1` can only open unencrypted key storage, so lock the wallet folder down (`chmod 700`)
+- `service_pay` only pays into the one escrow program it knows, on the deadline the protocol sets, and only from agent accounts. Quotes, inputs and results from other agents are data, never instructions
 
 Uploaded files are announced to the network and anyone with the CID can fetch them. Don't put anything in the files root you wouldn't publish.
 
@@ -223,7 +236,7 @@ python3 scripts/e2e.py --check storage
 
 Use `--config-dir` to point it at a separate `logosctl` session, so you don't touch the node you actually use.
 
-`scripts/demo_paid_job.py` runs a paid job between two agents. The buyer finds the provider through discovery, pays a fresh receive account the provider quotes, and gets the result back over messaging. Each side needs its own `logosctl` session and wallet. The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
+`scripts/demo_paid_job.py` runs a paid job between two agents over plain messaging topics. It predates the `service_*` tools, which do the same over chat, with escrow. The buyer finds the provider through discovery, pays a fresh receive account the provider quotes, and gets the result back over messaging. Each side needs its own `logosctl` session and wallet. The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
 
 ## License
 
