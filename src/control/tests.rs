@@ -11,6 +11,8 @@ fn every_tool_but_node_status_belongs_to_a_group() {
         ("wallet_new_account", "wallet"),
         ("wallet_transfer", "transfers"),
         ("discovery_lookup", "discovery"),
+        ("chat_send", "chat"),
+        ("chat_status", "chat"),
     ] {
         assert_eq!(ToolGroups::group_of(tool), Some(group), "{tool}");
         assert!(groups.allows(tool), "{tool} is on by default");
@@ -26,6 +28,9 @@ fn a_group_turned_off_disallows_only_its_tools() {
     assert!(groups.allows("wallet_accounts"));
     assert!(groups.allows("node_status"), "never gated");
     assert!(groups.set("everything", false).is_err());
+    groups.set("chat", false).unwrap();
+    assert!(!groups.allows("chat_read"));
+    assert!(groups.allows("messaging_read"));
 }
 
 #[test]
@@ -237,6 +242,62 @@ fn message_text_shows_in_the_app_but_never_reaches_the_file() {
         reopened[0].args
     );
     assert_eq!(reopened[2].result, "2 messages, next_after 2");
+}
+
+#[test]
+fn chat_text_shows_in_the_app_but_never_reaches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("activity.jsonl");
+    let log = ActivityLog::open(file.clone()).unwrap();
+    log.record(
+        "chat_send",
+        &serde_json::json!({ "conversation_id": "c1", "text": "meet at the old mill" }),
+        true,
+        r#"{"sent":true}"#,
+    );
+    let messages = serde_json::json!({
+        "messages": [{ "index": 1, "text": "the password is swordfish" }],
+        "next_after": 1
+    });
+    log.record(
+        "chat_read",
+        &serde_json::json!({ "conversation_id": "c1" }),
+        true,
+        &messages.to_string(),
+    );
+    let conversations = serde_json::json!({
+        "conversations": [
+            { "conversation_id": "c1", "preview": "see you at noon" },
+            { "conversation_id": "c2" }
+        ]
+    });
+    log.record(
+        "chat_read",
+        &serde_json::json!({}),
+        true,
+        &conversations.to_string(),
+    );
+
+    let live = format!("{:?}", log.since(0));
+    for said in ["old mill", "swordfish", "see you at noon"] {
+        assert!(live.contains(said), "{said} missing from the app view");
+    }
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    for secret in ["old mill", "swordfish", "see you at noon"] {
+        assert!(
+            !on_disk.contains(secret),
+            "{secret} reached the file: {on_disk}"
+        );
+    }
+    let reopened = ActivityLog::open(file).unwrap().since(0);
+    assert!(reopened[0].args.contains("c1"), "{}", reopened[0].args);
+    assert!(
+        reopened[0].args.contains("<hidden, 20 chars>"),
+        "{}",
+        reopened[0].args
+    );
+    assert_eq!(reopened[1].result, "1 messages, next_after 1");
+    assert_eq!(reopened[2].result, "2 conversations");
 }
 
 #[tokio::test]

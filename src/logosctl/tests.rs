@@ -56,6 +56,11 @@ fn encodes_args_as_logosctl_expects() {
         Arg::Bytes(b"hello logos".to_vec()).encode(),
         r#"json:{"_bytes":"aGVsbG8gbG9nb3M"}"#
     );
+    // A record argument, such as chat_module's init config.
+    assert_eq!(
+        Arg::Json(json!({ "delivery_preset": "logos.dev" })).encode(),
+        r#"json:{"delivery_preset":"logos.dev"}"#
+    );
 }
 
 #[test]
@@ -67,6 +72,10 @@ fn encodes_args_as_json_values_for_in_process_calls() {
     assert_eq!(
         Arg::Bytes(b"hello logos".to_vec()).to_json(),
         json!({ "_bytes": "aGVsbG8gbG9nb3M" })
+    );
+    assert_eq!(
+        Arg::Json(json!({ "delivery_preset": "logos.dev" })).to_json(),
+        json!({ "delivery_preset": "logos.dev" })
     );
 }
 

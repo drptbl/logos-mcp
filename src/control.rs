@@ -26,6 +26,7 @@ pub struct ToolGroups {
     pub wallet: bool,
     pub transfers: bool,
     pub discovery: bool,
+    pub chat: bool,
     pub ask_before_transfer: bool,
 }
 
@@ -37,6 +38,7 @@ impl Default for ToolGroups {
             wallet: true,
             transfers: true,
             discovery: true,
+            chat: true,
             ask_before_transfer: false,
         }
     }
@@ -52,6 +54,7 @@ impl ToolGroups {
             t if t.starts_with("storage_") => Some("storage"),
             t if t.starts_with("wallet_") => Some("wallet"),
             t if t.starts_with("discovery_") => Some("discovery"),
+            t if t.starts_with("chat_") => Some("chat"),
             _ => None,
         }
     }
@@ -63,6 +66,7 @@ impl ToolGroups {
             "wallet" => Some(&mut self.wallet),
             "transfers" => Some(&mut self.transfers),
             "discovery" => Some(&mut self.discovery),
+            "chat" => Some(&mut self.chat),
             "ask_before_transfer" => Some(&mut self.ask_before_transfer),
             _ => None,
         }
@@ -75,6 +79,7 @@ impl ToolGroups {
             Some("wallet") => self.wallet,
             Some("transfers") => self.transfers,
             Some("discovery") => self.discovery,
+            Some("chat") => self.chat,
             _ => true,
         }
     }
@@ -329,7 +334,7 @@ struct Inner {
 /// message keeps its topic and size, a read keeps how many messages came back.
 fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
     let mut args = args.clone();
-    if tool == "messaging_send"
+    if matches!(tool, "messaging_send" | "chat_send")
         && let Some(map) = args.as_object_mut()
     {
         // Whatever the type: a malformed payload is still someone's message.
@@ -347,14 +352,21 @@ fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
         }
     }
     let result = match serde_json::from_str::<Value>(result) {
-        Ok(read) if tool == "messaging_read" => match read["messages"].as_array() {
-            Some(messages) => format!(
-                "{} messages, next_after {}",
-                messages.len(),
-                read["next_after"]
-            ),
-            None => result.to_string(),
-        },
+        Ok(read) if matches!(tool, "messaging_read" | "chat_read") => {
+            match (
+                read["messages"].as_array(),
+                read["conversations"].as_array(),
+            ) {
+                (Some(messages), _) => format!(
+                    "{} messages, next_after {}",
+                    messages.len(),
+                    read["next_after"]
+                ),
+                // Each conversation carries a preview of its last message.
+                (None, Some(conversations)) => format!("{} conversations", conversations.len()),
+                (None, None) => result.to_string(),
+            }
+        }
         _ => result.to_string(),
     };
     (args, result)
