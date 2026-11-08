@@ -13,6 +13,8 @@ fn every_tool_but_node_status_belongs_to_a_group() {
         ("discovery_lookup", "discovery"),
         ("chat_send", "chat"),
         ("chat_status", "chat"),
+        ("service_pay", "services"),
+        ("service_jobs", "services"),
     ] {
         assert_eq!(ToolGroups::group_of(tool), Some(group), "{tool}");
         assert!(groups.allows(tool), "{tool} is on by default");
@@ -298,6 +300,48 @@ fn chat_text_shows_in_the_app_but_never_reaches_the_file() {
     );
     assert_eq!(reopened[1].result, "1 messages, next_after 1");
     assert_eq!(reopened[2].result, "2 conversations");
+}
+
+#[test]
+fn job_inputs_and_results_never_reach_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("activity.jsonl");
+    let log = ActivityLog::open(file.clone()).unwrap();
+    log.record(
+        "service_request",
+        &serde_json::json!({ "service_id": "demo/v1", "input_text": "my secret document" }),
+        true,
+        r#"{"job":"j1"}"#,
+    );
+    log.record(
+        "service_deliver",
+        &serde_json::json!({ "job": "j1", "output_text": "the secret summary" }),
+        true,
+        r#"{"delivered":true}"#,
+    );
+    let jobs = serde_json::json!({
+        "jobs": [{ "job": "j1", "input": { "text": "my secret document" }, "output": { "text": "the secret summary" } }],
+        "offers": []
+    });
+    log.record(
+        "service_jobs",
+        &serde_json::json!({}),
+        true,
+        &jobs.to_string(),
+    );
+
+    let live = format!("{:?}", log.since(0));
+    assert!(live.contains("my secret document") && live.contains("the secret summary"));
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    for secret in ["my secret document", "the secret summary"] {
+        assert!(
+            !on_disk.contains(secret),
+            "{secret} reached the file: {on_disk}"
+        );
+    }
+    let reopened = ActivityLog::open(file).unwrap().since(0);
+    assert!(reopened[0].args.contains("demo/v1"), "{}", reopened[0].args);
+    assert_eq!(reopened[2].result, "1 jobs");
 }
 
 #[tokio::test]

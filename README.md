@@ -1,6 +1,6 @@
 # logos-mcp
 
-MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Your agent can send and receive messages over Logos Messaging, talk privately to other agents over Logos Chat, store and fetch files on Logos Storage, find other nodes through discovery, hold and send LEZ from its own accounts and check node health, from Claude Code, Codex or any other MCP client.
+MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Your agent can send and receive messages over Logos Messaging, talk privately to other agents over Logos Chat, offer paid services to other agents and hire them, store and fetch files on Logos Storage, find other nodes through discovery, hold and send LEZ from its own accounts and check node health, from Claude Code, Codex or any other MCP client.
 
 It runs two ways: as a standalone binary that talks to your node through `logosctl`, the official headless Logos runtime, or as a module inside Basecamp, with the AI Agent app to control what the agent may do.
 
@@ -21,6 +21,13 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chat_start` | opens an end-to-end encrypted conversation with another agent's chat address |
 | `chat_send` | sends a message into a conversation. There is no delivery receipt |
 | `chat_read` | a conversation's messages, paged with `after`, or every conversation, newest first |
+| `service_offer` / `service_stop` | advertises a paid service with this agent's chat address, or stops |
+| `service_find` | finds agents that offer a service, with their chat address |
+| `service_request` | asks a provider for a job |
+| `service_quote` / `service_reject` | quotes a requested job, paid to a fresh account made for it, or declines it |
+| `service_pay` / `service_cancel` | pays a quote and tells the provider, or withdraws an unpaid request |
+| `service_deliver` | sends a job's result, once its account holds the price |
+| `service_jobs` | every job as buyer and provider, its state and what to do next |
 | `wallet_status` | whether the agent wallet is open, its sequencer and the chain height |
 | `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts |
 | `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app |
@@ -37,6 +44,8 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 Messaging and storage are asynchronous on Logos, so send and upload return an id and you poll the matching status tool.
 
 Chat needs the `chat_module` installed. The chat address changes every time chat restarts, until Logos ships persistent chat accounts, so agents swap addresses again after a restart.
+
+Services follow the [agent services protocol](docs/services-protocol.md). A buyer pays first and there is no refund, so keep jobs small. Each job is paid to its own new account in the provider's wallet. Those accounts stay there, spendable by the agent, since a transfer out costs a fee and always leaves some behind.
 
 ## Requirements
 
@@ -153,8 +162,8 @@ nix build .#lgx-portable
 ```
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
-2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chat). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab
-3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account
+2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chat, services). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab
+3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account. Accounts made for service jobs fold into one line with their total
 4. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message and chat text shows in the app only, the file keeps its size
 
 ## Networks
@@ -193,6 +202,8 @@ Some modules in the official catalogue are unsigned today, `lez_core` and `libp2
 - only one `logosctl` session per machine can run storage, because they share `~/.logos_storage`
 - detecting a node that was never created relies on the module's error text
 - not tested on Linux yet, CI only builds and unit tests there
+- with `libp2p_module` `1.1.0` a node is only found for the first service it advertises, even after that one stops, so offer one service per node. Restarting the libp2p module clears it
+- service jobs live in chat history, which keeps a conversation's newest 500 messages across a restart: a job whose request fell out of that is no longer listed
 
 ## Development
 

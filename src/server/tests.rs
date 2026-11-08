@@ -2178,8 +2178,9 @@ async fn chat_start_refuses_a_bad_address_without_calls() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn chat_start_opens_a_conversation_with_the_peer() {
+    let began = tokio::time::Instant::now();
     let fake = FakeRunner::with(vec![
         out(RLN_DISABLED),
         chat_ok(
@@ -2199,6 +2200,9 @@ async fn chat_start_opens_a_conversation_with_the_peer() {
         body(&r)["conversation_id"],
         "17de45e2ff7f5cebdce3617c5a0d4f9f"
     );
+    // A first message sent right away is often lost: it returns once the
+    // conversation has settled.
+    assert!(began.elapsed() >= std::time::Duration::from_secs(8));
     let calls = fake.calls.lock().unwrap();
     assert_eq!(calls[1][3], "create_conversation");
     assert_eq!(calls[1][4], format!("str:{PEER}"));
@@ -2717,3 +2721,5 @@ async fn node_status_shows_the_real_and_the_configured_network() {
     assert_eq!(b["messaging"]["network"], "logos.test");
     assert_eq!(b["messaging"]["configured_network"], "logos.dev");
 }
+
+mod services;

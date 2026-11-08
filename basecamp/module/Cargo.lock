@@ -687,6 +687,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -706,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "logos_mcp_module"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "axum",
  "logos-mcp",
