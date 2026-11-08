@@ -1012,7 +1012,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Decline a job. Before a quote it refuses the request; after one it tells the buyer you can't do it. There is no refund in the protocol: settle any payment yourself."
+        description = "Decline a job. Before a quote it refuses the request; after one it tells the buyer you can't do it, and sends an escrow payment straight back to the buyer. Once your delivery is recorded in escrow it can't be declined."
     )]
     pub(super) async fn service_reject(
         &self,
@@ -1021,23 +1021,62 @@ impl LogosServer {
         if let Err(e) = self.needs(&["chat"]) {
             return fail(e);
         }
-        let (convo, job) = match self.find_job(&p.job, Role::Provider).await {
-            Ok(found) => found,
-            Err(e) => return fail(e),
-        };
+        let job = p.job.clone();
+        match self.one_at_a_time(&job, self.reject(p)).await {
+            Ok(v) => ok(v),
+            Err(e) => fail(e),
+        }
+    }
+
+    async fn reject(&self, p: RejectParams) -> Result<Value, String> {
+        let (convo, job) = self.find_job(&p.job, Role::Provider).await?;
         let reason = p.reason;
         let body = match job.state {
             State::Requested => Body::Reject { reason },
             State::Quoted | State::Paid => Body::Failed { reason },
-            done => return fail(format!("job {} is already {done:?}", p.job).to_lowercase()),
+            done => return Err(format!("job {} is already {done:?}", p.job).to_lowercase()),
         };
-        match self
-            .send_message(&convo, &protocol::Message::new(&job.job, body))
-            .await
-        {
-            Ok(()) => ok(json!({ "job": job.job, "declined": true })),
-            Err(e) => fail(e),
+        // Money the buyer locked goes straight back, so it doesn't wait for
+        // the deadline. A recorded delivery is the provider's to claim.
+        let escrow = match job.escrow_buyer.as_deref() {
+            Some(buyer) => escrow_job(&job, buyer)?,
+            None => None,
+        };
+        let mut returned = None;
+        if let Some(e) = &escrow {
+            self.needs(&["wallet"])?;
+            match self.escrow_record(e).await {
+                Ok(Some(r)) if e.holds(&r) => match r.state {
+                    JobState::Open => {
+                        let back = Instruction::Return {
+                            job_ref: e.job_ref,
+                            amount: e.amount,
+                        };
+                        let tx = self
+                            .escrow_send(&e.provider, &[e.account, e.buyer], back)
+                            .await
+                            .map_err(|err| format!("the escrow payment wasn't returned: {err}"))?;
+                        returned = Some(tx);
+                    }
+                    JobState::Delivered | JobState::Claimed | JobState::Released => {
+                        return Err(
+                            "your delivery is recorded in escrow, so the job can't be declined: send the result with service_deliver".into(),
+                        );
+                    }
+                    JobState::Refunded => {}
+                },
+                Ok(_) => {}
+                Err(err) => return Err(format!("can't read the job's escrow: {err}")),
+            }
         }
+        self.send_message(&convo, &protocol::Message::new(&job.job, body))
+            .await?;
+        Ok(json!({
+            "job": job.job,
+            "declined": true,
+            "escrow_return_tx": returned,
+            "note": returned.as_ref().map(|_| "the escrow payment goes back to the buyer once the return lands"),
+        }))
     }
 
     #[tool(
@@ -1729,9 +1768,13 @@ impl LogosServer {
                 (Role::Provider, State::Delivered, Some(JobState::Open)) => {
                     Some("wait for the delivery to land on chain, then service_claim")
                 }
-                (Role::Buyer, State::Paid, Some(JobState::Open)) if deadline_passed => Some(
-                    "nothing was delivered by the deadline: take the money back with service_refund",
-                ),
+                (Role::Buyer, State::Paid | State::Failed, Some(JobState::Open))
+                    if deadline_passed =>
+                {
+                    Some(
+                        "nothing was delivered by the deadline: take the money back with service_refund",
+                    )
+                }
                 _ if !can_send => None,
                 _ => next_step(job.role, state),
             };

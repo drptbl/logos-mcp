@@ -1921,3 +1921,126 @@ async fn a_refunded_escrow_is_not_a_paid_job() {
     let b = body(&s.service_jobs().await.unwrap());
     assert_ne!(b["jobs"][0]["state"], "paid", "{b}");
 }
+
+#[tokio::test]
+async fn declining_a_paid_escrow_job_returns_the_money() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("return1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_reject(Parameters(RejectParams {
+            job: JOB.into(),
+            reason: "can't do it".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let call = &fake.calls_to("lez_core.send_generic_public_transaction")[0];
+    let q = escrow_quote_text(AGENT_FROM, FAR, FAR + 600_000);
+    let job_ref = id32(&protocol::quote_hash(&q));
+    let want = escrow::Instruction::Return {
+        job_ref,
+        amount: 1_000_000,
+    };
+    assert_eq!(instruction(call), want.encode());
+    // [provider, job, buyer], the provider signing.
+    let job_account = escrow::job_account(&public_id(PROVIDER_ACCOUNT), &job_ref);
+    assert_eq!(
+        call[0],
+        format!(
+            r#"json:["{}","{}","{}"]"#,
+            hex(&public_id(AGENT_FROM)),
+            hex(&job_account),
+            hex(&public_id(PROVIDER_ACCOUNT))
+        )
+    );
+    assert_eq!(call[1], "json:[true,false,false]");
+    assert!(matches!(
+        sent(&fake.calls_to("chat_module.send_message")[0]).body,
+        Body::Failed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_recorded_delivery_cannot_be_declined() {
+    // The money is the provider's once its delivery is on chain: declining
+    // then would tell the buyer it failed while the provider can still claim.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_reject(Parameters(RejectParams {
+            job: JOB.into(),
+            reason: "can't do it".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_job_still_open_in_escrow_points_to_the_refund() {
+    // The provider said it failed, but its return never landed.
+    let past = 1_000_000;
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, past - 600_000, past);
+    let paid = proto(
+        3,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        },
+    );
+    let failed = proto(
+        4,
+        Body::Failed {
+            reason: "broke".into(),
+        },
+    );
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (true, &request_text()),
+            (false, &q),
+            (true, &paid),
+            (false, &failed),
+        ]),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, past, 0),
+    );
+    let (s, _dir) = services_server(fake);
+    let b = body(&s.service_jobs().await.unwrap());
+    assert!(
+        b["jobs"][0]["next"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("service_refund"),
+        "{b}"
+    );
+}

@@ -1,14 +1,14 @@
-//! The lez-escrow program (github.com/drptbl/lez-escrow): a buyer locks a job's
+//! The logos-escrow program (github.com/drptbl/logos-escrow): a buyer locks a job's
 //! payment, the provider claims it after delivering, and the buyer is refunded
 //! when nothing is delivered by the deadline. This module only encodes and
 //! decodes; the server sends and reads through `lez_core`.
 
 use sha2::{Digest, Sha256};
 
-/// The program deployed on the LEZ testnet (v0.3.1), immutable: the deploy
-/// that refuses calls coming from other programs (image e8a93458…).
-pub const PROGRAM_ID: &str = "CAZ8AvrdAeZ4rQjHqhAucqSLqrMK8TFQ7Z8b2jg5Sb4G";
-pub const PROGRAM_ID_HEX: &str = "a5e31b14f1304b129f108abb457eb389ed0f88103fa91b069208af5e9df6560d";
+/// The program deployed on the LEZ testnet (v0.3.1), immutable: logos-escrow
+/// with `Return`, which refuses calls coming from other programs (image 83b695c1…).
+pub const PROGRAM_ID: &str = "9jbUSu3t3rdZbmekKJ73DCwaFULWUWhPVVUbbgzdUgNL";
+pub const PROGRAM_ID_HEX: &str = "81c6de4e3a4ba0d4694d8c225782952e012ccf8746ac77fe1535ec948928d729";
 
 const JOB_SEED: &[u8; 32] = b"/lez-escrow/v1/JobSeed/000000000";
 const PDA_PREFIX: &[u8; 32] = b"/LEE/v0.2/AccountId/PDA/\0\0\0\0\0\0\0\0";
@@ -69,6 +69,11 @@ pub enum Instruction {
         amount: u128,
         deadline: u64,
     },
+    /// The provider sends an open job's money back to the buyer.
+    Return {
+        job_ref: Id,
+        amount: u128,
+    },
 }
 
 impl Instruction {
@@ -111,6 +116,11 @@ impl Instruction {
                 out.extend(job_ref);
                 out.extend(amount.to_le_bytes());
                 out.extend(deadline.to_le_bytes());
+            }
+            Self::Return { job_ref, amount } => {
+                out.push(5);
+                out.extend(job_ref);
+                out.extend(amount.to_le_bytes());
             }
         }
         out
