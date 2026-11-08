@@ -188,6 +188,8 @@ pub struct LogosServer {
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
     /// Held while checking and starting chat, so it starts once.
     chat_starting: Arc<tokio::sync::Mutex<()>>,
+    /// Held while checking and creating the messaging node, so it is created once.
+    connecting: Arc<tokio::sync::Mutex<()>>,
     /// The tool groups the user allows, read on every list and call, and
     /// watched so connected agents hear when the list changes.
     tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
@@ -438,6 +440,7 @@ impl LogosServer {
             subscriptions: Arc::default(),
             agent_accounts: Arc::default(),
             chat_starting: Arc::default(),
+            connecting: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
@@ -915,6 +918,9 @@ impl LogosServer {
                 Err(e) => logos_fail(e),
             };
         }
+        // Checking for a node and creating it are one step: two calls at once
+        // would otherwise both find none and both create one.
+        let _connecting = self.connecting.lock().await;
         if let Err(e) = self.load(DELIVERY).await {
             return logos_fail(e);
         }

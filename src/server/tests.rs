@@ -2630,6 +2630,40 @@ async fn a_send_before_the_node_exists_still_reports_its_own_error() {
     assert!(text(&r).contains("not initialized"), "{}", text(&r));
 }
 
+#[tokio::test(start_paused = true)]
+async fn concurrent_connects_create_the_node_once() {
+    let fake = FakeRunner::with(vec![
+        // The first call loads the module and waits for it to settle.
+        out("[]"),
+        out(r#"{"status":"ok"}"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_TEST),
+        // The second finds the node the first created.
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_TEST),
+    ]);
+    let s = server(fake.clone(), None);
+    let (a, b) = tokio::join!(s.messaging_connect(), s.messaging_connect());
+    assert!(!is_error(&a.unwrap()) && !is_error(&b.unwrap()));
+    let calls = fake.calls.lock().unwrap();
+    let creates = calls
+        .iter()
+        .filter(|c| c.contains(&"createNode".to_string()))
+        .count();
+    assert_eq!(creates, 1, "{calls:?}");
+}
+
 #[tokio::test]
 async fn connect_names_the_network_an_existing_node_is_on() {
     // Configured for logos.dev, but the node was already running on logos.test.
