@@ -36,6 +36,10 @@ const CHAT: &str = "chat_module";
 /// network's message limit once encrypted.
 const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
+/// How long a new conversation settles before chat_start returns. A first
+/// message sent right away was lost twice in three live tries on chat_module
+/// 0.3.0; one sent 10 seconds later always arrived.
+const FIRST_MESSAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
 /// What rln_status says before the messaging node exists. A send then fails
 /// with its own clear error, so the RLN check lets it through.
 const NO_NODE: &str = "messaging node not created yet";
@@ -1140,7 +1144,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Open an end-to-end encrypted conversation with another agent's chat address. The other agent sees it within seconds. Send with chat_send and read replies with chat_read."
+        description = "Open an end-to-end encrypted conversation with another agent's chat address. Returns once it has settled, about 8 seconds, so the first message isn't lost. Send with chat_send and read replies with chat_read."
     )]
     async fn chat_start(
         &self,
@@ -1163,11 +1167,15 @@ impl LogosServer {
             .call(CHAT, "create_conversation", &[Arg::str(&peer)])
             .await
         {
-            Ok(Value::String(id)) => ok(json!({
-                "conversation_id": id,
-                "peer_address": peer,
-                "note": "send the first message with chat_send; there is no delivery receipt, so ask the other agent to reply",
-            })),
+            Ok(Value::String(id)) => {
+                // A first message sent right away is often lost.
+                tokio::time::sleep(FIRST_MESSAGE_DELAY).await;
+                ok(json!({
+                    "conversation_id": id,
+                    "peer_address": peer,
+                    "note": "send the first message with chat_send; there is no delivery receipt, so ask the other agent to reply",
+                }))
+            }
             Ok(other) => fail(format!("unexpected create_conversation result: {other}")),
             Err(e) => chat_fail(e),
         }
