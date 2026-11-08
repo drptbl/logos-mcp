@@ -2721,3 +2721,5 @@ async fn node_status_shows_the_real_and_the_configured_network() {
     assert_eq!(b["messaging"]["network"], "logos.test");
     assert_eq!(b["messaging"]["configured_network"], "logos.dev");
 }
+
+mod services;

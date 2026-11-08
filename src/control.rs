@@ -27,6 +27,7 @@ pub struct ToolGroups {
     pub transfers: bool,
     pub discovery: bool,
     pub chat: bool,
+    pub services: bool,
     pub ask_before_transfer: bool,
 }
 
@@ -39,6 +40,7 @@ impl Default for ToolGroups {
             transfers: true,
             discovery: true,
             chat: true,
+            services: true,
             ask_before_transfer: false,
         }
     }
@@ -55,6 +57,7 @@ impl ToolGroups {
             t if t.starts_with("wallet_") => Some("wallet"),
             t if t.starts_with("discovery_") => Some("discovery"),
             t if t.starts_with("chat_") => Some("chat"),
+            t if t.starts_with("service_") => Some("services"),
             _ => None,
         }
     }
@@ -67,6 +70,7 @@ impl ToolGroups {
             "transfers" => Some(&mut self.transfers),
             "discovery" => Some(&mut self.discovery),
             "chat" => Some(&mut self.chat),
+            "services" => Some(&mut self.services),
             "ask_before_transfer" => Some(&mut self.ask_before_transfer),
             _ => None,
         }
@@ -80,6 +84,7 @@ impl ToolGroups {
             Some("transfers") => self.transfers,
             Some("discovery") => self.discovery,
             Some("chat") => self.chat,
+            Some("services") => self.services,
             _ => true,
         }
     }
@@ -334,11 +339,13 @@ struct Inner {
 /// message keeps its topic and size, a read keeps how many messages came back.
 fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
     let mut args = args.clone();
-    if matches!(tool, "messaging_send" | "chat_send")
-        && let Some(map) = args.as_object_mut()
+    if matches!(
+        tool,
+        "messaging_send" | "chat_send" | "service_request" | "service_deliver"
+    ) && let Some(map) = args.as_object_mut()
     {
         // Whatever the type: a malformed payload is still someone's message.
-        for key in ["text", "base64"] {
+        for key in ["text", "base64", "input_text", "output_text"] {
             if let Some(body) = map.get(key) {
                 let size = match body {
                     Value::String(text) => text.chars().count(),
@@ -352,6 +359,11 @@ fn redact(tool: &str, args: &Value, result: &str) -> (Value, String) {
         }
     }
     let result = match serde_json::from_str::<Value>(result) {
+        // Each job carries its input and result.
+        Ok(read) if tool == "service_jobs" => match read["jobs"].as_array() {
+            Some(jobs) => format!("{} jobs", jobs.len()),
+            None => result.to_string(),
+        },
         Ok(read) if matches!(tool, "messaging_read" | "chat_read") => {
             match (
                 read["messages"].as_array(),

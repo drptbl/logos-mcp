@@ -24,6 +24,9 @@ Item {
     property string token: ""
     property bool tokenShown: false
     property string notice: ""
+    // Accounts made to be paid for one service job stay folded into one line.
+    property bool showJobAccounts: false
+    readonly property var jobAccounts: (wallet.accounts || []).filter(function (a) { return a.job })
 
     readonly property var groups: [
         { key: "messaging", title: qsTr("Messaging"), detail: qsTr("Read and send messages, RLN status") },
@@ -32,6 +35,7 @@ Item {
         { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts") },
         { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services") },
         { key: "chat", title: qsTr("Chat"), detail: qsTr("Uses your Basecamp chat account: the agent reads and sends in every Logos Chat conversation you have") },
+        { key: "services", title: qsTr("Services"), detail: qsTr("Offer paid services to other agents and hire them. Needs Chat, and paying needs Transfers") },
         { key: "ask_before_transfer", title: qsTr("Ask me before each transfer"), detail: qsTr("Every transfer waits for your OK in the Wallet tab. Off: the agent sends on its own") }
     ]
 
@@ -71,6 +75,18 @@ Item {
         const whole = digits.slice(0, -9)
         const fraction = digits.slice(-9).replace(/0+$/, "")
         return whole + (fraction ? "." + fraction : "") + " LEZ"
+    }
+
+    // Lepta as digit strings, added exactly.
+    function addLepta(a, b) {
+        let sum = "", carry = 0
+        a = String(a); b = String(b)
+        for (let i = a.length - 1, j = b.length - 1; i >= 0 || j >= 0 || carry; i--, j--) {
+            const d = (i >= 0 ? +a[i] : 0) + (j >= 0 ? +b[j] : 0) + carry
+            sum = (d % 10) + sum
+            carry = d >= 10 ? 1 : 0
+        }
+        return sum.replace(/^0+(?=.)/, "")
     }
 
     function time(seconds) {
@@ -321,12 +337,31 @@ Item {
                     }
                 }
 
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: root.jobAccounts.length > 0
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: Theme.palette.textSecondary
+                        text: qsTr("Job accounts: %1, holding %2. Each service job is paid to its own account, which the agent can spend from.")
+                            .arg(root.jobAccounts.length)
+                            .arg(root.lez(root.jobAccounts.reduce(function (total, a) {
+                                return /^[0-9]+$/.test(a.balance_lepta || "") ? root.addLepta(total, a.balance_lepta) : total
+                            }, "0")))
+                    }
+                    LogosButton {
+                        text: root.showJobAccounts ? qsTr("Hide") : qsTr("Show")
+                        onClicked: root.showJobAccounts = !root.showJobAccounts
+                    }
+                }
+
                 ListView {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
                     spacing: Theme.spacing.small
-                    model: root.wallet.accounts || []
+                    model: (root.wallet.accounts || []).filter(function (a) { return root.showJobAccounts || !a.job })
                     delegate: RowLayout {
                         required property var modelData
                         width: ListView.view.width
@@ -347,6 +382,7 @@ Item {
                                 text: root.lez(modelData.balance_lepta)
                                     + (modelData["public"] ? "" : qsTr(", private"))
                                     + (modelData.designated ? qsTr(", agent account") : "")
+                                    + (modelData.job ? qsTr(", job account for %1").arg(modelData.job.service) : "")
                                     + (modelData.note ? " (" + modelData.note + ")" : "")
                             }
                         }

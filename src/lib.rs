@@ -10,6 +10,7 @@ pub mod guard;
 pub mod logosctl;
 pub mod node;
 pub mod server;
+pub mod services;
 
 #[cfg(feature = "module")]
 pub mod module;

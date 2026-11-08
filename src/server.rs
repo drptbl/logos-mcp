@@ -147,6 +147,17 @@ fn sanitise_peer_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
+/// The raw data a peer record carries under service entry `id`.
+fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
+    record
+        .get("services")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|s| s.get("data")?.as_str())
+        .and_then(|b64| STANDARD.decode(b64).ok())
+}
+
 /// The account ids in a `list_accounts` reply, for telling wallets apart.
 fn account_ids(accounts: &[Value]) -> BTreeSet<String> {
     accounts
@@ -194,6 +205,12 @@ pub struct LogosServer {
     chat_starting: Arc<tokio::sync::Mutex<()>>,
     /// Held while checking and creating the messaging node, so it is created once.
     connecting: Arc<tokio::sync::Mutex<()>>,
+    /// The service tools' offers, conversations and payments in flight.
+    services: Arc<tokio::sync::Mutex<jobs::Services>>,
+    /// Held while quoting, so a job never gets two accounts.
+    quoting: Arc<tokio::sync::Mutex<()>>,
+    /// Held while offers are advertised or stopped, so they don't cross.
+    advertising: Arc<tokio::sync::Mutex<()>>,
     /// The tool groups the user allows, read on every list and call, and
     /// watched so connected agents hear when the list changes.
     tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
@@ -445,13 +462,16 @@ impl LogosServer {
             agent_accounts: Arc::default(),
             chat_starting: Arc::default(),
             connecting: Arc::default(),
+            services: Arc::default(),
+            quoting: Arc::default(),
+            advertising: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
             watching: std::sync::OnceLock::new(),
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::services_router(),
         }
     }
 
@@ -829,6 +849,7 @@ impl LogosServer {
             Ok(v) => v,
             Err(e) => return fail(e),
         };
+        let job_accounts = self.job_accounts();
         let mut accounts = Vec::with_capacity(w.accounts.len());
         for entry in &w.accounts {
             let (Some(id), Some(public)) = (
@@ -855,14 +876,19 @@ impl LogosServer {
                 ),
                 _ => None,
             };
-            accounts.push(json!({
+            let mut account = json!({
                 "agent": w.agent_ids.contains(id),
                 "address": address,
                 "account_id": id,
                 "public": public,
                 "balance_lepta": balance,
                 "note": note,
-            }));
+            });
+            // Made to be paid for one service job: the app groups these.
+            if let Some(job) = job_accounts.get(id) {
+                account["job"] = job.clone();
+            }
+            accounts.push(account);
         }
         // lez_core returns an empty list both for a wallet without accounts and on failure.
         let note = accounts
@@ -1705,6 +1731,34 @@ impl LogosServer {
             .to_string())
     }
 
+    /// The peer records advertising `service_id`, and this node's peer id.
+    async fn lookup(&self, service_id: &str) -> Result<(String, Vec<Value>), String> {
+        guard::validate_service_id(service_id)?;
+        let own = self.ensure_discovery().await?;
+        // Lookups only see a service the node has registered interest in. Once per service.
+        {
+            let mut interests = self.interests.lock().await;
+            if !interests.contains(service_id) {
+                let sid = [Arg::str(service_id)];
+                self.node
+                    .call(P2P, "discoRegisterInterest", &sid)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                interests.insert(service_id.to_string());
+            }
+        }
+        let found = self
+            .node
+            .call(P2P, "discoLookup", &[Arg::str(service_id), Arg::str("")])
+            .await
+            .map_err(|e| e.to_string())?;
+        let records = match embedded_json(found) {
+            Value::Array(list) => list,
+            _ => Vec::new(),
+        };
+        Ok((own, records))
+    }
+
     #[tool(
         description = "Advertise a service on the Logos discovery network so other agents can find this node. The tag is at most 33 bytes: put the terms in messages, not here."
     )]
@@ -1761,54 +1815,20 @@ impl LogosServer {
         &self,
         Parameters(p): Parameters<ServiceParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = guard::validate_service_id(&p.service_id) {
-            return fail(e);
-        }
-        let own = match self.ensure_discovery().await {
-            Ok(id) => id,
+        let (own, records) = match self.lookup(&p.service_id).await {
+            Ok(found) => found,
             Err(e) => return fail(e),
         };
-        // Lookups only see a service the node has registered interest in. Once per service.
-        {
-            let mut interests = self.interests.lock().await;
-            if !interests.contains(&p.service_id) {
-                let sid = [Arg::str(&p.service_id)];
-                if let Err(e) = self.node.call(P2P, "discoRegisterInterest", &sid).await {
-                    return logos_fail(e);
-                }
-                interests.insert(p.service_id.clone());
-            }
-        }
-        let found = match self
-            .node
-            .call(P2P, "discoLookup", &[Arg::str(&p.service_id), Arg::str("")])
-            .await
-        {
-            Ok(v) => embedded_json(v),
-            Err(e) => return logos_fail(e),
-        };
-        let providers: Vec<Value> = found
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(|peer| {
-                        let peer_id = peer.get("peerId")?.as_str()?;
-                        let tag = peer
-                            .get("services")?
-                            .as_array()?
-                            .iter()
-                            .find(|s| {
-                                s.get("id").and_then(Value::as_str) == Some(p.service_id.as_str())
-                            })
-                            .and_then(|s| s.get("data")?.as_str())
-                            .and_then(|b64| STANDARD.decode(b64).ok())
-                            .map(|bytes| sanitise_peer_text(&String::from_utf8_lossy(&bytes)))
-                            .unwrap_or_default();
-                        Some(json!({ "peer_id": peer_id, "tag": tag, "this_node": peer_id == own }))
-                    })
-                    .collect()
+        let providers: Vec<Value> = records
+            .iter()
+            .filter_map(|peer| {
+                let peer_id = peer.get("peerId")?.as_str()?;
+                let tag = service_entry(peer, &p.service_id)
+                    .map(|bytes| sanitise_peer_text(&String::from_utf8_lossy(&bytes)))
+                    .unwrap_or_default();
+                Some(json!({ "peer_id": peer_id, "tag": tag, "this_node": peer_id == own }))
             })
-            .unwrap_or_default();
+            .collect();
         let note = if providers.is_empty() {
             "nothing found yet: advertisements take a few seconds to spread, try again"
         } else {
@@ -2023,6 +2043,8 @@ impl ServerHandler for LogosServer {
         )
     }
 }
+
+mod jobs;
 
 #[cfg(test)]
 mod tests;
