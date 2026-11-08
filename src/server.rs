@@ -36,6 +36,9 @@ const CHAT: &str = "chat_module";
 /// network's message limit once encrypted.
 const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
+/// What rln_status says before the messaging node exists. A send then fails
+/// with its own clear error, so the RLN check lets it through.
+const NO_NODE: &str = "messaging node not created yet";
 /// How long wallet_transfer waits for the user before returning the request id.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
@@ -185,6 +188,8 @@ pub struct LogosServer {
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
     /// Held while checking and starting chat, so it starts once.
     chat_starting: Arc<tokio::sync::Mutex<()>>,
+    /// Held while checking and creating the messaging node, so it is created once.
+    connecting: Arc<tokio::sync::Mutex<()>>,
     /// The tool groups the user allows, read on every list and call, and
     /// watched so connected agents hear when the list changes.
     tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
@@ -435,6 +440,7 @@ impl LogosServer {
             subscriptions: Arc::default(),
             agent_accounts: Arc::default(),
             chat_starting: Arc::default(),
+            connecting: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
@@ -596,15 +602,36 @@ impl LogosServer {
     }
 
     /// Why the node can't send right now, as `rln_status` reports it. `None`
-    /// when it can, or when that can't be told (the send then reports its own error).
+    /// when it can, or when there is no node yet: the send then reports that
+    /// itself. A check that can't finish counts as can't send, since the node
+    /// accepts and then drops a message it has no RLN proof for.
     async fn cannot_send(&self) -> Option<String> {
-        let report = tool_json(self.rln_status().await).ok()?;
-        (report["can_send"] == false).then(|| {
-            report["reason"]
-                .as_str()
-                .unwrap_or("RLN can't send right now")
-                .to_string()
-        })
+        match tool_json(self.rln_report().await) {
+            Ok(report) => (report["can_send"] == false).then(|| {
+                report["reason"]
+                    .as_str()
+                    .unwrap_or("RLN can't send right now")
+                    .to_string()
+            }),
+            Err(e) if e.starts_with(NO_NODE) => None,
+            Err(e) => Some(format!("RLN could not be checked: {e}")),
+        }
+    }
+
+    /// The network the messaging node is really on, read from its ENR, which
+    /// can differ from this server's setting when it joined an existing node.
+    /// Before there is a node, the one it would be created on.
+    async fn network(&self) -> String {
+        match self
+            .node
+            .call(DELIVERY, "getNodeInfo", &[Arg::str("MyENR")])
+            .await
+        {
+            Ok(Value::String(enr)) => crate::enr::network_name(&enr),
+            Ok(_) => "unknown".to_string(),
+            Err(e) if is_uninitialized(&e) => self.settings.preset.clone(),
+            Err(_) => "unknown".to_string(),
+        }
     }
 
     /// Load `module` if it isn't loaded, and give a fresh load time to settle:
@@ -861,7 +888,8 @@ impl LogosServer {
             "daemon": daemon.get("daemon"),
             "modules": daemon.get("modules_summary"),
             "messaging": {
-                "network": self.settings.preset,
+                "network": self.network().await,
+                "configured_network": self.settings.preset,
                 "mode": self.settings.mode,
                 "connection": connection,
                 "subscriptions": *self.subscriptions.lock().unwrap(),
@@ -878,7 +906,7 @@ impl LogosServer {
         if self.settings.host_owns_messaging {
             return match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
                 Ok(connection) => ok(json!({
-                    "network": self.settings.preset,
+                    "network": self.network().await,
                     "created": false,
                     "started": false,
                     "connection": connection,
@@ -890,6 +918,9 @@ impl LogosServer {
                 Err(e) => logos_fail(e),
             };
         }
+        // Checking for a node and creating it are one step: two calls at once
+        // would otherwise both find none and both create one.
+        let _connecting = self.connecting.lock().await;
         if let Err(e) = self.load(DELIVERY).await {
             return logos_fail(e);
         }
@@ -933,7 +964,7 @@ impl LogosServer {
             }
         }
         ok(json!({
-            "network": self.settings.preset,
+            "network": self.network().await,
             "created": created,
             "started": started,
             "connection": connection,
@@ -1099,7 +1130,7 @@ impl LogosServer {
         };
         ok(json!({
             "address": address,
-            "network": self.settings.preset,
+            "network": self.network().await,
             "delivery_state": state,
             "detail": status["detail"],
             "conversations": status["convo_count"],
@@ -1267,16 +1298,26 @@ impl LogosServer {
         description = "Whether this node can send right now: RLN membership state and the messages left in the current epoch. On logos.dev RLN is off."
     )]
     async fn rln_status(&self) -> Result<CallToolResult, McpError> {
+        match tool_json(self.rln_report().await) {
+            Ok(mut report) => {
+                report["network"] = json!(self.network().await);
+                ok(report)
+            }
+            Err(e) => fail(e),
+        }
+    }
+
+    /// What rln_status reports, without the network: the check before every send.
+    async fn rln_report(&self) -> Result<CallToolResult, McpError> {
         let rln = match self.node.call(DELIVERY, "rlnState", &[]).await {
             Ok(v) => v,
             Err(e) if is_uninitialized(&e) => {
-                return fail("messaging node not created yet: call messaging_connect");
+                return fail(format!("{NO_NODE}: call messaging_connect"));
             }
             Err(e) => return logos_fail(e),
         };
         if rln.get("state").and_then(Value::as_str) == Some("Disabled") {
             return ok(json!({
-                "network": self.settings.preset,
                 "rln": "off",
                 "can_send": true,
             }));
@@ -1339,7 +1380,6 @@ impl LogosServer {
             }
         };
         ok(json!({
-            "network": self.settings.preset,
             "rln": "on",
             "can_send": reason.is_none(),
             "reason": reason,

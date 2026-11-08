@@ -4,6 +4,7 @@
 //! The standalone binary drives it with the `logosctl` adapter in [`logosctl`].
 
 pub mod control;
+pub mod enr;
 pub mod events;
 pub mod guard;
 pub mod logosctl;
