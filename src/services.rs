@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The version this side writes. It reads any `1.x`.
-pub const VERSION: &str = "1.0";
+pub const VERSION: &str = "1.1";
 /// The discovery entry that carries a provider's chat address.
 pub const CHAT_ENTRY: &str = "logos-mcp/chat/v1";
 
@@ -35,6 +35,9 @@ pub enum Body {
         network: String,
         expires_at: u64,
         deliver_within_s: u64,
+        /// Since 1.1: the buyer may lock the price in this escrow instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        escrow: Option<EscrowTerms>,
     },
     Reject {
         reason: String,
@@ -42,6 +45,9 @@ pub enum Body {
     Paid {
         quote: String,
         tx_hash: String,
+        /// Since 1.1: the account that opened the escrow, when it was used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        escrow_buyer: Option<String>,
     },
     Cancel {
         #[serde(default)]
@@ -53,6 +59,17 @@ pub enum Body {
     Failed {
         reason: String,
     },
+}
+
+/// Where and on what terms a quote's price may be locked in escrow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EscrowTerms {
+    /// The escrow program's id, base58.
+    pub program: String,
+    /// The provider's account the escrow pays, `Public/<base58>`.
+    pub provider: String,
+    /// Delivery deadline, milliseconds since the Unix epoch.
+    pub deadline: u64,
 }
 
 /// A job's input or output: text, or content in Logos Storage.
@@ -110,6 +127,7 @@ pub fn parse(text: &str) -> Option<Message> {
             price_lepta,
             pay_to,
             network,
+            escrow,
             ..
         } => {
             !price_lepta.is_empty()
@@ -117,6 +135,9 @@ pub fn parse(text: &str) -> Option<Message> {
                 && price_lepta.bytes().all(|b| b.is_ascii_digit())
                 && pay_to.starts_with("Public/")
                 && !network.is_empty()
+                && escrow.as_ref().is_none_or(|e| {
+                    !e.program.is_empty() && e.provider.starts_with("Public/") && e.deadline > 0
+                })
         }
         Body::Paid { quote, .. } => quote.len() == 64,
         _ => true,
@@ -175,6 +196,7 @@ pub struct Quote {
     pub network: String,
     pub expires_at: u64,
     pub deliver_within_s: u64,
+    pub escrow: Option<EscrowTerms>,
     /// What a `paid` message must name.
     pub hash: String,
 }
@@ -189,6 +211,8 @@ pub struct Job {
     pub state: State,
     pub quote: Option<Quote>,
     pub tx_hash: Option<String>,
+    /// The account that opened the escrow, as the buyer's `paid` names it.
+    pub escrow_buyer: Option<String>,
     pub output: Option<Payload>,
     pub reason: Option<String>,
     pub updated_ms: u64,
@@ -238,6 +262,7 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
                     state: State::Requested,
                     quote: None,
                     tx_hash: None,
+                    escrow_buyer: None,
                     output: None,
                     reason: None,
                     updated_ms: seen.timestamp_ms,
@@ -256,6 +281,7 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
                     network,
                     expires_at,
                     deliver_within_s,
+                    escrow,
                 },
                 State::Requested,
                 false,
@@ -266,6 +292,7 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
                     network,
                     expires_at,
                     deliver_within_s,
+                    escrow,
                     hash: quote_hash(seen.text),
                 });
                 Some(State::Quoted)
@@ -280,10 +307,17 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
                     State::Rejected
                 })
             }
-            (Body::Paid { quote, tx_hash }, State::Quoted, true)
-                if job.quote.as_ref().is_some_and(|q| q.hash == quote) =>
-            {
+            (
+                Body::Paid {
+                    quote,
+                    tx_hash,
+                    escrow_buyer,
+                },
+                State::Quoted,
+                true,
+            ) if job.quote.as_ref().is_some_and(|q| q.hash == quote) => {
                 job.tx_hash = Some(tx_hash);
+                job.escrow_buyer = escrow_buyer;
                 Some(State::Paid)
             }
             (Body::Cancel { reason }, State::Requested | State::Quoted, true) => {

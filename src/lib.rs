@@ -5,6 +5,7 @@
 
 pub mod control;
 pub mod enr;
+pub mod escrow;
 pub mod events;
 pub mod guard;
 pub mod logosctl;

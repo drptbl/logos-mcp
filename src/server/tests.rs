@@ -545,6 +545,7 @@ fn transfer(from: &str, to: &str, amount: &str) -> Parameters<TransferParams> {
         from: from.into(),
         to: to.into(),
         amount_lepta: amount.into(),
+        escrow: None,
     })
 }
 
@@ -816,6 +817,111 @@ async fn a_restart_between_open_and_listing_is_not_trusted() {
         assert!(is_error(&r));
         assert!(text(&r).contains("restarted"), "{}", text(&r));
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A payment into escrow for job ref [7; 32], from the agent account.
+fn escrow_payment(to: String) -> TransferParams {
+    TransferParams {
+        from: AGENT_FROM.into(),
+        to,
+        amount_lepta: "1000000".into(),
+        escrow: Some(crate::control::EscrowOpen {
+            job_ref: hex(&[7; 32]),
+            provider: RLN_PAYER.into(),
+            deadline: 9_000_000_000_000,
+        }),
+    }
+}
+
+const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
+
+#[tokio::test]
+async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "send_generic_public_transaction",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let buyer: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let job = crate::escrow::job_account(&buyer, &[7; 32]);
+    let sent = s
+        .send_checked(
+            &CancellationToken::new(),
+            &escrow_payment(hex(&job)),
+            SendMode::Direct,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["tx_hash"], "bb22");
+    let calls = fake.calls.lock().unwrap();
+    let call = &calls.last().unwrap()[2..];
+    let open = crate::escrow::Instruction::Open {
+        job_ref: [7; 32],
+        provider: crate::guard::public_account_hex(RLN_PAYER)
+            .map(|h| {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+            .unwrap(),
+        amount: 1_000_000,
+        deadline: 9_000_000_000_000,
+    };
+    assert_eq!(
+        call,
+        [
+            "lez_core".to_string(),
+            "send_generic_public_transaction".into(),
+            format!(r#"json:["{AGENT_ID}","{}"]"#, hex(&job)),
+            "json:[true,false]".into(),
+            format!(
+                r#"json:{{"_bytes":"{}"}}"#,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(open.encode())
+            ),
+            format!("str:{}", crate::escrow::PROGRAM_ID_HEX),
+            "str:".into(),
+            "json:[]".into(),
+        ]
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn an_escrow_payment_must_go_to_its_own_job_account() {
+    let fake = FakeRunner::with(opened_by_server());
+    let s = wallet_server(fake.clone());
+    let r = s
+        .send_checked(
+            &CancellationToken::new(),
+            &escrow_payment(RLN_PAYER.into()),
+            SendMode::Direct,
+        )
+        .await;
+    assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("send_generic_public_transaction"))
+    );
 }
 
 // One logos.dev fleet discovery node, as fleets.logos.co/data.json lists it.

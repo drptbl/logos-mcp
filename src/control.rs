@@ -144,6 +144,20 @@ pub struct TransferRequest {
     pub amount_lepta: String,
     /// Unix seconds.
     pub requested_at: u64,
+    /// Set when the payment locks the amount in escrow, `to` being the job's account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escrow: Option<EscrowOpen>,
+}
+
+/// The terms a payment into escrow locks the amount under.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EscrowOpen {
+    /// The job reference, 64 hex characters.
+    pub job_ref: String,
+    /// The provider account the escrow pays, `Public/<base58>`.
+    pub provider: String,
+    /// Delivery deadline, milliseconds since the Unix epoch.
+    pub deadline: u64,
 }
 
 struct Pending {
@@ -173,6 +187,7 @@ impl Approvals {
         from: &str,
         to: &str,
         amount_lepta: &str,
+        escrow: Option<EscrowOpen>,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         // Unique across restarts too, so an old id never names a new request.
         let id = format!(
@@ -203,6 +218,7 @@ impl Approvals {
                     to: to.to_string(),
                     amount_lepta: amount_lepta.to_string(),
                     requested_at: unix_now(),
+                    escrow,
                 },
                 expires: tokio::time::Instant::now() + APPROVAL_EXPIRES,
                 decision,

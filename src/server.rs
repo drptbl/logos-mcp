@@ -296,6 +296,11 @@ pub struct TransferParams {
     pub to: String,
     /// Amount in lepta as a decimal string (1 LEZ = 1,000,000,000 lepta).
     pub amount_lepta: String,
+    /// Locks the amount in escrow instead, `to` being the job's account. Only
+    /// service_pay sets it: agents can't.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub escrow: Option<crate::control::EscrowOpen>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -383,6 +388,55 @@ impl From<&str> for SendError {
     fn from(message: &str) -> Self {
         Self::NotSent(message.to_string())
     }
+}
+
+/// The `send_generic_public_transaction` arguments that open an escrow job:
+/// the buyer `from` signs and pays its fee, `to` must be the job's account.
+fn escrow_open(
+    from: &str,
+    to: &str,
+    amount_lepta: &str,
+    terms: &crate::control::EscrowOpen,
+) -> Result<Vec<Arg>, SendError> {
+    use crate::escrow::{Instruction, PROGRAM_ID_HEX, job_account};
+    let id = |hex: &str| -> Option<[u8; 32]> {
+        (hex.len() == 64)
+            .then(|| {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                    .collect::<Option<Vec<u8>>>()?
+                    .try_into()
+                    .ok()
+            })
+            .flatten()
+    };
+    let (Some(buyer), Some(job), Some(job_ref)) = (id(from), id(to), id(&terms.job_ref)) else {
+        return Err("escrow payment: an account or the job reference is not 32 bytes".into());
+    };
+    if job_account(&buyer, &job_ref) != job {
+        return Err("escrow payment: the recipient isn't this job's escrow account".into());
+    }
+    let provider = guard::public_account_hex(&terms.provider)
+        .ok()
+        .and_then(|h| id(&h))
+        .ok_or("escrow payment: the provider account is not a public account")?;
+    let amount: u128 = amount_lepta
+        .parse()
+        .map_err(|_| "escrow payment: the amount is not a number")?;
+    let open = Instruction::Open {
+        job_ref,
+        provider,
+        amount,
+        deadline: terms.deadline,
+    };
+    Ok(vec![
+        Arg::Json(json!([from, to])),
+        Arg::Json(json!([true, false])),
+        Arg::Bytes(open.encode()),
+        Arg::str(PROGRAM_ID_HEX),
+        Arg::str(""),
+        Arg::Json(json!([])),
+    ])
 }
 
 /// A submitted transfer, as wallet_transfer reports it.
@@ -550,6 +604,7 @@ impl LogosServer {
                 from: request.from,
                 to: request.to,
                 amount_lepta: request.amount_lepta,
+                escrow: request.escrow,
             };
             let outcome = match server
                 .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
@@ -1470,10 +1525,14 @@ impl LogosServer {
         if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
             return fail(e.message());
         }
-        let (id, mut decision) = match self.approvals.request(&p.from, &p.to, &p.amount_lepta) {
-            Ok(filed) => filed,
-            Err(e) => return fail(e),
-        };
+        let (id, mut decision) =
+            match self
+                .approvals
+                .request(&p.from, &p.to, &p.amount_lepta, p.escrow.clone())
+            {
+                Ok(filed) => filed,
+                Err(e) => return fail(e),
+            };
         let answered = async {
             loop {
                 let now = decision.borrow_and_update().clone();
@@ -1596,8 +1655,19 @@ impl LogosServer {
         if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
             return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
         }
-        let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
-        let outcome = match self.node.call(LEZ, "transfer_public", &args).await {
+        let reply = match &p.escrow {
+            None => {
+                let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
+                self.node.call(LEZ, "transfer_public", &args).await
+            }
+            Some(terms) => {
+                let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
+                self.node
+                    .call(LEZ, "send_generic_public_transaction", &open)
+                    .await
+            }
+        };
+        let outcome = match reply {
             Ok(v) => TransferOutcome::read(&embedded_json(v)),
             Err(e) => TransferOutcome::Unknown(e.to_string()),
         };
