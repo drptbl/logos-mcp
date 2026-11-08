@@ -129,10 +129,12 @@ async fn connect_creates_node_only_when_uninitialized() {
     ]);
     let s = server(fake.clone(), None);
     assert!(!is_error(&s.messaging_connect().await.unwrap()));
-    assert_eq!(
-        fake.calls.lock().unwrap().len(),
-        2,
-        "a connected node is left alone"
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains(&"createNode".to_string()) || c.contains(&"start".to_string())),
+        "a connected node is left alone: {calls:?}"
     );
 }
 
@@ -201,9 +203,13 @@ async fn rln_status_on_a_network_without_rln_allows_sending() {
     let b = body(&r);
     assert_eq!(b["rln"], "off");
     assert_eq!(b["can_send"], true);
-    assert_eq!(
-        fake.calls.lock().unwrap().len(),
-        1,
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"get_membership_state".to_string())),
         "no membership lookups when RLN is off"
     );
 }
@@ -2066,9 +2072,11 @@ async fn chat_status_starts_chat_once_on_the_session_network() {
         out(
             r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
         ),
+        node_enr(ENR_LOGOS_DEV),
         chat_ok("init", "null"),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_DEV),
     ]);
     let s = server(fake.clone(), None);
     let r = s.chat_status().await.unwrap();
@@ -2100,7 +2108,14 @@ async fn chat_status_leaves_running_chat_alone() {
     let b = body(&s.chat_status().await.unwrap());
     assert_eq!(b["address"], SELF_ADDR);
     assert_eq!(b["started_now"], false);
-    assert_eq!(fake.calls.lock().unwrap().len(), 3, "no init, no connect");
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains(&"init".to_string())
+                || c.contains(&"getConnectionStatus".to_string())),
+        "no init, no connect: {calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -2409,10 +2424,12 @@ async fn chat_status_in_basecamp_reports_running_chat_without_touching_messaging
     ]);
     let b = body(&basecamp_server(fake.clone()).chat_status().await.unwrap());
     assert_eq!(b["address"], SELF_ADDR);
-    assert_eq!(
-        fake.calls.lock().unwrap().len(),
-        2,
-        "no load, no connect, no init"
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|c| c.contains(&"init".to_string())
+            || c.contains(&"getConnectionStatus".to_string())
+            || c.contains(&"load".to_string())),
+        "no load, no connect, no init: {calls:?}"
     );
 }
 
@@ -2493,13 +2510,16 @@ async fn concurrent_first_chat_status_calls_start_chat_once() {
         out(
             r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
         ),
+        node_enr(ENR_LOGOS_DEV),
         chat_ok("init", "null"),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_DEV),
         // The second call finds chat already running.
         out(CHAT_LOADED),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_DEV),
     ]);
     let s = server(fake.clone(), None);
     let (a, b) = tokio::join!(s.chat_status(), s.chat_status());
@@ -2532,4 +2552,69 @@ async fn chat_start_refuses_when_rln_cannot_send_the_invite() {
             .iter()
             .any(|c| c.contains(&"create_conversation".to_string()))
     );
+}
+
+// ---- send checks, node creation and the real network ----
+
+const ENR_LOGOS_DEV: &str = "enr:-K24QN6sIVvTUFyY43EG8XDgzmk7yJ47RSCBDlMiH6U7sEZwCpygNxlsH9mlin9P1WSbHaHSHqiunbDNe6bahLsR3HtKgmlkgnY0im11bHRpYWRkcnOAgnJzkwADCAAAAAEAAgADAAQABQAGAAeJc2VjcDI1NmsxoQM0rGKBJR2xGVsXh09fXRXCX0wISE-HgZUqCHvqrNWU7IN0Y3CCweuDdWRwgsbihXdha3UyAA";
+const ENR_LOGOS_TEST: &str = "enr:-K-4QEtqScAIVZA-pAT0BE-v7OBbpDwzI16aV_Q76rm5MLoJfxtBckAf8EFtI1E9KEo53Rgkxk_YVVj1Tm1a5PxXE7WCBcGCaWSCdjSKbXVsdGlhZGRyc4CCcnOTAAIIAAAAAQACAAMABAAFAAYAB4lzZWNwMjU2azGhAgcPu3b-Y0n-8xrgdBw56URSEdLXrcZCqfIALawUf45yg3RjcILmMIN1ZHCC1_aFd2FrdTIN";
+
+fn node_enr(enr: &str) -> crate::logosctl::RawOutput {
+    out(&format!(
+        r#"{{"method":"getNodeInfo","module":"delivery_module","result":{{"error":null,"success":true,"value":"{enr}"}},"status":"ok"}}"#
+    ))
+}
+
+#[tokio::test]
+async fn connect_names_the_network_an_existing_node_is_on() {
+    // Configured for logos.dev, but the node was already running on logos.test.
+    let fake = FakeRunner::with(vec![
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_TEST),
+    ]);
+    let b = body(&server(fake, None).messaging_connect().await.unwrap());
+    assert_eq!(b["network"], "logos.test");
+}
+
+#[tokio::test]
+async fn chat_status_names_the_network_chat_joined() {
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_TEST),
+    ]);
+    let b = body(&server(fake, None).chat_status().await.unwrap());
+    assert_eq!(b["network"], "logos.test");
+}
+
+#[tokio::test]
+async fn rln_status_names_the_network_of_the_node() {
+    let fake = FakeRunner::with(vec![out(RLN_DISABLED), node_enr(ENR_LOGOS_TEST)]);
+    let b = body(&server(fake, None).rln_status().await.unwrap());
+    assert_eq!(b["network"], "logos.test");
+}
+
+#[tokio::test]
+async fn before_the_node_exists_the_configured_network_is_named() {
+    let uninit = r#"{"method":"getNodeInfo","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let fake = FakeRunner::with(vec![out(uninit)]);
+    assert_eq!(server(fake, None).network().await, "logos.dev");
+}
+
+#[tokio::test]
+async fn node_status_shows_the_real_and_the_configured_network() {
+    let fake = FakeRunner::with(vec![
+        out(r#"{"daemon":{"pid":7,"status":"running"},"modules":[],"modules_summary":{}}"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_TEST),
+    ]);
+    let b = body(&server(fake, None).node_status().await.unwrap());
+    assert_eq!(b["messaging"]["network"], "logos.test");
+    assert_eq!(b["messaging"]["configured_network"], "logos.dev");
 }

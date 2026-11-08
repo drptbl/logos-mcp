@@ -598,13 +598,29 @@ impl LogosServer {
     /// Why the node can't send right now, as `rln_status` reports it. `None`
     /// when it can, or when that can't be told (the send then reports its own error).
     async fn cannot_send(&self) -> Option<String> {
-        let report = tool_json(self.rln_status().await).ok()?;
+        let report = tool_json(self.rln_report().await).ok()?;
         (report["can_send"] == false).then(|| {
             report["reason"]
                 .as_str()
                 .unwrap_or("RLN can't send right now")
                 .to_string()
         })
+    }
+
+    /// The network the messaging node is really on, read from its ENR, which
+    /// can differ from this server's setting when it joined an existing node.
+    /// Before there is a node, the one it would be created on.
+    async fn network(&self) -> String {
+        match self
+            .node
+            .call(DELIVERY, "getNodeInfo", &[Arg::str("MyENR")])
+            .await
+        {
+            Ok(Value::String(enr)) => crate::enr::network_name(&enr),
+            Ok(_) => "unknown".to_string(),
+            Err(e) if is_uninitialized(&e) => self.settings.preset.clone(),
+            Err(_) => "unknown".to_string(),
+        }
     }
 
     /// Load `module` if it isn't loaded, and give a fresh load time to settle:
@@ -861,7 +877,8 @@ impl LogosServer {
             "daemon": daemon.get("daemon"),
             "modules": daemon.get("modules_summary"),
             "messaging": {
-                "network": self.settings.preset,
+                "network": self.network().await,
+                "configured_network": self.settings.preset,
                 "mode": self.settings.mode,
                 "connection": connection,
                 "subscriptions": *self.subscriptions.lock().unwrap(),
@@ -878,7 +895,7 @@ impl LogosServer {
         if self.settings.host_owns_messaging {
             return match self.node.call(DELIVERY, "getConnectionStatus", &[]).await {
                 Ok(connection) => ok(json!({
-                    "network": self.settings.preset,
+                    "network": self.network().await,
                     "created": false,
                     "started": false,
                     "connection": connection,
@@ -933,7 +950,7 @@ impl LogosServer {
             }
         }
         ok(json!({
-            "network": self.settings.preset,
+            "network": self.network().await,
             "created": created,
             "started": started,
             "connection": connection,
@@ -1099,7 +1116,7 @@ impl LogosServer {
         };
         ok(json!({
             "address": address,
-            "network": self.settings.preset,
+            "network": self.network().await,
             "delivery_state": state,
             "detail": status["detail"],
             "conversations": status["convo_count"],
@@ -1267,6 +1284,17 @@ impl LogosServer {
         description = "Whether this node can send right now: RLN membership state and the messages left in the current epoch. On logos.dev RLN is off."
     )]
     async fn rln_status(&self) -> Result<CallToolResult, McpError> {
+        match tool_json(self.rln_report().await) {
+            Ok(mut report) => {
+                report["network"] = json!(self.network().await);
+                ok(report)
+            }
+            Err(e) => fail(e),
+        }
+    }
+
+    /// What rln_status reports, without the network: the check before every send.
+    async fn rln_report(&self) -> Result<CallToolResult, McpError> {
         let rln = match self.node.call(DELIVERY, "rlnState", &[]).await {
             Ok(v) => v,
             Err(e) if is_uninitialized(&e) => {
@@ -1276,7 +1304,6 @@ impl LogosServer {
         };
         if rln.get("state").and_then(Value::as_str) == Some("Disabled") {
             return ok(json!({
-                "network": self.settings.preset,
                 "rln": "off",
                 "can_send": true,
             }));
@@ -1339,7 +1366,6 @@ impl LogosServer {
             }
         };
         ok(json!({
-            "network": self.settings.preset,
             "rln": "on",
             "can_send": reason.is_none(),
             "reason": reason,
