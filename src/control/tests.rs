@@ -345,11 +345,35 @@ fn job_inputs_and_results_never_reach_the_file() {
 }
 
 #[tokio::test]
+async fn an_escrow_payment_shows_its_terms_to_the_user() {
+    let approvals = Approvals::default();
+    let terms = EscrowOpen {
+        job_ref: "ab".repeat(32),
+        provider: "Public/p".into(),
+        deadline: 9,
+    };
+    approvals
+        .request("Public/a", "Public/job", "5", Some(terms.clone()))
+        .unwrap();
+    let waiting = serde_json::to_value(approvals.waiting()).unwrap();
+    assert_eq!(waiting[0]["escrow"]["provider"], "Public/p", "{waiting}");
+    approvals
+        .request("Public/a", "Public/b", "5", None)
+        .unwrap();
+    let waiting = serde_json::to_value(approvals.waiting()).unwrap();
+    assert!(waiting[1].get("escrow").is_none(), "{waiting}");
+}
+
+#[tokio::test]
 async fn waiting_requests_are_capped() {
     let approvals = Approvals::default();
     for _ in 0..MAX_WAITING {
-        approvals.request("Public/a", "Public/b", "1").unwrap();
+        approvals
+            .request("Public/a", "Public/b", "1", None)
+            .unwrap();
     }
-    let e = approvals.request("Public/a", "Public/b", "1").unwrap_err();
+    let e = approvals
+        .request("Public/a", "Public/b", "1", None)
+        .unwrap_err();
     assert!(e.contains("waiting"), "{e}");
 }

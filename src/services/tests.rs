@@ -91,7 +91,7 @@ fn new_messages_carry_the_version_and_fresh_ids() {
             reason: String::new(),
         },
     );
-    assert_eq!(a.v, "1.0");
+    assert_eq!(a.v, VERSION);
     assert_eq!(a.id.len(), 32);
     assert_ne!(a.id, b.id);
     assert_eq!(new_job_id().len(), 32);
@@ -238,4 +238,57 @@ fn a_provider_counts_a_payment_only_once_it_lands() {
     assert_eq!(job.state_at(5_000, false), State::Quoted);
     assert_eq!(job.state_at(10_000, false), State::Expired);
     assert_eq!(job.state_at(10_000, true), State::Paid);
+}
+
+fn escrow_quote(expires_at: u64) -> String {
+    msg(
+        "2",
+        json!({
+            "type": "quote",
+            "price_lepta": "1000000",
+            "pay_to": "Public/7Lrmxj4ZQDAeqmfzR5W27yb2WC7hyxrzP2V9nUXDx5Hd",
+            "network": "logos.dev",
+            "expires_at": expires_at,
+            "deliver_within_s": 600,
+            "escrow": {
+                "program": "CAZ8AvrdAeZ4rQjHqhAucqSLqrMK8TFQ7Z8b2jg5Sb4G",
+                "provider": "Public/4n2DCJMYveciCLAvfcR1nWvMFbr7f8zSc7KGaG7YMpLK",
+                "deadline": expires_at + 600_000
+            }
+        }),
+    )
+}
+
+#[test]
+fn a_quote_may_offer_escrow_and_a_payment_names_its_buyer() {
+    assert_eq!(VERSION, "1.1");
+    let q = escrow_quote(10_000);
+    let paid = msg(
+        "3",
+        json!({
+            "type": "paid", "quote": quote_hash(&q), "tx_hash": "t1",
+            "escrow_buyer": "Public/DKZmzyVG8sccQKQPGaFoZr8wi6rMGgMwJiB77YCPZjsQ"
+        }),
+    );
+    let jobs = replay([seen(true, &request()), seen(false, &q), seen(true, &paid)]);
+    let job = &jobs[0];
+    let escrow = job.quote.as_ref().unwrap().escrow.as_ref().unwrap();
+    assert_eq!(
+        escrow.program,
+        "CAZ8AvrdAeZ4rQjHqhAucqSLqrMK8TFQ7Z8b2jg5Sb4G"
+    );
+    assert_eq!(escrow.deadline, 610_000);
+    assert_eq!(
+        job.escrow_buyer.as_deref(),
+        Some("Public/DKZmzyVG8sccQKQPGaFoZr8wi6rMGgMwJiB77YCPZjsQ")
+    );
+    // A v1.0 quote has none, and still reads.
+    let plain = replay([seen(true, &request()), seen(false, &quote(10_000))]);
+    assert!(plain[0].quote.as_ref().unwrap().escrow.is_none());
+}
+
+#[test]
+fn a_malformed_escrow_offer_spoils_the_quote() {
+    let bad = escrow_quote(10_000).replace("\"Public/4n2D", "\"4n2D");
+    assert_eq!(parse(&bad), None);
 }

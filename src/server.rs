@@ -36,6 +36,8 @@ const CHAT: &str = "chat_module";
 /// network's message limit once encrypted.
 const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
+/// How many seconds chat waits for a messaging node it just created to connect.
+const CONNECT_WAIT_TRIES: usize = 60;
 /// How long a new conversation settles before chat_start returns. A first
 /// message sent right away was lost twice in three live tries on chat_module
 /// 0.3.0; one sent 10 seconds later always arrived.
@@ -294,6 +296,11 @@ pub struct TransferParams {
     pub to: String,
     /// Amount in lepta as a decimal string (1 LEZ = 1,000,000,000 lepta).
     pub amount_lepta: String,
+    /// Locks the amount in escrow instead, `to` being the job's account. Only
+    /// service_pay sets it: agents can't.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub escrow: Option<crate::control::EscrowOpen>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -381,6 +388,55 @@ impl From<&str> for SendError {
     fn from(message: &str) -> Self {
         Self::NotSent(message.to_string())
     }
+}
+
+/// The `send_generic_public_transaction` arguments that open an escrow job:
+/// the buyer `from` signs and pays its fee, `to` must be the job's account.
+fn escrow_open(
+    from: &str,
+    to: &str,
+    amount_lepta: &str,
+    terms: &crate::control::EscrowOpen,
+) -> Result<Vec<Arg>, SendError> {
+    use crate::escrow::{Instruction, PROGRAM_ID_HEX, job_account};
+    let id = |hex: &str| -> Option<[u8; 32]> {
+        (hex.len() == 64)
+            .then(|| {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                    .collect::<Option<Vec<u8>>>()?
+                    .try_into()
+                    .ok()
+            })
+            .flatten()
+    };
+    let (Some(buyer), Some(job), Some(job_ref)) = (id(from), id(to), id(&terms.job_ref)) else {
+        return Err("escrow payment: an account or the job reference is not 32 bytes".into());
+    };
+    if job_account(&buyer, &job_ref) != job {
+        return Err("escrow payment: the recipient isn't this job's escrow account".into());
+    }
+    let provider = guard::public_account_hex(&terms.provider)
+        .ok()
+        .and_then(|h| id(&h))
+        .ok_or("escrow payment: the provider account is not a public account")?;
+    let amount: u128 = amount_lepta
+        .parse()
+        .map_err(|_| "escrow payment: the amount is not a number")?;
+    let open = Instruction::Open {
+        job_ref,
+        provider,
+        amount,
+        deadline: terms.deadline,
+    };
+    Ok(vec![
+        Arg::Json(json!([from, to])),
+        Arg::Json(json!([true, false])),
+        Arg::Bytes(open.encode()),
+        Arg::str(PROGRAM_ID_HEX),
+        Arg::str(""),
+        Arg::Json(json!([])),
+    ])
 }
 
 /// A submitted transfer, as wallet_transfer reports it.
@@ -548,6 +604,7 @@ impl LogosServer {
                 from: request.from,
                 to: request.to,
                 amount_lepta: request.amount_lepta,
+                escrow: request.escrow,
             };
             let outcome = match server
                 .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
@@ -1127,7 +1184,26 @@ impl LogosServer {
         // Chat joins whatever messaging node exists and creates one otherwise, so
         // bring that node up first: on the operator's settings standalone, and
         // never in Basecamp, which runs its own.
-        tool_json(self.messaging_connect().await)?;
+        let connect = tool_json(self.messaging_connect().await)?;
+        // chat_module starts a node it joins while that node is still starting,
+        // and a second start crashes delivery_module (seen live on 0.3.3): give
+        // a node this call created time to connect first.
+        if connect["created"] == true {
+            let mut connected = false;
+            for _ in 0..CONNECT_WAIT_TRIES {
+                let state = self.node.call(DELIVERY, "getConnectionStatus", &[]).await;
+                if matches!(&state, Ok(Value::String(s)) if s != "Disconnected") {
+                    connected = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            if !connected {
+                return Err(
+                    "messaging is still connecting: call chat_status again in a minute to start chat".into(),
+                );
+            }
+        }
         let config = json!({ "delivery_preset": self.settings.preset });
         self.node
             .call(CHAT, "init", &[Arg::Json(config)])
@@ -1449,10 +1525,14 @@ impl LogosServer {
         if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
             return fail(e.message());
         }
-        let (id, mut decision) = match self.approvals.request(&p.from, &p.to, &p.amount_lepta) {
-            Ok(filed) => filed,
-            Err(e) => return fail(e),
-        };
+        let (id, mut decision) =
+            match self
+                .approvals
+                .request(&p.from, &p.to, &p.amount_lepta, p.escrow.clone())
+            {
+                Ok(filed) => filed,
+                Err(e) => return fail(e),
+            };
         let answered = async {
             loop {
                 let now = decision.borrow_and_update().clone();
@@ -1575,8 +1655,19 @@ impl LogosServer {
         if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
             return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
         }
-        let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
-        let outcome = match self.node.call(LEZ, "transfer_public", &args).await {
+        let reply = match &p.escrow {
+            None => {
+                let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
+                self.node.call(LEZ, "transfer_public", &args).await
+            }
+            Some(terms) => {
+                let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
+                self.node
+                    .call(LEZ, "send_generic_public_transaction", &open)
+                    .await
+            }
+        };
+        let outcome = match reply {
             Ok(v) => TransferOutcome::read(&embedded_json(v)),
             Err(e) => TransferOutcome::Unknown(e.to_string()),
         };

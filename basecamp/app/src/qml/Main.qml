@@ -293,9 +293,15 @@ Item {
                         LogosText {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: qsTr("%1 from %2 to %3, asked at %4")
-                                .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
-                                .arg(modelData.to).arg(root.time(modelData.requested_at))
+                            text: modelData.escrow
+                                ? qsTr("%1 from %2 into escrow for %3, refunded if nothing is delivered by %4, asked at %5")
+                                    .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
+                                    .arg(modelData.escrow.provider)
+                                    .arg(new Date(modelData.escrow.deadline).toLocaleString(Qt.locale(), Locale.ShortFormat))
+                                    .arg(root.time(modelData.requested_at))
+                                : qsTr("%1 from %2 to %3, asked at %4")
+                                    .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
+                                    .arg(modelData.to).arg(root.time(modelData.requested_at))
                         }
                         LogosButton {
                             text: qsTr("Deny")

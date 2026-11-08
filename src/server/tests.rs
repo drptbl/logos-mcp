@@ -545,6 +545,7 @@ fn transfer(from: &str, to: &str, amount: &str) -> Parameters<TransferParams> {
         from: from.into(),
         to: to.into(),
         amount_lepta: amount.into(),
+        escrow: None,
     })
 }
 
@@ -816,6 +817,111 @@ async fn a_restart_between_open_and_listing_is_not_trusted() {
         assert!(is_error(&r));
         assert!(text(&r).contains("restarted"), "{}", text(&r));
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A payment into escrow for job ref [7; 32], from the agent account.
+fn escrow_payment(to: String) -> TransferParams {
+    TransferParams {
+        from: AGENT_FROM.into(),
+        to,
+        amount_lepta: "1000000".into(),
+        escrow: Some(crate::control::EscrowOpen {
+            job_ref: hex(&[7; 32]),
+            provider: RLN_PAYER.into(),
+            deadline: 9_000_000_000_000,
+        }),
+    }
+}
+
+const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
+
+#[tokio::test]
+async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "send_generic_public_transaction",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let buyer: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let job = crate::escrow::job_account(&buyer, &[7; 32]);
+    let sent = s
+        .send_checked(
+            &CancellationToken::new(),
+            &escrow_payment(hex(&job)),
+            SendMode::Direct,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["tx_hash"], "bb22");
+    let calls = fake.calls.lock().unwrap();
+    let call = &calls.last().unwrap()[2..];
+    let open = crate::escrow::Instruction::Open {
+        job_ref: [7; 32],
+        provider: crate::guard::public_account_hex(RLN_PAYER)
+            .map(|h| {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+            .unwrap(),
+        amount: 1_000_000,
+        deadline: 9_000_000_000_000,
+    };
+    assert_eq!(
+        call,
+        [
+            "lez_core".to_string(),
+            "send_generic_public_transaction".into(),
+            format!(r#"json:["{AGENT_ID}","{}"]"#, hex(&job)),
+            "json:[true,false]".into(),
+            format!(
+                r#"json:{{"_bytes":"{}"}}"#,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(open.encode())
+            ),
+            format!("str:{}", crate::escrow::PROGRAM_ID_HEX),
+            "str:".into(),
+            "json:[]".into(),
+        ]
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("transfer_public"))
+    );
+}
+
+#[tokio::test]
+async fn an_escrow_payment_must_go_to_its_own_job_account() {
+    let fake = FakeRunner::with(opened_by_server());
+    let s = wallet_server(fake.clone());
+    let r = s
+        .send_checked(
+            &CancellationToken::new(),
+            &escrow_payment(RLN_PAYER.into()),
+            SendMode::Direct,
+        )
+        .await;
+    assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("send_generic_public_transaction"))
+    );
 }
 
 // One logos.dev fleet discovery node, as fleets.logos.co/data.json lists it.
@@ -2515,6 +2621,9 @@ async fn concurrent_first_chat_status_calls_start_chat_once() {
             r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
         ),
         node_enr(ENR_LOGOS_DEV),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
         chat_ok("init", "null"),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
@@ -2723,3 +2832,59 @@ async fn node_status_shows_the_real_and_the_configured_network() {
 }
 
 mod services;
+
+#[tokio::test(start_paused = true)]
+async fn chat_waits_for_a_new_messaging_node_to_connect_before_starting() {
+    // chat_module starts a node it joins while that node is still starting,
+    // and starting it twice crashes delivery_module (seen live on 0.3.3).
+    let status = |value: &str| {
+        out(&format!(
+            r#"{{"method":"getConnectionStatus","module":"delivery_module","result":{{"error":null,"success":true,"value":"{value}"}},"status":"ok"}}"#
+        ))
+    };
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", r#""""#),
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        node_enr(ENR_LOGOS_DEV),
+        status("Disconnected"),
+        status("Disconnected"),
+        status("Connected"),
+        chat_ok("init", "null"),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_DEV),
+    ]);
+    let s = server(fake.clone(), None);
+    let r = s.chat_status().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let calls = fake.calls.lock().unwrap();
+    let init = calls
+        .iter()
+        .position(|c| c.get(3).map(String::as_str) == Some("init"))
+        .unwrap();
+    let connected = calls
+        .iter()
+        .rposition(|c| c.get(3).map(String::as_str) == Some("getConnectionStatus"))
+        .unwrap();
+    assert!(
+        connected < init,
+        "init only after the node connected: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.get(3).map(String::as_str) == Some("getConnectionStatus"))
+            .count(),
+        4
+    );
+}
