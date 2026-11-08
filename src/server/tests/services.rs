@@ -369,6 +369,43 @@ async fn a_request_goes_to_the_provider_over_one_conversation() {
     assert_eq!(fake.calls_to("chat_module.create_conversation").len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_request_starts_chat_before_opening_a_conversation() {
+    // A fresh server may find chat not started yet.
+    let fake = node();
+    fake.reset("chat_module.get_address", chat("get_address", r#""""#));
+    fake.set(
+        "chat_module.get_address",
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+    );
+    fake.set("chat_module.init", chat_ok("init", "null"));
+    fake.reset(
+        "module ls --loaded",
+        out(r#"[{"name":"chat_module","status":"loaded"},{"name":"delivery_module","status":"loaded"}]"#),
+    );
+    fake.set(
+        "delivery_module.getConnectionStatus",
+        out(r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_request(Parameters(RequestParams {
+            chat_address: PEER.into(),
+            service_id: SVC.into(),
+            input_text: Some("hi".into()),
+            input_cid: None,
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let calls = fake.calls.lock().unwrap();
+    let first = |k: &str| calls.iter().position(|argv| key(argv) == k);
+    assert!(
+        first("chat_module.init").unwrap() < first("chat_module.create_conversation").unwrap(),
+        "{calls:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_request_needs_exactly_one_input() {
     let fake = node();

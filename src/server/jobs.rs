@@ -613,6 +613,10 @@ impl LogosServer {
             Ok(input) => input,
             Err(e) => return fail(e),
         };
+        // A fresh server may find chat not started yet.
+        if let Err(e) = self.ensure_chat().await {
+            return fail(e);
+        }
         let known = self.services.lock().await.conversations.get(&peer).cloned();
         let convo = match known.clone() {
             Some(convo) => convo,
