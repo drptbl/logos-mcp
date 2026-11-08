@@ -67,6 +67,8 @@ pub enum Arg {
     Int(i64),
     Bool(bool),
     Bytes(Vec<u8>),
+    /// A record argument, passed as a JSON value rather than a string.
+    Json(Value),
 }
 
 impl Arg {
@@ -79,7 +81,7 @@ impl Arg {
             Arg::Str(s) => format!("str:{s}"),
             Arg::Int(i) => i.to_string(),
             Arg::Bool(b) => b.to_string(),
-            Arg::Bytes(_) => format!("json:{}", self.to_json()),
+            Arg::Bytes(_) | Arg::Json(_) => format!("json:{}", self.to_json()),
         }
     }
 
@@ -91,6 +93,7 @@ impl Arg {
             Arg::Int(i) => json!(i),
             Arg::Bool(b) => json!(b),
             Arg::Bytes(b) => json!({ "_bytes": URL_SAFE_NO_PAD.encode(b) }),
+            Arg::Json(v) => v.clone(),
         }
     }
 }

@@ -31,6 +31,7 @@ Item {
         { key: "wallet", title: qsTr("Wallet"), detail: qsTr("See accounts and balances, create agent accounts") },
         { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts") },
         { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services") },
+        { key: "chat", title: qsTr("Chat"), detail: qsTr("Uses your Basecamp chat account: the agent reads and sends in every Logos Chat conversation you have") },
         { key: "ask_before_transfer", title: qsTr("Ask me before each transfer"), detail: qsTr("Every transfer waits for your OK in the Wallet tab. Off: the agent sends on its own") }
     ]
 

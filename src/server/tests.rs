@@ -2020,3 +2020,516 @@ async fn an_unknown_request_never_claims_nothing_was_sent() {
     assert!(text(&r).contains("wallet_accounts"), "{}", text(&r));
     assert!(!text(&r).contains("never sent"), "{}", text(&r));
 }
+
+// ---- chat ----
+
+const PEER: &str = "b6e5c2c80f1fa492db3cd4596be2751e1464099fd24096d68837a6476a470fbe";
+const SELF_ADDR: &str = "cf6ec1fb860378d445f5a4feafed9569b3e3bd23125817dd13716d0b6b92f952";
+
+fn chat(method: &str, result: &str) -> crate::logosctl::RawOutput {
+    out(&format!(
+        r#"{{"method":"{method}","module":"chat_module","result":{result},"status":"ok"}}"#
+    ))
+}
+
+fn chat_ok(method: &str, value: &str) -> crate::logosctl::RawOutput {
+    chat(
+        method,
+        &format!(r#"{{"error":null,"success":true,"value":{value}}}"#),
+    )
+}
+
+fn chat_refused(method: &str, error: &str) -> crate::logosctl::RawOutput {
+    chat(
+        method,
+        &format!(r#"{{"error":"{error}","success":false,"value":null}}"#),
+    )
+}
+
+const CHAT_LOADED: &str = r#"[{"name":"chat_module","status":"loaded"}]"#;
+const CHAT_ONLINE: &str =
+    r#"{"convo_count":2,"delivery_adopted":true,"delivery_state":"online","detail":""}"#;
+
+fn basecamp_server(fake: Arc<FakeRunner>) -> LogosServer {
+    let mut s = server(fake, None);
+    s.settings.host_owns_messaging = true;
+    s
+}
+
+#[tokio::test]
+async fn chat_status_starts_chat_once_on_the_session_network() {
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", r#""""#),
+        // messaging_connect: an existing node is adopted, never restarted.
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":null,"success":true,"value":"Connected"},"status":"ok"}"#,
+        ),
+        chat_ok("init", "null"),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+    ]);
+    let s = server(fake.clone(), None);
+    let r = s.chat_status().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["address"], SELF_ADDR);
+    assert_eq!(b["delivery_state"], "online");
+    assert_eq!(b["conversations"], 2);
+    assert_eq!(b["started_now"], true);
+    let calls = fake.calls.lock().unwrap();
+    let init = calls
+        .iter()
+        .find(|c| c.contains(&"init".to_string()))
+        .unwrap();
+    assert_eq!(
+        init.last().unwrap(),
+        r#"json:{"delivery_preset":"logos.dev"}"#
+    );
+}
+
+#[tokio::test]
+async fn chat_status_leaves_running_chat_alone() {
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+    ]);
+    let s = server(fake.clone(), None);
+    let b = body(&s.chat_status().await.unwrap());
+    assert_eq!(b["address"], SELF_ADDR);
+    assert_eq!(b["started_now"], false);
+    assert_eq!(fake.calls.lock().unwrap().len(), 3, "no init, no connect");
+}
+
+#[tokio::test]
+async fn chat_status_says_when_the_network_is_still_coming_up() {
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat(
+            "status",
+            r#"{"convo_count":0,"delivery_adopted":false,"delivery_state":"initialising","detail":""}"#,
+        ),
+    ]);
+    let b = body(&server(fake, None).chat_status().await.unwrap());
+    assert_eq!(b["delivery_state"], "initialising");
+    assert!(
+        b["note"].as_str().unwrap().contains("again"),
+        "{}",
+        b["note"]
+    );
+}
+
+#[tokio::test]
+async fn chat_status_in_basecamp_never_starts_messaging() {
+    let fake = FakeRunner::with(vec![
+        chat("get_address", r#""""#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+    ]);
+    let s = basecamp_server(fake.clone());
+    let r = s.chat_status().await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("Basecamp"), "{}", text(&r));
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls.iter().any(|c| c.contains(&"init".to_string())),
+        "chat was not started: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_start_refuses_a_bad_address_without_calls() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    for bad in [
+        "",
+        "zz",
+        &PEER[..63],
+        &format!("{PEER}0"),
+        &PEER.replace('b', "g"),
+    ] {
+        let r = s
+            .chat_start(Parameters(ChatStartParams {
+                peer_address: bad.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{bad}");
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn chat_start_opens_a_conversation_with_the_peer() {
+    let fake = FakeRunner::with(vec![
+        out(RLN_DISABLED),
+        chat_ok(
+            "create_conversation",
+            r#""17de45e2ff7f5cebdce3617c5a0d4f9f""#,
+        ),
+    ]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chat_start(Parameters(ChatStartParams {
+            peer_address: PEER.to_uppercase(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        body(&r)["conversation_id"],
+        "17de45e2ff7f5cebdce3617c5a0d4f9f"
+    );
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls[1][3], "create_conversation");
+    assert_eq!(calls[1][4], format!("str:{PEER}"));
+}
+
+#[tokio::test]
+async fn chat_errors_reach_the_agent_in_full() {
+    let fake = FakeRunner::with(vec![
+        out(RLN_DISABLED),
+        chat_refused("create_conversation", "module not initialised"),
+    ]);
+    let r = server(fake, None)
+        .chat_start(Parameters(ChatStartParams {
+            peer_address: PEER.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("module not initialised"), "{}", text(&r));
+    assert!(text(&r).contains("chat_status"), "{}", text(&r));
+
+    let fake = FakeRunner::with(vec![
+        out(RLN_DISABLED),
+        chat_refused("send_message", "conversation not found"),
+    ]);
+    let r = server(fake, None)
+        .chat_send(Parameters(ChatSendParams {
+            conversation_id: "ffff".into(),
+            text: "hi".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("conversation not found"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn chat_send_refuses_empty_or_oversized_text_without_calls() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    for (id, text) in [
+        ("c1", String::new()),
+        ("c1", "x".repeat(MAX_CHAT_BYTES + 1)),
+        ("", "hi".to_string()),
+    ] {
+        let r = s
+            .chat_send(Parameters(ChatSendParams {
+                conversation_id: id.into(),
+                text,
+            }))
+            .await
+            .unwrap();
+        assert!(is_error(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn chat_send_hands_the_text_to_the_conversation() {
+    let fake = FakeRunner::with(vec![out(RLN_DISABLED), chat_ok("send_message", "null")]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chat_send(Parameters(ChatSendParams {
+            conversation_id: "17de45e2ff7f5cebdce3617c5a0d4f9f".into(),
+            text: "meet at noon".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["sent"], true);
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls[1][3], "send_message");
+    assert_eq!(calls[1][4], "str:17de45e2ff7f5cebdce3617c5a0d4f9f");
+    assert_eq!(calls[1][5], "str:meet at noon");
+}
+
+#[tokio::test]
+async fn chat_send_refuses_when_rln_cannot_send() {
+    let spent = QUOTA_99.replace(r#""remaining":99"#, r#""remaining":0"#);
+    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_ACTIVE), out(&spent)]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chat_send(Parameters(ChatSendParams {
+            conversation_id: "c1".into(),
+            text: "hi".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("rln_status"), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"send_message".to_string()))
+    );
+}
+
+const MESSAGES: &str = r#"[
+    {"content":"hello from the dev agent","from_self":true,"timestamp_ms":1},
+    {"content":"second message","from_self":true,"timestamp_ms":2},
+    {"content":"reply from the buyer","from_self":false,"sender":"b6e5c2c80f1fa492db3cd4596be2751e1464099fd24096d68837a6476a470fbe","timestamp_ms":3}
+]"#;
+
+#[tokio::test]
+async fn chat_read_pages_a_conversation_by_index() {
+    let fake = FakeRunner::with(vec![
+        chat("get_messages", MESSAGES),
+        chat("get_messages", MESSAGES),
+    ]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chat_read(Parameters(ChatReadParams {
+            conversation_id: Some("c1".into()),
+            after: Some(1),
+            limit: Some(1),
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(b["messages"][0]["index"], 2);
+    assert_eq!(b["messages"][0]["text"], "second message");
+    assert_eq!(b["messages"][0]["sender"], Value::Null, "sent by you");
+    assert_eq!(b["next_after"], 2);
+
+    let b = body(
+        &s.chat_read(Parameters(ChatReadParams {
+            conversation_id: Some("c1".into()),
+            after: Some(2),
+            limit: None,
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(b["messages"][0]["index"], 3);
+    assert_eq!(b["messages"][0]["sender"], PEER);
+    assert_eq!(b["messages"][0]["text"], "reply from the buyer");
+    assert_eq!(b["next_after"], 3);
+    assert_eq!(fake.calls.lock().unwrap()[0][4], "str:c1");
+}
+
+#[tokio::test]
+async fn chat_read_without_a_conversation_lists_them_newest_first() {
+    let fake = FakeRunner::with(vec![chat(
+        "list_conversations",
+        r#"[
+            {"convo_id":"old","history_only":true,"kind":"direct","last_activity_ms":5,"message_count":1,"preview":"bye"},
+            {"convo_id":"empty","history_only":false,"kind":"direct","last_activity_ms":0,"message_count":0},
+            {"convo_id":"new","history_only":false,"kind":"direct","last_activity_ms":9,"message_count":3,"preview":"reply"}
+        ]"#,
+    )]);
+    let b = body(
+        &server(fake, None)
+            .chat_read(Parameters(ChatReadParams {
+                conversation_id: None,
+                after: None,
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = b["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["conversation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["new", "old", "empty"]);
+    assert_eq!(b["conversations"][0]["messages"], 3);
+    assert_eq!(b["conversations"][0]["preview"], "reply");
+    assert_eq!(b["conversations"][1]["can_send"], false, "history only");
+    assert_eq!(b["conversations"][0]["can_send"], true);
+}
+
+#[tokio::test]
+async fn turning_chat_off_hides_and_refuses_every_chat_tool() {
+    let fake = FakeRunner::with(vec![]);
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let client = connected(server(fake.clone(), None).with_tool_groups(rx)).await;
+    let chat_tools = ["chat_status", "chat_start", "chat_send", "chat_read"];
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in chat_tools {
+        assert!(names.iter().any(|n| n == tool), "{tool} listed: {names:?}");
+    }
+
+    groups.send_modify(|g| g.set("chat", false).unwrap());
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in chat_tools {
+        assert!(!names.iter().any(|n| n == tool), "{tool} hidden: {names:?}");
+    }
+    let args = serde_json::json!({ "conversation_id": "c1", "text": "hi" });
+    let r = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("chat_send")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("turned off"), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn chat_status_in_basecamp_reports_running_chat_without_touching_messaging() {
+    let fake = FakeRunner::with(vec![
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+    ]);
+    let b = body(&basecamp_server(fake.clone()).chat_status().await.unwrap());
+    assert_eq!(b["address"], SELF_ADDR);
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        2,
+        "no load, no connect, no init"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_chat_module_is_named() {
+    let fake = FakeRunner::with(vec![crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"MODULE_NOT_FOUND","message":"no such module: chat_module","status":"error"}"#.into(),
+        stderr: String::new(),
+    }]);
+    let r = basecamp_server(fake).chat_status().await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("Chat module"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn reading_past_the_last_message_says_so() {
+    let fake = FakeRunner::with(vec![chat("get_messages", MESSAGES)]);
+    let b = body(
+        &server(fake, None)
+            .chat_read(Parameters(ChatReadParams {
+                conversation_id: Some("c1".into()),
+                after: Some(650),
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["messages"].as_array().unwrap().len(), 0);
+    // Messages are renumbered after a restart: read the kept ones again rather
+    // than skip any that were never read.
+    assert_eq!(b["next_after"], 0);
+    assert!(
+        b["note"].as_str().unwrap().contains("restart"),
+        "{}",
+        b["note"]
+    );
+}
+
+#[tokio::test]
+async fn an_unexpected_chat_reply_is_not_echoed_into_the_error() {
+    let fake = FakeRunner::with(vec![
+        chat("get_messages", r#"{"content":"the password is swordfish"}"#),
+        chat(
+            "list_conversations",
+            r#"{"preview":"the password is swordfish"}"#,
+        ),
+    ]);
+    let s = server(fake, None);
+    for id in [Some("c1".to_string()), None] {
+        let r = s
+            .chat_read(Parameters(ChatReadParams {
+                conversation_id: id,
+                after: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_error(&r));
+        assert!(!text(&r).contains("swordfish"), "{}", text(&r));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_first_chat_status_calls_start_chat_once() {
+    let fake = FakeRunner::with(vec![
+        // Loading the module waits for it to settle, so the second call runs meanwhile.
+        out("[]"),
+        out(r#"{"status":"ok"}"#),
+        chat("get_address", r#""""#),
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        chat_ok("init", "null"),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+        // The second call finds chat already running.
+        out(CHAT_LOADED),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+    ]);
+    let s = server(fake.clone(), None);
+    let (a, b) = tokio::join!(s.chat_status(), s.chat_status());
+    assert!(!is_error(&a.unwrap()) && !is_error(&b.unwrap()));
+    let calls = fake.calls.lock().unwrap();
+    let creates = calls
+        .iter()
+        .filter(|c| c.contains(&"createNode".to_string()))
+        .count();
+    assert_eq!(creates, 1, "{calls:?}");
+}
+
+#[tokio::test]
+async fn chat_start_refuses_when_rln_cannot_send_the_invite() {
+    let spent = QUOTA_99.replace(r#""remaining":99"#, r#""remaining":0"#);
+    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_ACTIVE), out(&spent)]);
+    let r = server(fake.clone(), None)
+        .chat_start(Parameters(ChatStartParams {
+            peer_address: PEER.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("rln_status"), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains(&"create_conversation".to_string()))
+    );
+}

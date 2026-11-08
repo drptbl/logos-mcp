@@ -1,6 +1,6 @@
 [package]
 name = "logos_mcp_module"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 
 # Standalone crate: built by logos-module-builder, not part of the repo's workspace.
