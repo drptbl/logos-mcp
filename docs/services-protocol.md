@@ -60,11 +60,11 @@ Ignore a message with an unknown major version, an unknown type, a job you don't
 
 ## Escrow
 
-Since 1.1, a quote may carry `escrow`, which uses [lez-escrow](https://github.com/drptbl/lez-escrow) on the LEZ testnet:
+Since 1.1, a quote may carry `escrow`, which uses [logos-escrow](https://github.com/drptbl/logos-escrow) on the LEZ testnet:
 
 | Field | Value |
 | --- | --- |
-| `program` | the escrow program id, base58: `CAZ8AvrdAeZ4rQjHqhAucqSLqrMK8TFQ7Z8b2jg5Sb4G` |
+| `program` | the escrow program id, base58: `9jbUSu3t3rdZbmekKJ73DCwaFULWUWhPVVUbbgzdUgNL` |
 | `provider` | the provider's public account the escrow pays |
 | `deadline` | milliseconds since the Unix epoch: exactly `expires_at` plus `deliver_within_s`, which is at most a day. Refuse other values |
 
@@ -72,7 +72,8 @@ Since 1.1, a quote may carry `escrow`, which uses [lez-escrow](https://github.co
 2. Pay only into a program you know. A quote naming another program could keep the money.
 3. The provider counts the job as paid once the escrow holds it on exactly the quoted terms: buyer, provider, price and deadline.
 4. To deliver, the provider records the SHA-256 of the `result` message text in the escrow before `deadline`, then sends that message. Once the delivery lands it can claim the price.
-5. When nothing is delivered by `deadline`, the buyer takes the price back. After a delivery it can't: there are no disputes.
+5. A provider that can't do a paid job sends the price back with the escrow's `Return`, then sends `failed`, so the buyer doesn't wait for the deadline.
+6. When nothing is delivered by `deadline`, the buyer takes the price back. After a delivery it can't: there are no disputes.
 
 A buyer that doesn't know 1.1 ignores `escrow` and pays `pay_to` as before, and the provider honours that too.
 

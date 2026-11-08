@@ -20,11 +20,11 @@ const RUN_A_PROGRAM: &str = "369d7d27dee17ad2f9d39e067ccaf3693c29bc4d432c4d8d6cb
 
 #[test]
 fn the_program_is_the_deployed_one() {
-    // lez-escrow's README: the redeploy that refuses calls from other programs.
-    assert_eq!(PROGRAM_ID, "CAZ8AvrdAeZ4rQjHqhAucqSLqrMK8TFQ7Z8b2jg5Sb4G");
+    // logos-escrow's README: the deploy with Return (image 83b695c1…).
+    assert_eq!(PROGRAM_ID, "9jbUSu3t3rdZbmekKJ73DCwaFULWUWhPVVUbbgzdUgNL");
     assert_eq!(
         PROGRAM_ID_HEX,
-        "a5e31b14f1304b129f108abb457eb389ed0f88103fa91b069208af5e9df6560d"
+        "81c6de4e3a4ba0d4694d8c225782952e012ccf8746ac77fe1535ec948928d729"
     );
 }
 
@@ -75,6 +75,17 @@ fn encodes_instructions_as_the_program_expects() {
     }
     .encode();
     assert_eq!((refund.len(), refund[0]), (57, 4));
+    // Variant 5, then job_ref and amount: 49 bytes, as the README lays it out.
+    let back = Instruction::Return {
+        job_ref: [1; 32],
+        amount: 5,
+    }
+    .encode();
+    let mut want = vec![5u8];
+    want.extend([1u8; 32]);
+    want.extend(5u128.to_le_bytes());
+    assert_eq!(back, want);
+    assert_eq!(back.len(), 49);
 }
 
 #[test]
