@@ -46,6 +46,13 @@ const FIRST_MESSAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// with its own clear error, so the RLN check lets it through.
 const NO_NODE: &str = "messaging node not created yet";
 /// How long wallet_transfer waits for the user before returning the request id.
+/// The wallet's gas limit when its config sets none.
+const DEFAULT_GAS_LIMIT: u64 = 2_000_000;
+/// LEZ's lowest base fee per unit of gas, for execution and for storage.
+const BASE_FEE_MIN: u128 = 8;
+/// Storage gas allowance: a transaction's size in bytes. An escrow call was
+/// about 4.3 KB live.
+const TX_BYTES: u128 = 8 * 1024;
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
 const WATCH_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -757,6 +764,53 @@ impl LogosServer {
             "wallet tools are disabled: start the server with --wallet-config and --wallet-storage"
                 .to_string()
         })
+    }
+
+    /// The fee LEZ holds back from the payer before running one of this
+    /// wallet's transactions: its gas limit and size, priced at the lowest
+    /// base fee. A busier network charges more, so this is the least the
+    /// payer needs on top of what it moves.
+    async fn fee_reserve(&self) -> u128 {
+        let config = match self.wallet() {
+            Ok(WalletMode::Dedicated(paths)) => Some(paths.config.clone()),
+            // Basecamp's wallet keeps its config next to its storage.
+            Ok(WalletMode::Shared { .. }) => match self.node.call(LEZ, "wallet_dir", &[]).await {
+                Ok(Value::String(dir)) if !dir.is_empty() => {
+                    Some(PathBuf::from(dir).join("config.json"))
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let gas_limit = config
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .and_then(|v| v.get("gas_limit")?.as_u64())
+            .unwrap_or(DEFAULT_GAS_LIMIT);
+        (u128::from(gas_limit) + TX_BYTES) * BASE_FEE_MIN
+    }
+
+    /// Refuse an escrow open `from` can't pay for: the wallet only checks the
+    /// fee, so an open short of price plus fee goes out, is refused on
+    /// chain, and still costs the whole reserve.
+    async fn check_open_funds(&self, from: &str, amount: u128) -> Result<(), String> {
+        let id = guard::public_account_hex(from)?;
+        let held = match self
+            .node
+            .call(LEZ, "get_balance", &[Arg::str(id), Arg::Bool(true)])
+            .await
+        {
+            Ok(Value::String(b)) => b.parse::<u128>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| format!("can't read {from}'s balance: not opening the escrow"))?;
+        let reserve = self.fee_reserve().await;
+        if held < amount.saturating_add(reserve) {
+            return Err(format!(
+                "{from} holds {held} lepta, less than the {amount} lepta price plus the network's {reserve} lepta fee reserve: not opening the escrow"
+            ));
+        }
+        Ok(())
     }
 
     async fn sequencer_addr(&self) -> Result<String, String> {
@@ -1642,6 +1696,20 @@ impl LogosServer {
         }
         if from == to {
             return Err("sender and recipient are the same account".into());
+        }
+        // An escrow open the chain would refuse still costs its whole fee.
+        // Checked here, after any approval wait and before the last looks.
+        if let Some(terms) = &p.escrow {
+            if jobs::too_late_for(terms.deadline) {
+                return Err(
+                    "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
+                );
+            }
+            let amount = p
+                .amount_lepta
+                .parse()
+                .map_err(|_| "escrow payment: the amount is not a number")?;
+            self.check_open_funds(&p.from, amount).await?;
         }
         if ct.is_cancelled() {
             return Err("transfer cancelled before sending: nothing was sent".into());

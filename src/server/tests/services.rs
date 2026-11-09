@@ -165,22 +165,7 @@ fn node() -> Arc<Routed> {
 /// A server with its own agent wallet (in a temp dir) and discovery peers.
 fn services_server(fake: Arc<Routed>) -> (LogosServer, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let s = LogosServer::new(
-        Arc::new(Logosctl::new(fake)),
-        Arc::new(EventStore::default()),
-        None,
-        NodeSettings {
-            preset: "logos.dev".into(),
-            mode: "Edge".into(),
-            config_dir: None,
-            wallet: Some(WalletMode::Dedicated(WalletPaths {
-                config: dir.path().join("wallet_config.json"),
-                storage: dir.path().join("storage.json"),
-            })),
-            discovery_bootstrap: vec![FLEET_PEER.into()],
-            host_owns_messaging: false,
-        },
-    );
+    let s = services_server_in(fake, dir.path());
     (s, dir)
 }
 
@@ -884,7 +869,14 @@ async fn an_input_too_big_once_encoded_is_refused() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
+/// The gas limit the test wallets' config sets, as the live ones do.
+const GAS_LIMIT: u128 = 200_000;
+
 fn services_server_in(fake: Arc<Routed>, dir: &std::path::Path) -> LogosServer {
+    let config = dir.join("wallet_config.json");
+    if !config.exists() {
+        std::fs::write(&config, format!(r#"{{"gas_limit": {GAS_LIMIT}}}"#)).unwrap();
+    }
     LogosServer::new(
         Arc::new(Logosctl::new(fake)),
         Arc::new(EventStore::default()),
@@ -1552,6 +1544,20 @@ async fn an_escrow_is_not_opened_without_the_funds() {
         .await
         .unwrap();
     assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+
+    // The price, but not the network's fee reserve on top: LEZ would refuse
+    // the open and keep the whole reserve, as it did live with 2.28M lepta.
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""2280000""#));
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("fee reserve"), "{}", text(&r));
     assert!(
         fake.calls_to("lez_core.send_generic_public_transaction")
             .is_empty()
@@ -2266,4 +2272,339 @@ async fn a_returned_escrow_is_not_a_paid_job() {
         fake.calls_to("lez_core.send_generic_public_transaction")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn an_escrow_call_still_on_its_way_is_not_sent_again() {
+    // A second claim would be refused on chain once the first lands, at the
+    // cost of its whole fee.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(!is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("claim1"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+
+    // Included, yet the job is still only delivered: that claim was refused
+    // on chain, so it may go again.
+    fake.reset(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "true"),
+    );
+    assert!(!is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        2
+    );
+
+    // Landed while this call waited: read as delivered first, claimed by
+    // the time it landed. Nothing more is sent.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 2),
+    );
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("has landed"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn any_escrow_call_on_its_way_holds_back_the_next() {
+    // A delivery still landing: declining now would race it on chain.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(!is_error(&s.service_deliver(deliver_done()).await.unwrap()));
+    let r = s
+        .service_reject(Parameters(RejectParams {
+            job: JOB.into(),
+            reason: "can't do it".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn an_escrow_call_with_no_clear_outcome_holds_back_a_retry() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    // Neither a hash nor a refusal: it may have gone out.
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        lez("send_generic_public_transaction", r#""garbled""#),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("no clear outcome"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_escrow_call_that_never_landed_stops_holding_back() {
+    // Sent long ago and never included: dropped, so the claim may go.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim2"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-in-flight.json"),
+        json!({ JOB: { "tx": "claim1", "sent_ms": now_ms() - 16 * 60_000 } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_refund_keeps_the_paying_account_until_it_lands() {
+    // The `paid` message never went out: only this server's note says which
+    // account opened the escrow.
+    let past = 1_000_000;
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, past - 600_000, past);
+    let fake_with = |state: u8| {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, past, state),
+        );
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("refund1"),
+        );
+        fake
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-payments.json"),
+        json!({ JOB: { "tx_hash": "open1", "escrow_buyer": AGENT_FROM } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake_with(0), dir.path());
+    assert!(!is_error(&s.service_refund(job(JOB)).await.unwrap()));
+
+    // After a restart the refund hasn't landed: it isn't sent again, and the
+    // account it goes back to is still known.
+    let fake = fake_with(0);
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("refund1"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+
+    // Once it landed, the note goes.
+    let s = services_server_in(fake_with(4), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let s = services_server_in(fake_with(4), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_job_too_late_to_deliver_is_not_worked_on() {
+    // Paid, but the delivery couldn't be recorded before the deadline any more.
+    let soon = now_ms() + 3 * 60_000;
+    let fake = node();
+    fake.set("chat_module.get_messages", provider_escrow_history(soon));
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, soon, 0),
+    );
+    let (s, _dir) = services_server(fake);
+    let b = body(&s.service_jobs().await.unwrap());
+    let next = b["jobs"][0]["next"].as_str().unwrap_or_default();
+    assert!(!next.contains("do the work"), "{b}");
+    assert!(next.contains("service_reject"), "{b}");
+}
+
+#[tokio::test]
+async fn an_escrow_too_close_to_its_deadline_is_not_opened() {
+    // A one-minute delivery window: by the time the open lands, the
+    // provider couldn't deliver, and an open after the deadline is refused
+    // at the cost of its fee.
+    let expires = now_ms() + 60_000;
+    let q = proto(
+        2,
+        Body::Quote {
+            price_lepta: "1000000".into(),
+            pay_to: NEW_ADDRESS.into(),
+            network: "logos.dev".into(),
+            expires_at: expires,
+            deliver_within_s: 60,
+            escrow: Some(protocol::EscrowTerms {
+                program: escrow::PROGRAM_ID.into(),
+                provider: PROVIDER_ACCOUNT.into(),
+                deadline: expires + 60_000,
+            }),
+        },
+    );
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_bad_delivery_window_is_refused_before_advertising() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    let mut p = offer();
+    p.0.deliver_within_s = Some(0);
+    let r = s.service_offer(p).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("libp2p_module.createXpr").is_empty());
+}
+
+#[tokio::test]
+async fn a_returned_or_refunded_escrow_is_not_announced_as_paid() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    // The open is noted, and its record says the job came back; then the
+    // same with no note, as before a restart.
+    for (noted, state) in [(true, 5u8), (true, 4u8), (false, 5u8), (false, 4u8)] {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(
+                AGENT_FROM,
+                PROVIDER_ACCOUNT,
+                1_000_000,
+                FAR + 600_000,
+                state,
+            ),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        if noted {
+            std::fs::write(
+                dir.path().join("service-payments.json"),
+                json!({ JOB: { "tx_hash": "open1", "escrow_buyer": AGENT_FROM } }).to_string(),
+            )
+            .unwrap();
+        }
+        let s = services_server_in(fake.clone(), dir.path());
+        let r = s
+            .service_pay(CancellationToken::new(), pay())
+            .await
+            .unwrap();
+        assert!(is_error(&r), "noted {noted}, state {state}: {}", text(&r));
+        assert!(fake.calls_to("chat_module.send_message").is_empty());
+        assert!(
+            fake.calls_to("lez_core.send_generic_public_transaction")
+                .is_empty()
+        );
+    }
 }
