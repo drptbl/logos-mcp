@@ -746,6 +746,12 @@ impl LogosServer {
         {
             return fail("price_lepta must be a whole number of lepta above zero, as digits");
         }
+        let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
+        if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
+            return fail(format!(
+                "deliver_within_s must be between 1 and {MAX_DELIVER_S} seconds"
+            ));
+        }
         if let Err(e) = self.wallet() {
             return fail(format!("services are paid into the agent wallet: {e}"));
         }
@@ -774,12 +780,6 @@ impl LogosServer {
             Ok(id) => id,
             Err(e) => return fail(e),
         };
-        let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
-        if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
-            return fail(format!(
-                "deliver_within_s must be between 1 and {MAX_DELIVER_S} seconds"
-            ));
-        }
         {
             let mut state = self.services.lock().await;
             state.advertised.insert(p.service_id.clone());

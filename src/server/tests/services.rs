@@ -2421,3 +2421,14 @@ async fn an_escrow_too_close_to_its_deadline_is_not_opened() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_bad_delivery_window_is_refused_before_advertising() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    let mut p = offer();
+    p.0.deliver_within_s = Some(0);
+    let r = s.service_offer(p).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("libp2p_module.createXpr").is_empty());
+}
