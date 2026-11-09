@@ -1999,10 +1999,17 @@ impl LogosServer {
                         "nothing was delivered by the deadline: take the money back with service_refund",
                     )
                 }
-                (Role::Buyer, State::Paid, Some(JobState::Open)) if untold => {
-                    Some("the escrow is open, but the provider wasn't told: call service_pay again")
-                }
                 _ if !can_send => None,
+                (Role::Buyer, State::Paid, Some(JobState::Open)) if untold => Some(
+                    if escrow
+                        .as_ref()
+                        .is_some_and(|(_, e)| too_late_for(e.deadline))
+                    {
+                        "the escrow is open, but too late for the provider to deliver: wait for the deadline to pass, then take the money back with service_refund"
+                    } else {
+                        "the escrow is open, but the provider wasn't told: call service_pay again"
+                    },
+                ),
                 _ => next_step(job.role, state),
             };
             listed.push(json!({
