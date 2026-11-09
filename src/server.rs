@@ -1719,6 +1719,13 @@ impl LogosServer {
                 self.node.call(LEZ, "transfer_public", &args).await
             }
             Some(terms) => {
+                // An approval can take a while: an open landing after the
+                // deadline is refused and still costs its fee.
+                if jobs::too_late_for(terms.deadline) {
+                    return Err(
+                        "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
+                    );
+                }
                 let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
                 let amount = p
                     .amount_lepta

@@ -254,6 +254,12 @@ pub struct CancelParams {
     pub reason: Option<String>,
 }
 
+/// Too late to record a delivery before `deadline`, allowing for block
+/// timestamps that lag. An escrow opened now would leave no time either.
+pub(super) fn too_late_for(deadline: u64) -> bool {
+    now_ms().saturating_add(DEADLINE_MARGIN_MS) >= deadline
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1187,7 +1193,7 @@ impl LogosServer {
             match record.state {
                 // Record the delivery first; the result goes out once it lands.
                 JobState::Open => {
-                    if now_ms() + DEADLINE_MARGIN_MS >= e.deadline {
+                    if too_late_for(e.deadline) {
                         return Err(
                             "the escrow deadline has passed, or is too close to record the delivery in time: the buyer can take a refund once it passes".into(),
                         );
@@ -1599,6 +1605,11 @@ impl LogosServer {
                 APPROVAL_EXPIRES.as_secs() / 60
             ));
         }
+        if escrow.as_ref().is_some_and(|e| too_late_for(e.deadline)) {
+            return Err(
+                "the escrow deadline is too close for the provider to deliver in time: ask for a new quote with service_request".into(),
+            );
+        }
         let network = self.network().await;
         if q.network != network {
             return Err(format!(
@@ -1831,6 +1842,15 @@ impl LogosServer {
             let next = match (job.role, state, escrow_state) {
                 (Role::Provider, State::Delivered, Some(JobState::Delivered)) => {
                     Some("collect the payment with service_claim")
+                }
+                (Role::Provider, State::Paid, Some(JobState::Open))
+                    if escrow
+                        .as_ref()
+                        .is_some_and(|(_, e)| too_late_for(e.deadline)) =>
+                {
+                    Some(
+                        "too late to record a delivery before the escrow deadline: don't start the work. Decline with service_reject so the buyer can take a refund",
+                    )
                 }
                 (Role::Provider, State::Delivered, Some(JobState::Open)) => {
                     Some("wait for the delivery to land on chain, then service_claim")

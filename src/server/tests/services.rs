@@ -2364,3 +2364,60 @@ async fn a_refund_keeps_the_paying_account_until_it_lands() {
     let r = s.service_refund(job(JOB)).await.unwrap();
     assert!(is_error(&r), "{}", text(&r));
 }
+
+#[tokio::test]
+async fn a_job_too_late_to_deliver_is_not_worked_on() {
+    // Paid, but the delivery couldn't be recorded before the deadline any more.
+    let soon = now_ms() + 3 * 60_000;
+    let fake = node();
+    fake.set("chat_module.get_messages", provider_escrow_history(soon));
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, soon, 0),
+    );
+    let (s, _dir) = services_server(fake);
+    let b = body(&s.service_jobs().await.unwrap());
+    let next = b["jobs"][0]["next"].as_str().unwrap_or_default();
+    assert!(!next.contains("do the work"), "{b}");
+    assert!(next.contains("service_reject"), "{b}");
+}
+
+#[tokio::test]
+async fn an_escrow_too_close_to_its_deadline_is_not_opened() {
+    // A one-minute delivery window: by the time the open lands, the
+    // provider couldn't deliver, and an open after the deadline is refused
+    // at the cost of its fee.
+    let expires = now_ms() + 60_000;
+    let q = proto(
+        2,
+        Body::Quote {
+            price_lepta: "1000000".into(),
+            pay_to: NEW_ADDRESS.into(),
+            network: "logos.dev".into(),
+            expires_at: expires,
+            deliver_within_s: 60,
+            escrow: Some(protocol::EscrowTerms {
+                program: escrow::PROGRAM_ID.into(),
+                provider: PROVIDER_ACCOUNT.into(),
+                deadline: expires + 60_000,
+            }),
+        },
+    );
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
