@@ -77,7 +77,7 @@ logosctl package install delivery_module --yes
 
 ## Install
 
-Download the binary for your platform from the newest `v*` release on the [releases page](https://github.com/drptbl/logos-mcp/releases). The `logos_mcp-*` releases there are Basecamp packages:
+Download the binary for your platform from the [latest release](https://github.com/drptbl/logos-mcp/releases/latest):
 
 1. macOS, Apple Silicon => `aarch64-apple-darwin`
 2. Linux x86_64 => `x86_64-unknown-linux-gnu`
