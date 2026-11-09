@@ -1400,7 +1400,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Pay a job's quote from one of your agent accounts, then tell the provider. There is no refund if the provider doesn't deliver, so keep jobs small. Your account also needs the network fee on top of the price. With approvals on, the user approves the payment first: call again later to finish."
+        description = "Pay a job's quote from one of your agent accounts, then tell the provider. A quote with escrow locks the price until the provider delivers, and service_refund takes it back if they decline or miss the deadline. Without escrow there is no refund, so keep those jobs small. Your account also needs the network's fee reserve on top of the price. With approvals on, the user approves the payment first: call again later to finish."
     )]
     pub(super) async fn service_pay(
         &self,
