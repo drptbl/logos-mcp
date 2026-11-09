@@ -28,6 +28,11 @@ const DEADLINE_MARGIN_MS: u64 = 5 * 60 * 1000;
 const MAX_DELIVER_S: u64 = 24 * 60 * 60;
 /// Next to the wallet: payments sent, or maybe sent, before the provider was told.
 const PAYMENTS: &str = "service-payments.json";
+/// Escrow calls that may still land, kept across restarts.
+const IN_FLIGHT: &str = "service-in-flight.json";
+/// How long an escrow call is waited for before it counts as dropped:
+/// calls landed in 2 to 7 minutes live.
+const IN_FLIGHT_MS: u64 = 15 * 60 * 1000;
 
 /// A service this agent offers.
 #[derive(Debug, Clone)]
@@ -62,6 +67,14 @@ fn paid_state(state: JobState) -> bool {
         state,
         JobState::Open | JobState::Delivered | JobState::Claimed | JobState::Released
     )
+}
+
+/// An escrow call that went out, or may have.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct InFlight {
+    /// `None` when the send had no clear outcome.
+    tx: Option<String>,
+    sent_ms: u64,
 }
 
 /// Why an escrow on the quoted terms no longer pays for its job.
@@ -186,9 +199,10 @@ pub(super) struct Services {
     /// so it is kept in `PAYMENTS` too and survives a restart.
     submitted: BTreeMap<String, Payment>,
     payments_loaded: bool,
-    /// The last escrow call sent for each job, until it lands: job ->
-    /// (instruction variant, tx hash).
-    in_flight: BTreeMap<String, (u8, String)>,
+    /// The last escrow call sent for each job, until it lands or counts as
+    /// dropped. Kept in `IN_FLIGHT` too.
+    in_flight: BTreeMap<String, InFlight>,
+    in_flight_loaded: bool,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
 }
@@ -510,42 +524,105 @@ impl LogosServer {
         }
     }
 
-    /// Send a job's escrow instruction unless the same one is still on its
-    /// way: once the first lands, a second is refused on chain and still
-    /// costs its whole fee.
+    async fn with_in_flight(&self) -> tokio::sync::MutexGuard<'_, Services> {
+        let mut state = self.services.lock().await;
+        if !state.in_flight_loaded {
+            let saved: BTreeMap<String, InFlight> = self
+                .wallet_side_file(IN_FLIGHT)
+                .and_then(|f| std::fs::read(f).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            for (job, f) in saved {
+                state.in_flight.entry(job).or_insert(f);
+            }
+            state.in_flight_loaded = true;
+        }
+        state
+    }
+
+    /// Remember (`Some`) or forget (`None`) a job's escrow call, dropping
+    /// ones too old to wait for.
+    async fn note_in_flight(&self, job: &str, call: Option<InFlight>) {
+        let mut state = self.with_in_flight().await;
+        match call {
+            Some(f) => state.in_flight.insert(job.to_string(), f),
+            None => state.in_flight.remove(job),
+        };
+        let now = now_ms();
+        state
+            .in_flight
+            .retain(|_, f| now.saturating_sub(f.sent_ms) < IN_FLIGHT_MS);
+        let saved = self.wallet_side_file(IN_FLIGHT).map(|file| {
+            serde_json::to_vec_pretty(&state.in_flight)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
+        });
+        if let Some(Err(e)) = saved {
+            tracing::warn!("could not save the escrow calls in flight: {e}");
+        }
+    }
+
+    /// Send a job's escrow instruction, read in state `seen`, unless an
+    /// earlier call for the job may still land: once it does, the second is
+    /// refused on chain and still costs its whole fee.
     async fn escrow_send_once(
         &self,
+        e: &EscrowJob,
         job: &str,
+        seen: JobState,
         signer: &Id,
         accounts: &[Id],
         ix: Instruction,
     ) -> Result<String, String> {
-        let kind = ix.encode()[0];
-        let earlier = self.services.lock().await.in_flight.get(job).cloned();
-        if let Some((k, tx)) = earlier
-            && k == kind
+        let earlier = self.with_in_flight().await.in_flight.get(job).cloned();
+        if let Some(f) = earlier
+            && now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS
         {
+            let Some(tx) = f.tx else {
+                return Err(
+                    "an earlier escrow call for this job had no clear outcome and may still land: check service_jobs in a few minutes before trying again".into(),
+                );
+            };
             let included = matches!(
                 self.node
                     .call(LEZ, "poll_transaction_status", &[Arg::str(&tx)])
                     .await,
                 Ok(Value::Bool(true))
             );
-            // Included while the escrow still takes this call: that one was
-            // refused on chain, so it may go again.
             if !included {
                 return Err(format!(
-                    "the same call, {tx}, hasn't landed yet: check service_jobs in a few minutes before trying again"
+                    "an earlier escrow call for this job, {tx}, hasn't landed yet: check service_jobs in a few minutes before trying again"
                 ));
             }
+            // It landed. The escrow still where it was means it was refused
+            // on chain, so this call may go; otherwise it did its work, and
+            // what was read before it landed is stale.
+            match self.escrow_record(e).await {
+                Ok(Some(r)) if e.holds(&r) && r.state == seen => {}
+                Ok(_) => {
+                    self.note_in_flight(job, None).await;
+                    return Err(format!(
+                        "an earlier escrow call for this job, {tx}, has landed: check service_jobs, then call again if it's still needed"
+                    ));
+                }
+                Err(err) => return Err(format!("can't read the job's escrow: {err}")),
+            }
         }
-        let tx = self.escrow_send(signer, accounts, ix).await?;
-        self.services
-            .lock()
-            .await
-            .in_flight
-            .insert(job.to_string(), (kind, tx.clone()));
-        Ok(tx)
+        let sent = self.escrow_send(signer, accounts, ix).await;
+        let tx = match &sent {
+            Ok(tx) => Some(tx.clone()),
+            Err(SendError::MaybeSent(_)) => None,
+            Err(SendError::NotSent(_)) => return sent.map_err(SendError::message),
+        };
+        self.note_in_flight(
+            job,
+            Some(InFlight {
+                tx,
+                sent_ms: now_ms(),
+            }),
+        )
+        .await;
+        sent.map_err(SendError::message)
     }
 
     /// Send an escrow instruction signed by `signer`, an agent account that
@@ -555,10 +632,10 @@ impl LogosServer {
         signer: &Id,
         accounts: &[Id],
         ix: Instruction,
-    ) -> Result<String, String> {
+    ) -> Result<String, SendError> {
         let w = self.ensure_wallet().await?;
         if let Some(warning) = w.warning() {
-            return Err(format!("refusing to sign: {warning}"));
+            return Err(format!("refusing to sign: {warning}").into());
         }
         if !w.agent_ids.contains(&id_hex(signer)) {
             return Err("the escrow account must be one of the agent accounts".into());
@@ -581,13 +658,13 @@ impl LogosServer {
             .await;
         match reply.map(|v| TransferOutcome::read(&embedded_json(v))) {
             Ok(TransferOutcome::Submitted(tx)) => Ok(tx),
-            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}")),
-            Ok(TransferOutcome::Unknown(detail)) => Err(format!(
+            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}").into()),
+            Ok(TransferOutcome::Unknown(detail)) => Err(SendError::MaybeSent(format!(
                 "outcome unknown: it may have been sent, so check service_jobs before trying again ({detail})"
-            )),
-            Err(e) => Err(format!(
+            ))),
+            Err(e) => Err(SendError::MaybeSent(format!(
                 "outcome unknown: it may have been sent, so check service_jobs before trying again ({e})"
-            )),
+            ))),
         }
     }
 
@@ -1114,7 +1191,9 @@ impl LogosServer {
                     JobState::Open => {
                         let tx = self
                             .escrow_send_once(
+                                e,
                                 &job.job,
+                                JobState::Open,
                                 &e.provider,
                                 &[e.account],
                                 Instruction::Return,
@@ -1214,7 +1293,14 @@ impl LogosServer {
                         deadline: e.deadline,
                     };
                     let tx = self
-                        .escrow_send_once(&job.job, &e.provider, &[e.account], deliver)
+                        .escrow_send_once(
+                            e,
+                            &job.job,
+                            JobState::Open,
+                            &e.provider,
+                            &[e.account],
+                            deliver,
+                        )
                         .await
                         .map_err(|err| format!("the delivery wasn't recorded in escrow: {err}"))?;
                     return Ok(json!({
@@ -1279,9 +1365,9 @@ impl LogosServer {
             None => None,
         }
         .ok_or("this job wasn't paid through escrow")?;
-        match self.escrow_record(&e).await {
+        let seen = match self.escrow_record(&e).await {
             Ok(Some(r)) if e.holds(&r) => match r.state {
-                JobState::Delivered | JobState::Released => {}
+                JobState::Delivered | JobState::Released => r.state,
                 JobState::Open => {
                     return Err(
                         "the delivery isn't on chain yet: service_deliver records it, and it can take minutes to land".into(),
@@ -1297,7 +1383,7 @@ impl LogosServer {
             },
             Ok(_) => return Err("the job's escrow isn't open on the quoted terms".into()),
             Err(err) => return Err(format!("can't read the job's escrow: {err}")),
-        }
+        };
         let claim = Instruction::Claim {
             buyer: e.buyer,
             job_ref: e.job_ref,
@@ -1305,7 +1391,7 @@ impl LogosServer {
         };
         // Paid to the provider itself, so `pay_to` is left out of the accounts.
         let tx = self
-            .escrow_send_once(&job.job, &e.provider, &[e.account], claim)
+            .escrow_send_once(&e, &job.job, seen, &e.provider, &[e.account], claim)
             .await?;
         Ok(json!({
             "job": job.job,
@@ -1349,10 +1435,10 @@ impl LogosServer {
         let e = escrow_job(&job, &buyer)?.ok_or("the quote offered no escrow")?;
         // A returned job is refunded at once, with deadline 0; an open one
         // only after its deadline.
-        let deadline = match self.escrow_record(&e).await {
+        let (seen, deadline) = match self.escrow_record(&e).await {
             Ok(Some(r)) if e.holds(&r) => match r.state {
-                JobState::Open => e.deadline,
-                JobState::Returned => 0,
+                JobState::Open => (r.state, e.deadline),
+                JobState::Returned => (r.state, 0),
                 JobState::Refunded => {
                     // Landed: the note of which account paid has served.
                     self.note_payment(&p.job, None).await;
@@ -1389,7 +1475,7 @@ impl LogosServer {
         };
         // Paid back to the buyer itself, so `refund_to` is left out of the accounts.
         let tx = self
-            .escrow_send_once(&job.job, &e.buyer, &[e.account], refund)
+            .escrow_send_once(&e, &job.job, seen, &e.buyer, &[e.account], refund)
             .await?;
         Ok(json!({
             "job": job.job,

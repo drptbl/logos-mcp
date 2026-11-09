@@ -2318,6 +2318,127 @@ async fn an_escrow_call_still_on_its_way_is_not_sent_again() {
             .len(),
         2
     );
+
+    // Landed while this call waited: read as delivered first, claimed by
+    // the time it landed. Nothing more is sent.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 2),
+    );
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("has landed"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn any_escrow_call_on_its_way_holds_back_the_next() {
+    // A delivery still landing: declining now would race it on chain.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(!is_error(&s.service_deliver(deliver_done()).await.unwrap()));
+    let r = s
+        .service_reject(Parameters(RejectParams {
+            job: JOB.into(),
+            reason: "can't do it".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn an_escrow_call_with_no_clear_outcome_holds_back_a_retry() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    // Neither a hash nor a refusal: it may have gone out.
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        lez("send_generic_public_transaction", r#""garbled""#),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("no clear outcome"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_escrow_call_that_never_landed_stops_holding_back() {
+    // Sent long ago and never included: dropped, so the claim may go.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim2"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-in-flight.json"),
+        json!({ JOB: { "tx": "claim1", "sent_ms": now_ms() - 16 * 60_000 } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -2351,10 +2472,21 @@ async fn a_refund_keeps_the_paying_account_until_it_lands() {
     let s = services_server_in(fake_with(0), dir.path());
     assert!(!is_error(&s.service_refund(job(JOB)).await.unwrap()));
 
-    // After a restart the refund hasn't landed: the account is still known.
-    let s = services_server_in(fake_with(0), dir.path());
+    // After a restart the refund hasn't landed: it isn't sent again, and the
+    // account it goes back to is still known.
+    let fake = fake_with(0);
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let s = services_server_in(fake.clone(), dir.path());
     let r = s.service_refund(job(JOB)).await.unwrap();
-    assert!(!is_error(&r), "{}", text(&r));
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("refund1"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
 
     // Once it landed, the note goes.
     let s = services_server_in(fake_with(4), dir.path());
