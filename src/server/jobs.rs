@@ -97,6 +97,13 @@ fn unreadable_payments(e: &str) -> String {
     )
 }
 
+/// Why no escrow call is sent while `IN_FLIGHT` can't be read.
+fn unreadable_in_flight(e: &str) -> String {
+    format!(
+        "{IN_FLIGHT} next to the wallet can't be read ({e}). It records escrow calls that may still land, so no other is sent or written over it: fix or move it, then restart the server"
+    )
+}
+
 /// Why an escrow on the quoted terms no longer pays for its job.
 fn unpaid_escrow(state: JobState) -> String {
     match state {
@@ -227,6 +234,8 @@ pub(super) struct Services {
     /// dropped. Kept in `IN_FLIGHT` too.
     in_flight: BTreeMap<String, InFlight>,
     in_flight_loaded: bool,
+    /// Why `IN_FLIGHT` couldn't be read, as for `payments_unreadable`.
+    in_flight_unreadable: Option<String>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
 }
@@ -550,16 +559,19 @@ impl LogosServer {
 
     async fn with_in_flight(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
-        if !state.in_flight_loaded {
-            let saved: BTreeMap<String, InFlight> = self
-                .wallet_side_file(IN_FLIGHT)
-                .and_then(|f| std::fs::read(f).ok())
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-            for (job, f) in saved {
-                state.in_flight.entry(job).or_insert(f);
+        if !state.in_flight_loaded && state.in_flight_unreadable.is_none() {
+            match read_side_map::<InFlight>(self.wallet_side_file(IN_FLIGHT)) {
+                Ok(saved) => {
+                    for (job, f) in saved {
+                        state.in_flight.entry(job).or_insert(f);
+                    }
+                    state.in_flight_loaded = true;
+                }
+                Err(e) => {
+                    tracing::warn!("can't read {IN_FLIGHT}, so it won't be written: {e}");
+                    state.in_flight_unreadable = Some(e);
+                }
             }
-            state.in_flight_loaded = true;
         }
         state
     }
@@ -568,6 +580,9 @@ impl LogosServer {
     /// ones too old to wait for.
     async fn note_in_flight(&self, job: &str, call: Option<InFlight>) {
         let mut state = self.with_in_flight().await;
+        if state.in_flight_unreadable.is_some() {
+            return;
+        }
         match call {
             Some(f) => state.in_flight.insert(job.to_string(), f),
             None => state.in_flight.remove(job),
@@ -598,7 +613,13 @@ impl LogosServer {
         accounts: &[Id],
         ix: Instruction,
     ) -> Result<String, String> {
-        let earlier = self.with_in_flight().await.in_flight.get(job).cloned();
+        let earlier = {
+            let state = self.with_in_flight().await;
+            if let Some(e) = &state.in_flight_unreadable {
+                return Err(unreadable_in_flight(e));
+            }
+            state.in_flight.get(job).cloned()
+        };
         if let Some(f) = earlier
             && now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS
         {

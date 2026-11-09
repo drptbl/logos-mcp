@@ -2883,6 +2883,37 @@ async fn a_refund_says_when_the_payment_file_cant_be_read() {
 }
 
 #[tokio::test]
+async fn no_escrow_call_is_sent_while_the_in_flight_file_cant_be_read() {
+    // It may record a call still landing: another would be refused on chain
+    // at the cost of its fee, and saving over it would forget the first.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("service-in-flight.json");
+    std::fs::write(&file, "{").unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-in-flight.json"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "{");
+}
+
+#[tokio::test]
 async fn a_refund_the_chat_names_goes_ahead_while_the_payment_file_cant_be_read() {
     // The `paid` message names the account, so the file isn't needed.
     let past = 1_000_000;
