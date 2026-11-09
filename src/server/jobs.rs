@@ -775,19 +775,32 @@ impl LogosServer {
 
     /// Remember (`Some`) or forget (`None`) a payment the provider hasn't been told about.
     async fn note_payment(&self, job: &str, payment: Option<Payment>) {
+        if let Err(e) = self.save_payment(job, payment).await {
+            tracing::warn!("could not save the service payments: {e}");
+        }
+    }
+
+    /// `note_payment`, for a caller that must not go on unless it is saved.
+    /// Memory keeps what the file holds: a failed save changes neither.
+    async fn save_payment(&self, job: &str, payment: Option<Payment>) -> Result<(), String> {
+        let file = self
+            .wallet_side_file(PAYMENTS)
+            .ok_or("no wallet is configured")?;
         let mut state = self.with_payments().await;
-        match payment {
+        let before = match payment {
             Some(tx) => state.submitted.insert(job.to_string(), tx),
             None => state.submitted.remove(job),
         };
-        let saved = self.wallet_side_file(PAYMENTS).map(|file| {
-            serde_json::to_vec_pretty(&state.submitted)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
-        });
-        if let Some(Err(e)) = saved {
-            tracing::warn!("could not save the service payments: {e}");
+        let saved = serde_json::to_vec_pretty(&state.submitted)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()));
+        if saved.is_err() {
+            match before {
+                Some(tx) => state.submitted.insert(job.to_string(), tx),
+                None => state.submitted.remove(job),
+            };
         }
+        saved
     }
 
     /// Which accounts were made for which job: account id -> `{job, service}`.
@@ -1727,16 +1740,23 @@ impl LogosServer {
             None => (q.pay_to.clone(), None),
         };
         // An escrow payment is noted before it is asked for, so a restart
-        // can't lose which account it goes from.
-        if escrow.is_some() {
-            self.note_payment(
-                &p.job,
-                Some(Payment::Escrow {
-                    tx_hash: None,
-                    escrow_buyer: p.from.clone(),
-                }),
-            )
-            .await;
+        // can't lose which account it goes from: without that, no open. An
+        // earlier note, from an open with no clear outcome, outlives this try.
+        let earlier = self.with_payments().await.submitted.get(&p.job).cloned();
+        if escrow.is_some()
+            && let Err(e) = self
+                .save_payment(
+                    &p.job,
+                    Some(Payment::Escrow {
+                        tx_hash: None,
+                        escrow_buyer: p.from.clone(),
+                    }),
+                )
+                .await
+        {
+            return Err(format!(
+                "can't save which account pays, so a restart could lose the refund: not opening the escrow ({e})"
+            ));
         }
         let sent = tool_json(
             self.wallet_transfer(
@@ -1759,8 +1779,8 @@ impl LogosServer {
                         self.note_payment(&p.job, Some(Payment::Transfer(None)))
                             .await;
                     }
-                    // Nothing went out.
-                    (Some(_), false) => self.note_payment(&p.job, None).await,
+                    // Nothing went out this time.
+                    (Some(_), false) => self.note_payment(&p.job, earlier).await,
                     _ => {}
                 }
                 return Err(e);
@@ -1891,6 +1911,18 @@ impl LogosServer {
             Err(e) => return fail(e),
         };
         let now = now_ms();
+        // Escrows this server opened, including ones whose `paid` message
+        // never went out.
+        let noted: BTreeMap<String, String> = self
+            .with_payments()
+            .await
+            .submitted
+            .iter()
+            .filter_map(|(job, p)| match p {
+                Payment::Escrow { escrow_buyer, .. } => Some((job.clone(), escrow_buyer.clone())),
+                Payment::Transfer(_) => None,
+            })
+            .collect();
         let mut listed = Vec::with_capacity(jobs.len());
         for Found {
             convo,
@@ -1899,7 +1931,14 @@ impl LogosServer {
         } in jobs
         {
             // An escrow job's record says what the chat can't: paid, delivered, claimed.
-            let escrow = match job.escrow_buyer.as_deref().map(|b| escrow_job(&job, b)) {
+            let untold = job.role == Role::Buyer
+                && job.escrow_buyer.is_none()
+                && noted.contains_key(&job.job);
+            let buyer = match job.role {
+                Role::Buyer => job.escrow_buyer.as_ref().or(noted.get(&job.job)),
+                Role::Provider => job.escrow_buyer.as_ref(),
+            };
+            let escrow = match buyer.map(|b| escrow_job(&job, b)) {
                 Some(Ok(Some(e))) => Some((self.escrow_record(&e).await, e)),
                 _ => None,
             };
@@ -1961,6 +2000,16 @@ impl LogosServer {
                     )
                 }
                 _ if !can_send => None,
+                (Role::Buyer, State::Paid, Some(JobState::Open)) if untold => Some(
+                    if escrow
+                        .as_ref()
+                        .is_some_and(|(_, e)| too_late_for(e.deadline))
+                    {
+                        "the escrow is open, but too late for the provider to deliver: wait for the deadline to pass, then take the money back with service_refund"
+                    } else {
+                        "the escrow is open, but the provider wasn't told: call service_pay again"
+                    },
+                ),
                 _ => next_step(job.role, state),
             };
             listed.push(json!({

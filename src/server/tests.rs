@@ -918,6 +918,45 @@ async fn an_approved_escrow_open_past_its_time_is_not_sent() {
 }
 
 #[tokio::test]
+async fn an_escrow_naming_the_buyer_as_provider_is_not_opened() {
+    // The program refuses it, at the cost of the whole fee.
+    let mut replies = opened_by_server();
+    replies.push(lez("get_balance", r#""100000000""#));
+    replies.push(lez(
+        "send_generic_public_transaction",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let buyer: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let job = crate::escrow::job_account(&buyer, &[7; 32]);
+    let mut own = escrow_payment(hex(&job));
+    own.escrow.as_mut().unwrap().provider = AGENT_FROM.into();
+    // Refused before the user is asked to approve it, too.
+    let err = s
+        .send_checked(&CancellationToken::new(), &own, SendMode::CheckOnly)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
+    let err = s
+        .send_checked(&CancellationToken::new(), &own, SendMode::Direct)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains(&"send_generic_public_transaction".to_string())),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
     let mut replies = opened_by_server();
     replies.push(lez(
