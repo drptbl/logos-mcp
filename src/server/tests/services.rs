@@ -2950,3 +2950,31 @@ async fn a_refund_the_chat_names_goes_ahead_while_the_payment_file_cant_be_read(
         1
     );
 }
+
+#[tokio::test]
+async fn a_job_accounts_file_that_cant_be_read_is_never_overwritten() {
+    // It says which receive accounts belong to which job: saving an almost
+    // empty map over it would lose that for every earlier job.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("job-accounts.json");
+    std::fs::write(&file, "{").unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    s.service_offer(offer()).await.unwrap();
+    // The quote itself still goes out: the grouping is a convenience.
+    let r = s.service_quote(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "{");
+    let accounts = body(&s.wallet_accounts().await.unwrap());
+    assert!(
+        accounts["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("job-accounts.json"),
+        "{accounts}"
+    );
+}
