@@ -55,8 +55,8 @@ enum Payment {
     },
 }
 
-/// The escrow states in which the job is paid for: the money is locked, or
-/// went to the provider.
+/// The escrow states in which the job is paid for: the money is locked for
+/// the provider, or went to it.
 fn paid_state(state: JobState) -> bool {
     matches!(
         state,
@@ -79,10 +79,13 @@ struct EscrowJob {
 }
 
 impl EscrowJob {
-    /// The record holds this job on exactly these terms.
+    /// The record holds this job on exactly these terms, paying out to the
+    /// provider's account and back to the buyer's, as `service_pay` opens it.
     fn holds(&self, r: &Record) -> bool {
         r.buyer == self.buyer
             && r.provider == self.provider
+            && r.pay_to == self.provider
+            && r.refund_to == self.buyer
             && r.amount == self.amount
             && r.deadline == self.deadline
     }
@@ -1012,7 +1015,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Decline a job. Before a quote it refuses the request; after one it tells the buyer you can't do it, and sends an escrow payment straight back to the buyer. Once your delivery is recorded in escrow it can't be declined."
+        description = "Decline a job. Before a quote it refuses the request; after one it tells the buyer you can't do it, and returns an escrow job so the buyer can take the money back at once. Once your delivery is recorded in escrow it can't be declined."
     )]
     pub(super) async fn service_reject(
         &self,
@@ -1036,8 +1039,8 @@ impl LogosServer {
             State::Quoted | State::Paid => Body::Failed { reason },
             done => return Err(format!("job {} is already {done:?}", p.job).to_lowercase()),
         };
-        // Money the buyer locked goes straight back, so it doesn't wait for
-        // the deadline. A recorded delivery is the provider's to claim.
+        // Return the job, so the buyer can refund at once instead of waiting
+        // for the deadline. A recorded delivery is the provider's to claim.
         let escrow = match job.escrow_buyer.as_deref() {
             Some(buyer) => escrow_job(&job, buyer)?,
             None => None,
@@ -1047,35 +1050,45 @@ impl LogosServer {
             self.needs(&["wallet"])?;
             match self.escrow_record(e).await {
                 Ok(Some(r)) if e.holds(&r) => match r.state {
+                    // Past the deadline the buyer can refund anyway, and a
+                    // refund landing first would make the return fail.
+                    JobState::Open if now_ms() >= e.deadline => {}
                     JobState::Open => {
-                        let back = Instruction::Return {
-                            job_ref: e.job_ref,
-                            amount: e.amount,
-                        };
                         let tx = self
-                            .escrow_send(&e.provider, &[e.account, e.buyer], back)
+                            .escrow_send(&e.provider, &[e.account], Instruction::Return)
                             .await
-                            .map_err(|err| format!("the escrow payment wasn't returned: {err}"))?;
+                            .map_err(|err| format!("the job wasn't returned in escrow: {err}"))?;
                         returned = Some(tx);
                     }
-                    JobState::Delivered | JobState::Claimed | JobState::Released => {
+                    JobState::Delivered | JobState::Claimed => {
                         return Err(
                             "your delivery is recorded in escrow, so the job can't be declined: send the result with service_deliver".into(),
                         );
                     }
-                    JobState::Refunded => {}
+                    JobState::Released => {
+                        return Err(
+                            "the buyer released the payment to you, so the job can't be declined: collect it with service_claim".into(),
+                        );
+                    }
+                    JobState::Refunded | JobState::Returned => {}
                 },
                 Ok(_) => {}
                 Err(err) => return Err(format!("can't read the job's escrow: {err}")),
             }
         }
         self.send_message(&convo, &protocol::Message::new(&job.job, body))
-            .await?;
+            .await
+            .map_err(|err| match &returned {
+                Some(tx) => format!(
+                    "the job was returned in escrow ({tx}), but the buyer wasn't told: call service_reject again ({err})"
+                ),
+                None => err,
+            })?;
         Ok(json!({
             "job": job.job,
             "declined": true,
             "escrow_return_tx": returned,
-            "note": returned.as_ref().map(|_| "the escrow payment goes back to the buyer once the return lands"),
+            "note": returned.as_ref().map(|_| "once the return lands, the buyer can take the money back with service_refund"),
         }))
     }
 
@@ -1148,6 +1161,7 @@ impl LogosServer {
                     }));
                 }
                 JobState::Delivered | JobState::Claimed | JobState::Released => {
+                    // A released job may have no result recorded: just send it.
                     if record.result.is_some_and(|r| r != hash) {
                         return Err(
                             "the escrow recorded a different result: send the same output as the first time".into(),
@@ -1156,6 +1170,9 @@ impl LogosServer {
                 }
                 JobState::Refunded => {
                     return Err("the buyer was refunded, so this job is over".into());
+                }
+                JobState::Returned => {
+                    return Err("you returned this job, so it is over".into());
                 }
             }
         } else if !self.paid_on_chain(&job).await {
@@ -1175,7 +1192,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Collect an escrow job's payment into your escrow account, once your delivery has landed on chain."
+        description = "Collect an escrow job's payment into your escrow account, once your delivery has landed on chain or the buyer released it."
     )]
     pub(super) async fn service_claim(
         &self,
@@ -1201,18 +1218,19 @@ impl LogosServer {
         .ok_or("this job wasn't paid through escrow")?;
         match self.escrow_record(&e).await {
             Ok(Some(r)) if e.holds(&r) => match r.state {
-                JobState::Delivered => {}
+                JobState::Delivered | JobState::Released => {}
                 JobState::Open => {
                     return Err(
                         "the delivery isn't on chain yet: service_deliver records it, and it can take minutes to land".into(),
                     );
                 }
-                JobState::Claimed | JobState::Released => {
+                JobState::Claimed => {
                     return Ok(
                         json!({ "job": job.job, "claimed": true, "note": "already paid out" }),
                     );
                 }
                 JobState::Refunded => return Err("the buyer was refunded".into()),
+                JobState::Returned => return Err("you returned this job".into()),
             },
             Ok(_) => return Err("the job's escrow isn't open on the quoted terms".into()),
             Err(err) => return Err(format!("can't read the job's escrow: {err}")),
@@ -1222,6 +1240,7 @@ impl LogosServer {
             job_ref: e.job_ref,
             amount: e.amount,
         };
+        // Paid to the provider itself, so `pay_to` is left out of the accounts.
         let tx = self.escrow_send(&e.provider, &[e.account], claim).await?;
         Ok(json!({
             "job": job.job,
@@ -1232,7 +1251,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Take back an escrow payment the provider didn't deliver for: allowed a few minutes after the escrow deadline, and only while nothing is delivered."
+        description = "Take back an escrow payment: at once when the provider declined the job, otherwise a few minutes after the escrow deadline, and only while nothing is delivered."
     )]
     pub(super) async fn service_refund(
         &self,
@@ -1263,25 +1282,33 @@ impl LogosServer {
             .or(noted)
             .ok_or("this job wasn't paid through escrow, so there's nothing to refund")?;
         let e = escrow_job(&job, &buyer)?.ok_or("the quote offered no escrow")?;
-        match self.escrow_record(&e).await {
+        // A returned job is refunded at once, with deadline 0; an open one
+        // only after its deadline.
+        let deadline = match self.escrow_record(&e).await {
             Ok(Some(r)) if e.holds(&r) => match r.state {
-                JobState::Open => {}
+                JobState::Open => e.deadline,
+                JobState::Returned => 0,
                 JobState::Refunded => {
                     return Ok(
                         json!({ "job": job.job, "refunded": true, "note": "already refunded" }),
                     );
                 }
-                JobState::Delivered | JobState::Claimed | JobState::Released => {
+                JobState::Delivered | JobState::Claimed => {
                     return Err(
                         "the provider delivered, so the escrow pays them: there's no refund".into(),
+                    );
+                }
+                JobState::Released => {
+                    return Err(
+                        "you released the payment to the provider: there's no refund".into(),
                     );
                 }
             },
             Ok(_) => return Err("the job's escrow isn't open on the quoted terms".into()),
             Err(err) => return Err(format!("can't read the job's escrow: {err}")),
-        }
+        };
         // Refused on chain before the deadline, at the cost of the whole fee.
-        if now_ms() < e.deadline.saturating_add(DEADLINE_MARGIN_MS) {
+        if deadline != 0 && now_ms() < deadline.saturating_add(DEADLINE_MARGIN_MS) {
             return Err(format!(
                 "not yet: the escrow deadline is {} ms since the epoch, and a refund waits {} minutes past it for the chain's clock",
                 e.deadline,
@@ -1291,8 +1318,9 @@ impl LogosServer {
         let refund = Instruction::Refund {
             job_ref: e.job_ref,
             amount: e.amount,
-            deadline: e.deadline,
+            deadline,
         };
+        // Paid back to the buyer itself, so `refund_to` is left out of the accounts.
         let tx = self.escrow_send(&e.buyer, &[e.account], refund).await?;
         self.note_payment(&p.job, None).await;
         Ok(json!({
@@ -1767,6 +1795,12 @@ impl LogosServer {
                 }
                 (Role::Provider, State::Delivered, Some(JobState::Open)) => {
                     Some("wait for the delivery to land on chain, then service_claim")
+                }
+                (Role::Provider, _, Some(JobState::Released)) => {
+                    Some("the buyer released the payment: collect it with service_claim")
+                }
+                (Role::Buyer, _, Some(JobState::Returned)) => {
+                    Some("the provider declined the job: take the money back with service_refund")
                 }
                 (Role::Buyer, State::Paid | State::Failed, Some(JobState::Open))
                     if deadline_passed =>

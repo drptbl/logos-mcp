@@ -64,16 +64,20 @@ Since 1.1, a quote may carry `escrow`, which uses [logos-escrow](https://github.
 
 | Field | Value |
 | --- | --- |
-| `program` | the escrow program id, base58: `9jbUSu3t3rdZbmekKJ73DCwaFULWUWhPVVUbbgzdUgNL` |
-| `provider` | the provider's public account the escrow pays |
+| `program` | the escrow program id, base58: `HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d` |
+| `provider` | the provider's public account, which the escrow also pays out to |
 | `deadline` | milliseconds since the Unix epoch: exactly `expires_at` plus `deliver_within_s`, which is at most a day. Refuse other values |
 
-1. The job reference is the quote hash, the same value `paid` names. The buyer opens the escrow from one of its public accounts, locking exactly `price_lepta` for `provider` until `deadline`. Once the escrow holds it, the buyer sends `paid` with `escrow_buyer` set to that account, so the provider can find the job.
+1. The job reference is the quote hash, the same value `paid` names. The buyer opens the escrow from one of its public accounts, locking exactly `price_lepta` for `provider` until `deadline`. It names `provider` as `pay_to` and the paying account as `refund_to`. Once the escrow holds it, the buyer sends `paid` with `escrow_buyer` set to that account, so the provider can find the job.
 2. Pay only into a program you know. A quote naming another program could keep the money.
-3. The provider counts the job as paid once the escrow holds it on exactly the quoted terms: buyer, provider, price and deadline.
-4. To deliver, the provider records the SHA-256 of the `result` message text in the escrow before `deadline`, then sends that message. Once the delivery lands it can claim the price.
-5. A provider that can't do a paid job sends the price back with the escrow's `Return`, then sends `failed`, so the buyer doesn't wait for the deadline.
-6. When nothing is delivered by `deadline`, the buyer takes the price back. After a delivery it can't: there are no disputes.
+3. The provider counts the job as paid once the escrow holds it on exactly these terms: `escrow_buyer` as buyer and `refund_to`, the quote's `provider` as provider and `pay_to`, and the quoted price and deadline.
+4. To deliver, the provider records the SHA-256 of the `result` message text in the escrow before `deadline`, then sends that message. Once the delivery lands it can claim the price. It can claim without delivering when the buyer released the job.
+5. A provider that can't do a paid job sends the escrow's `Return`, then `failed`. The buyer can then refund at once instead of waiting for the deadline.
+6. When nothing is delivered by `deadline`, the buyer takes the price back. After a delivery, or once it released the job, it can't: there are no disputes.
+
+Money only moves when the side being paid asks for it: the provider with `Claim`, the buyer with `Refund`.
+
+The program changed in November 2026 to one with payout addresses and pull-only payouts. Agents still on `9jbUSu3t3rdZbmekKJ73DCwaFULWUWhPVVUbbgzdUgNL` refuse quotes that name the new one, and the other way round, so they can't trade through escrow. A job opened on the old program finishes there: the `service_*` tools no longer act on it, so claim or refund it with logos-escrow's CLI.
 
 A buyer that doesn't know 1.1 ignores `escrow` and pays `pay_to` as before, and the provider honours that too.
 

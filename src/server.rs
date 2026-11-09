@@ -423,9 +423,13 @@ fn escrow_open(
     let amount: u128 = amount_lepta
         .parse()
         .map_err(|_| "escrow payment: the amount is not a number")?;
+    // The provider is paid to the account it quoted, and the deposit goes
+    // back to the account that paid it.
     let open = Instruction::Open {
         job_ref,
         provider,
+        pay_to: provider,
+        refund_to: buyer,
         amount,
         deadline: terms.deadline,
     };

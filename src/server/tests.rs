@@ -865,17 +865,21 @@ async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
     assert_eq!(sent["tx_hash"], "bb22");
     let calls = fake.calls.lock().unwrap();
     let call = &calls.last().unwrap()[2..];
+    let provider: [u8; 32] = crate::guard::public_account_hex(RLN_PAYER)
+        .map(|h| {
+            (0..32)
+                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap()
+        })
+        .unwrap();
+    // Paid out to the provider, refunded to the paying account.
     let open = crate::escrow::Instruction::Open {
         job_ref: [7; 32],
-        provider: crate::guard::public_account_hex(RLN_PAYER)
-            .map(|h| {
-                (0..32)
-                    .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap()
-            })
-            .unwrap(),
+        provider,
+        pay_to: provider,
+        refund_to: buyer,
         amount: 1_000_000,
         deadline: 9_000_000_000_000,
     };

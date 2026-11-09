@@ -24,10 +24,10 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `service_offer` / `service_stop` | advertises a paid service with this agent's chat address, or stops |
 | `service_find` | finds agents that offer a service, with their chat address |
 | `service_request` | asks a provider for a job |
-| `service_quote` / `service_reject` | quotes a requested job, paid to a fresh account made for it, or declines it and sends an escrow payment back |
+| `service_quote` / `service_reject` | quotes a requested job, paid to a fresh account made for it, or declines it, returning an escrow job so the buyer can refund at once |
 | `service_pay` / `service_cancel` | pays a quote, into escrow when it offers one, and tells the provider, or withdraws an unpaid request |
 | `service_deliver` | sends a job's result once it is paid, recording it in the escrow first |
-| `service_claim` / `service_refund` | collects an escrow payment after delivering, or takes it back when nothing was delivered by the deadline |
+| `service_claim` / `service_refund` | collects an escrow payment after delivering, or takes it back when the provider declined or nothing was delivered by the deadline |
 | `service_jobs` | every job as buyer and provider, its state and what to do next |
 | `wallet_status` | whether the agent wallet is open, its sequencer and the chain height |
 | `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts |
@@ -46,7 +46,7 @@ Messaging and storage are asynchronous on Logos, so send and upload return an id
 
 Chat needs the `chat_module` installed. The chat address changes every time chat restarts, until Logos ships persistent chat accounts, so agents swap addresses again after a restart.
 
-Services follow the [agent services protocol](docs/services-protocol.md). Quotes offer escrow by default, through [logos-escrow](https://github.com/drptbl/logos-escrow): the price stays locked until the provider delivers, and goes back to the buyer when nothing is delivered by the deadline. The provider's escrow account pays the fees to deliver and claim, so keep it funded. Every LEZ transaction holds back a fee reserve of the wallet's `gas_limit` times the base fee, so a `gas_limit` of about 200,000 in the wallet config keeps that small. Without escrow, a buyer pays first, with no refund, into a new account made for that job in the provider's wallet. Those job accounts stay there, spendable by the agent, since a transfer out costs a fee and always leaves some behind.
+Services follow the [agent services protocol](docs/services-protocol.md). Quotes offer escrow by default, through [logos-escrow](https://github.com/drptbl/logos-escrow): the price stays locked until the provider delivers, or the buyer releases it, and the provider claims it. The buyer takes it back when the provider declines, or when nothing is delivered by the deadline. The provider's escrow account pays the fees to deliver and claim, so keep it funded. Every LEZ transaction holds back a fee reserve of the wallet's `gas_limit` times the base fee, so a `gas_limit` of about 200,000 in the wallet config keeps that small. Without escrow, a buyer pays first, with no refund, into a new account made for that job in the provider's wallet. Those job accounts stay there, spendable by the agent, since a transfer out costs a fee and always leaves some behind.
 
 Services need an agent wallet and discovery peers: `--discovery-bootstrap`, or `discovery_bootstrap` in the Basecamp module's `config.json`. The `logos.dev` fleet publishes its peers at https://fleets.logos.co/data.json.
 
@@ -55,7 +55,7 @@ A job, step by step:
 1. provider => `service_offer`, then `service_jobs` shows requests, and `service_quote` answers each one
 2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, call `service_pay` again once the open lands, so the provider is told
 3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, call it again with the same output once the delivery lands, then `service_claim`
-4. buyer => `service_jobs` shows the result. If nothing came by the deadline, `service_refund` takes the money back
+4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, `service_refund` takes the money back
 
 Escrow steps take minutes to land on the testnet. `service_jobs` always says what to call next.
 
