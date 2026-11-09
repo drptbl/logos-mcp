@@ -427,6 +427,10 @@ fn escrow_open(
         .ok()
         .and_then(|h| id(&h))
         .ok_or("escrow payment: the provider account is not a public account")?;
+    // The program refuses it, and a refused call still costs its whole fee.
+    if provider == buyer {
+        return Err("escrow payment: the quote names the paying account as its provider".into());
+    }
     let amount: u128 = amount_lepta
         .parse()
         .map_err(|_| "escrow payment: the amount is not a number")?;
