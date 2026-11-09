@@ -77,6 +77,26 @@ struct InFlight {
     sent_ms: u64,
 }
 
+/// A side file's map: empty when there is no file yet, refused when there is
+/// one that can't be read.
+fn read_side_map<T: serde::de::DeserializeOwned>(
+    file: Option<PathBuf>,
+) -> Result<BTreeMap<String, T>, String> {
+    match file.map(std::fs::read) {
+        None => Ok(BTreeMap::new()),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Some(Err(e)) => Err(e.to_string()),
+        Some(Ok(bytes)) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+    }
+}
+
+/// Why nothing is paid or cancelled while `PAYMENTS` can't be read.
+fn unreadable_payments(e: &str) -> String {
+    format!(
+        "{PAYMENTS} next to the wallet can't be read ({e}). It records payments that may already have gone out, so nothing is paid, cancelled or written over it: fix or move it, then restart the server"
+    )
+}
+
 /// Why an escrow on the quoted terms no longer pays for its job.
 fn unpaid_escrow(state: JobState) -> String {
     match state {
@@ -199,8 +219,9 @@ pub(super) struct Services {
     /// so it is kept in `PAYMENTS` too and survives a restart.
     submitted: BTreeMap<String, Payment>,
     payments_loaded: bool,
-    /// Why `PAYMENTS` couldn't be read: until it can, it is read again on
-    /// each use and never written over.
+    /// Why `PAYMENTS` couldn't be read. It holds until a restart reads the
+    /// file afresh, so no call acts on half of what it read, and the file is
+    /// never written over meanwhile.
     payments_unreadable: Option<String>,
     /// The last escrow call sent for each job, until it lands or counts as
     /// dropped. Kept in `IN_FLIGHT` too.
@@ -762,21 +783,13 @@ impl LogosServer {
     /// The service state, with the payments a previous run left loaded.
     async fn with_payments(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
-        if !state.payments_loaded {
-            let read = match self.wallet_side_file(PAYMENTS).map(std::fs::read) {
-                None => Ok(BTreeMap::new()),
-                Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-                Some(Err(e)) => Err(e.to_string()),
-                Some(Ok(bytes)) => serde_json::from_slice::<BTreeMap<String, Payment>>(&bytes)
-                    .map_err(|e| e.to_string()),
-            };
-            match read {
+        if !state.payments_loaded && state.payments_unreadable.is_none() {
+            match read_side_map::<Payment>(self.wallet_side_file(PAYMENTS)) {
                 Ok(saved) => {
                     for (job, tx) in saved {
                         state.submitted.entry(job).or_insert(tx);
                     }
                     state.payments_loaded = true;
-                    state.payments_unreadable = None;
                 }
                 Err(e) => {
                     tracing::warn!("can't read {PAYMENTS}, so it won't be written: {e}");
@@ -802,9 +815,7 @@ impl LogosServer {
             .ok_or("no wallet is configured")?;
         let mut state = self.with_payments().await;
         if let Some(e) = &state.payments_unreadable {
-            return Err(format!(
-                "{PAYMENTS} next to the wallet can't be read ({e}), and it may hold which accounts paid for which escrows: fix or move it, nothing is written over it until then"
-            ));
+            return Err(unreadable_payments(e));
         }
         let before = match payment {
             Some(tx) => state.submitted.insert(job.to_string(), tx),
@@ -1459,11 +1470,17 @@ impl LogosServer {
             Some(Payment::Escrow { escrow_buyer, .. }) => Some(escrow_buyer.clone()),
             _ => None,
         };
-        let buyer = job
-            .escrow_buyer
-            .clone()
-            .or(noted)
-            .ok_or("this job wasn't paid through escrow, so there's nothing to refund")?;
+        let buyer = match job.escrow_buyer.clone().or(noted) {
+            Some(buyer) => buyer,
+            // The file may be the only record of an escrow whose `paid`
+            // message never went out.
+            None => {
+                self.payments_readable().await?;
+                return Err(
+                    "this job wasn't paid through escrow, so there's nothing to refund".into(),
+                );
+            }
+        };
         let e = escrow_job(&job, &buyer)?.ok_or("the quote offered no escrow")?;
         // A returned job is refunded at once, with deadline 0; an open one
         // only after its deadline.
@@ -1535,7 +1552,16 @@ impl LogosServer {
         }
     }
 
+    /// Refused while `PAYMENTS` can't be read.
+    async fn payments_readable(&self) -> Result<(), String> {
+        match &self.with_payments().await.payments_unreadable {
+            Some(e) => Err(unreadable_payments(e)),
+            None => Ok(()),
+        }
+    }
+
     async fn pay(&self, ct: &CancellationToken, p: &PayParams) -> Result<Value, String> {
+        self.payments_readable().await?;
         let (convo, job) = self.find_job(&p.job, Role::Buyer).await?;
         if job.state != State::Quoted {
             return Err(
@@ -1856,6 +1882,7 @@ impl LogosServer {
     }
 
     async fn cancel(&self, p: CancelParams) -> Result<Value, String> {
+        self.payments_readable().await?;
         let (convo, job) = self.find_job(&p.job, Role::Buyer).await?;
         // Not while a payment waits, went out untold, or landed.
         let busy = {
@@ -1932,16 +1959,20 @@ impl LogosServer {
         let now = now_ms();
         // Escrows this server opened, including ones whose `paid` message
         // never went out.
-        let noted: BTreeMap<String, String> = self
-            .with_payments()
-            .await
-            .submitted
-            .iter()
-            .filter_map(|(job, p)| match p {
-                Payment::Escrow { escrow_buyer, .. } => Some((job.clone(), escrow_buyer.clone())),
-                Payment::Transfer(_) => None,
-            })
-            .collect();
+        let (noted, unreadable): (BTreeMap<String, String>, _) = {
+            let state = self.with_payments().await;
+            let noted = state
+                .submitted
+                .iter()
+                .filter_map(|(job, p)| match p {
+                    Payment::Escrow { escrow_buyer, .. } => {
+                        Some((job.clone(), escrow_buyer.clone()))
+                    }
+                    Payment::Transfer(_) => None,
+                })
+                .collect();
+            (noted, state.payments_unreadable.clone())
+        };
         let mut listed = Vec::with_capacity(jobs.len());
         for Found {
             convo,
@@ -2056,16 +2087,12 @@ impl LogosServer {
             .iter()
             .map(|(id, o)| json!({ "service_id": id, "price_lepta": o.price_lepta, "chat_address": o.advertised_to }))
             .collect();
-        let unreadable = self
-            .with_payments()
-            .await
-            .payments_unreadable
-            .clone()
-            .map(|e| {
-                format!(
-                    "{PAYMENTS} next to the wallet can't be read ({e}): escrow payments it records are missing here, and no escrow is opened until it is fixed or moved"
-                )
-            });
+        let unreadable = unreadable.map(|e| {
+            format!(
+                "{} Jobs it records may be missing here.",
+                unreadable_payments(&e)
+            )
+        });
         let warning = [
             refreshed.map(|e| format!("could not advertise the offers again: {e}")),
             unreadable,
