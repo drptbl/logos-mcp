@@ -1708,23 +1708,12 @@ impl LogosServer {
                 APPROVAL_EXPIRES.as_secs() / 60
             ));
         }
-        if escrow.as_ref().is_some_and(|e| too_late_for(e.deadline)) {
-            return Err(
-                "the escrow deadline is too close for the provider to deliver in time: ask for a new quote with service_request".into(),
-            );
-        }
         let network = self.network().await;
         if q.network != network {
             return Err(format!(
                 "the quote is for {}, but this node is on {network}",
                 q.network
             ));
-        }
-        // A refused open still costs its whole fee: don't ask the user to
-        // approve one that can't pay. Sending checks again.
-        if escrow.is_some() {
-            self.ensure_wallet().await?;
-            self.check_open_funds(&p.from, price).await?;
         }
         let (to, terms) = match &escrow {
             Some(e) => (

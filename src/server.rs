@@ -1697,6 +1697,20 @@ impl LogosServer {
         if from == to {
             return Err("sender and recipient are the same account".into());
         }
+        // An escrow open the chain would refuse still costs its whole fee.
+        // Checked here, after any approval wait and before the last looks.
+        if let Some(terms) = &p.escrow {
+            if jobs::too_late_for(terms.deadline) {
+                return Err(
+                    "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
+                );
+            }
+            let amount = p
+                .amount_lepta
+                .parse()
+                .map_err(|_| "escrow payment: the amount is not a number")?;
+            self.check_open_funds(&p.from, amount).await?;
+        }
         if ct.is_cancelled() {
             return Err("transfer cancelled before sending: nothing was sent".into());
         }
@@ -1719,19 +1733,7 @@ impl LogosServer {
                 self.node.call(LEZ, "transfer_public", &args).await
             }
             Some(terms) => {
-                // An approval can take a while: an open landing after the
-                // deadline is refused and still costs its fee.
-                if jobs::too_late_for(terms.deadline) {
-                    return Err(
-                        "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
-                    );
-                }
                 let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
-                let amount = p
-                    .amount_lepta
-                    .parse()
-                    .map_err(|_| "escrow payment: the amount is not a number")?;
-                self.check_open_funds(&p.from, amount).await?;
                 self.node
                     .call(LEZ, "send_generic_public_transaction", &open)
                     .await
