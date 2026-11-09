@@ -855,16 +855,16 @@ impl LogosServer {
     }
 
     /// Which accounts were made for which job: account id -> `{job, service}`.
-    pub(super) fn job_accounts(&self) -> BTreeMap<String, Value> {
-        self.job_accounts_file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// Refused when the file is there but can't be read.
+    pub(super) fn job_accounts(&self) -> Result<BTreeMap<String, Value>, String> {
+        read_side_map(self.job_accounts_file())
+            .map_err(|e| format!("{JOB_ACCOUNTS} next to the wallet can't be read ({e})"))
     }
 
+    /// Never writes over a file it couldn't read.
     fn record_job_account(&self, account_id: &str, job: &str, service: &str) -> Result<(), String> {
         let file = self.job_accounts_file().ok_or("no wallet configured")?;
-        let mut accounts = self.job_accounts();
+        let mut accounts = self.job_accounts()?;
         accounts.insert(
             account_id.to_string(),
             json!({ "job": job, "service": service }),

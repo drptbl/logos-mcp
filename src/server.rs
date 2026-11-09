@@ -964,7 +964,11 @@ impl LogosServer {
             Ok(v) => v,
             Err(e) => return fail(e),
         };
-        let job_accounts = self.job_accounts();
+        // Only marks which accounts were made for jobs: the list stands without it.
+        let (job_accounts, unreadable) = match self.job_accounts() {
+            Ok(map) => (map, None),
+            Err(e) => (std::collections::BTreeMap::new(), Some(e)),
+        };
         let mut accounts = Vec::with_capacity(w.accounts.len());
         for entry in &w.accounts {
             let (Some(id), Some(public)) = (
@@ -1006,9 +1010,15 @@ impl LogosServer {
             accounts.push(account);
         }
         // lez_core returns an empty list both for a wallet without accounts and on failure.
-        let note = accounts
-            .is_empty()
-            .then_some("no accounts listed: either the wallet has none or listing failed");
+        let note = match (accounts.is_empty(), unreadable) {
+            (true, _) => {
+                Some("no accounts listed: either the wallet has none or listing failed".to_string())
+            }
+            (false, Some(e)) => Some(format!(
+                "{e}, so the accounts made for service jobs aren't marked: fix or move it"
+            )),
+            (false, None) => None,
+        };
         ok(json!({
             "accounts": accounts,
             "warning": w.warning(),
