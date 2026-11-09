@@ -2782,3 +2782,171 @@ async fn an_open_that_isnt_sent_keeps_the_earlier_note() {
     let b = body(&s.service_jobs().await.unwrap());
     assert_eq!(b["jobs"][0]["escrow"]["state"], "open", "{b}");
 }
+
+#[tokio::test]
+async fn a_payment_file_that_cant_be_read_is_never_overwritten() {
+    // It may hold the only record of which account opened an escrow: an
+    // empty map saved over it would lose every refund it points to.
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("service-payments.json");
+    let corrupt = r#"{"0123": {"tx_hash": "open1", "escrow_buy"#;
+    std::fs::write(&file, corrupt).unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let b = body(&s.service_jobs().await.unwrap());
+    assert!(
+        b["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("service-payments.json"),
+        "{b}"
+    );
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-payments.json"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), corrupt);
+}
+
+#[tokio::test]
+async fn nothing_is_paid_or_cancelled_while_the_payment_file_cant_be_read() {
+    // A payment that may have gone out is only remembered there: paying
+    // again could pay twice, and cancelling could leave money in escrow.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (true, &request_text()),
+            (false, &quote_text("logos.dev", FAR)),
+        ]),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("service-payments.json"), "{").unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-payments.json"), "{}", text(&r));
+    let r = s
+        .service_cancel(Parameters(CancelParams {
+            job: JOB.into(),
+            reason: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("lez_core.transfer_public").is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+
+    // Fixed meanwhile: it stays refused until a restart reads it afresh, so
+    // no call acts on half of what it read.
+    std::fs::write(dir.path().join("service-payments.json"), "{}").unwrap();
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("restart"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_refund_says_when_the_payment_file_cant_be_read() {
+    // The `paid` message never went out: only the file knows the escrow.
+    let past = 1_000_000;
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, past - 600_000, past);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("service-payments.json"), "{").unwrap();
+    let s = services_server_in(fake, dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-payments.json"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn no_escrow_call_is_sent_while_the_in_flight_file_cant_be_read() {
+    // It may record a call still landing: another would be refused on chain
+    // at the cost of its fee, and saving over it would forget the first.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("service-in-flight.json");
+    std::fs::write(&file, "{").unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-in-flight.json"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "{");
+}
+
+#[tokio::test]
+async fn a_refund_the_chat_names_goes_ahead_while_the_payment_file_cant_be_read() {
+    // The `paid` message names the account, so the file isn't needed.
+    let past = 1_000_000;
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, past - 600_000, past);
+    let paid = proto(
+        3,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        },
+    );
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q), (true, &paid)]),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, past, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("refund1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("service-payments.json"), "{").unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
