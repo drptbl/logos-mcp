@@ -165,22 +165,7 @@ fn node() -> Arc<Routed> {
 /// A server with its own agent wallet (in a temp dir) and discovery peers.
 fn services_server(fake: Arc<Routed>) -> (LogosServer, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let s = LogosServer::new(
-        Arc::new(Logosctl::new(fake)),
-        Arc::new(EventStore::default()),
-        None,
-        NodeSettings {
-            preset: "logos.dev".into(),
-            mode: "Edge".into(),
-            config_dir: None,
-            wallet: Some(WalletMode::Dedicated(WalletPaths {
-                config: dir.path().join("wallet_config.json"),
-                storage: dir.path().join("storage.json"),
-            })),
-            discovery_bootstrap: vec![FLEET_PEER.into()],
-            host_owns_messaging: false,
-        },
-    );
+    let s = services_server_in(fake, dir.path());
     (s, dir)
 }
 
@@ -884,7 +869,14 @@ async fn an_input_too_big_once_encoded_is_refused() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
+/// The gas limit the test wallets' config sets, as the live ones do.
+const GAS_LIMIT: u128 = 200_000;
+
 fn services_server_in(fake: Arc<Routed>, dir: &std::path::Path) -> LogosServer {
+    let config = dir.join("wallet_config.json");
+    if !config.exists() {
+        std::fs::write(&config, format!(r#"{{"gas_limit": {GAS_LIMIT}}}"#)).unwrap();
+    }
     LogosServer::new(
         Arc::new(Logosctl::new(fake)),
         Arc::new(EventStore::default()),
@@ -1552,6 +1544,20 @@ async fn an_escrow_is_not_opened_without_the_funds() {
         .await
         .unwrap();
     assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+
+    // The price, but not the network's fee reserve on top: LEZ would refuse
+    // the open and keep the whole reserve, as it did live with 2.28M lepta.
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""2280000""#));
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("fee reserve"), "{}", text(&r));
     assert!(
         fake.calls_to("lez_core.send_generic_public_transaction")
             .is_empty()

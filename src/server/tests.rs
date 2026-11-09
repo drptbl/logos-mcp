@@ -839,9 +839,51 @@ fn escrow_payment(to: String) -> TransferParams {
 
 const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
 
+/// The fee LEZ holds back at the wallet's default gas limit of 2,000,000
+/// and its lowest base fee of 8, with 8 KiB for the transaction's size.
+const DEFAULT_RESERVE: u128 = (2_000_000 + 8 * 1024) * 8;
+
+#[tokio::test]
+async fn an_escrow_open_needs_the_fee_reserve_on_top_of_the_price() {
+    // Checked as it is sent, after any approval: the balance may have moved.
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "get_balance",
+        &format!(r#""{}""#, 1_000_000 + DEFAULT_RESERVE - 1),
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let buyer: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let job = crate::escrow::job_account(&buyer, &[7; 32]);
+    let err = s
+        .send_checked(
+            &CancellationToken::new(),
+            &escrow_payment(hex(&job)),
+            SendMode::Direct,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains(&"send_generic_public_transaction".to_string())),
+        "{calls:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
     let mut replies = opened_by_server();
+    replies.push(lez(
+        "get_balance",
+        &format!(r#""{}""#, 1_000_000 + DEFAULT_RESERVE),
+    ));
     replies.push(lez(
         "send_generic_public_transaction",
         r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,

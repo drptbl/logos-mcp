@@ -1555,23 +1555,11 @@ impl LogosServer {
                 q.network
             ));
         }
-        // A refused open still costs its whole fee: don't send one that can't pay.
+        // A refused open still costs its whole fee: don't ask the user to
+        // approve one that can't pay. Sending checks again.
         if escrow.is_some() {
-            match self.balance(&p.from).await {
-                Some(held) if held >= price => {}
-                Some(held) => {
-                    return Err(format!(
-                        "{} holds {held} lepta, less than the {price} lepta price: not opening the escrow",
-                        p.from
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "can't read {}'s balance: not opening the escrow",
-                        p.from
-                    ));
-                }
-            }
+            self.ensure_wallet().await?;
+            self.check_open_funds(&p.from, price).await?;
         }
         let (to, terms) = match &escrow {
             Some(e) => (
