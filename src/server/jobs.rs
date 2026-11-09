@@ -64,6 +64,17 @@ fn paid_state(state: JobState) -> bool {
     )
 }
 
+/// Why an escrow on the quoted terms no longer pays for its job.
+fn unpaid_escrow(state: JobState) -> String {
+    match state {
+        JobState::Returned => {
+            "the provider returned this job, so it isn't paid: take the money back with service_refund"
+        }
+        _ => "this job's escrow was refunded, so it isn't paid: ask for a new quote with service_request",
+    }
+    .into()
+}
+
 /// A job's escrow as this server can act on it.
 struct EscrowJob {
     buyer: Id,
@@ -1461,6 +1472,9 @@ impl LogosServer {
                 let e = escrow.as_ref().ok_or("the quote no longer offers escrow")?;
                 match self.escrow_record(e).await {
                     Ok(Some(r)) if e.holds(&r) => {
+                        if !paid_state(r.state) {
+                            return Err(unpaid_escrow(r.state));
+                        }
                         let tx = tx_hash.unwrap_or_default();
                         return self
                             .tell_paid(&convo, &job.job, tell(tx, Some(p.from.clone())))
@@ -1560,6 +1574,9 @@ impl LogosServer {
         if let Some(e) = &escrow {
             match self.escrow_record(e).await {
                 Ok(Some(r)) if e.holds(&r) => {
+                    if !paid_state(r.state) {
+                        return Err(unpaid_escrow(r.state));
+                    }
                     return self
                         .tell_paid(&convo, &job.job, tell(String::new(), Some(p.from.clone())))
                         .await;

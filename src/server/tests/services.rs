@@ -2432,3 +2432,47 @@ async fn a_bad_delivery_window_is_refused_before_advertising() {
     assert!(is_error(&r), "{}", text(&r));
     assert!(fake.calls_to("libp2p_module.createXpr").is_empty());
 }
+
+#[tokio::test]
+async fn a_returned_or_refunded_escrow_is_not_announced_as_paid() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    // The open is noted, and its record says the job came back; then the
+    // same with no note, as before a restart.
+    for (noted, state) in [(true, 5u8), (true, 4u8), (false, 5u8), (false, 4u8)] {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(
+                AGENT_FROM,
+                PROVIDER_ACCOUNT,
+                1_000_000,
+                FAR + 600_000,
+                state,
+            ),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        if noted {
+            std::fs::write(
+                dir.path().join("service-payments.json"),
+                json!({ JOB: { "tx_hash": "open1", "escrow_buyer": AGENT_FROM } }).to_string(),
+            )
+            .unwrap();
+        }
+        let s = services_server_in(fake.clone(), dir.path());
+        let r = s
+            .service_pay(CancellationToken::new(), pay())
+            .await
+            .unwrap();
+        assert!(is_error(&r), "noted {noted}, state {state}: {}", text(&r));
+        assert!(fake.calls_to("chat_module.send_message").is_empty());
+        assert!(
+            fake.calls_to("lez_core.send_generic_public_transaction")
+                .is_empty()
+        );
+    }
+}
