@@ -427,10 +427,6 @@ fn escrow_open(
         .ok()
         .and_then(|h| id(&h))
         .ok_or("escrow payment: the provider account is not a public account")?;
-    // The program refuses it, and a refused call still costs its whole fee.
-    if provider == buyer {
-        return Err("escrow payment: the quote names the paying account as its provider".into());
-    }
     let amount: u128 = amount_lepta
         .parse()
         .map_err(|_| "escrow payment: the amount is not a number")?;
@@ -1704,6 +1700,11 @@ impl LogosServer {
         // An escrow open the chain would refuse still costs its whole fee.
         // Checked here, after any approval wait and before the last looks.
         if let Some(terms) = &p.escrow {
+            if guard::public_account_hex(&terms.provider).ok().as_deref() == Some(from.as_str()) {
+                return Err(
+                    "escrow payment: the quote names the paying account as its provider".into(),
+                );
+            }
             if jobs::too_late_for(terms.deadline) {
                 return Err(
                     "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),

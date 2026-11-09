@@ -936,6 +936,12 @@ async fn an_escrow_naming_the_buyer_as_provider_is_not_opened() {
     let job = crate::escrow::job_account(&buyer, &[7; 32]);
     let mut own = escrow_payment(hex(&job));
     own.escrow.as_mut().unwrap().provider = AGENT_FROM.into();
+    // Refused before the user is asked to approve it, too.
+    let err = s
+        .send_checked(&CancellationToken::new(), &own, SendMode::CheckOnly)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
     let err = s
         .send_checked(&CancellationToken::new(), &own, SendMode::Direct)
         .await
