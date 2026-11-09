@@ -775,19 +775,23 @@ impl LogosServer {
 
     /// Remember (`Some`) or forget (`None`) a payment the provider hasn't been told about.
     async fn note_payment(&self, job: &str, payment: Option<Payment>) {
+        if let Err(e) = self.save_payment(job, payment).await {
+            tracing::warn!("could not save the service payments: {e}");
+        }
+    }
+
+    /// `note_payment`, for a caller that must not go on unless it is saved.
+    async fn save_payment(&self, job: &str, payment: Option<Payment>) -> Result<(), String> {
         let mut state = self.with_payments().await;
         match payment {
             Some(tx) => state.submitted.insert(job.to_string(), tx),
             None => state.submitted.remove(job),
         };
-        let saved = self.wallet_side_file(PAYMENTS).map(|file| {
-            serde_json::to_vec_pretty(&state.submitted)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
-        });
-        if let Some(Err(e)) = saved {
-            tracing::warn!("could not save the service payments: {e}");
-        }
+        let file = self
+            .wallet_side_file(PAYMENTS)
+            .ok_or("no wallet is configured")?;
+        let bytes = serde_json::to_vec_pretty(&state.submitted).map_err(|e| e.to_string())?;
+        guard::write_private(&file, &bytes).map_err(|e| e.to_string())
     }
 
     /// Which accounts were made for which job: account id -> `{job, service}`.
@@ -1727,16 +1731,22 @@ impl LogosServer {
             None => (q.pay_to.clone(), None),
         };
         // An escrow payment is noted before it is asked for, so a restart
-        // can't lose which account it goes from.
-        if escrow.is_some() {
-            self.note_payment(
-                &p.job,
-                Some(Payment::Escrow {
-                    tx_hash: None,
-                    escrow_buyer: p.from.clone(),
-                }),
-            )
-            .await;
+        // can't lose which account it goes from: without that, no open.
+        if escrow.is_some()
+            && let Err(e) = self
+                .save_payment(
+                    &p.job,
+                    Some(Payment::Escrow {
+                        tx_hash: None,
+                        escrow_buyer: p.from.clone(),
+                    }),
+                )
+                .await
+        {
+            self.note_payment(&p.job, None).await;
+            return Err(format!(
+                "can't save which account pays, so a restart could lose the refund: not opening the escrow ({e})"
+            ));
         }
         let sent = tool_json(
             self.wallet_transfer(

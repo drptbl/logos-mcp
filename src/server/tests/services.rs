@@ -2645,3 +2645,30 @@ async fn an_escrow_known_only_from_the_note_still_shows_its_next_step() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_escrow_is_not_opened_when_its_note_cant_be_saved() {
+    // Without the note, a restart before `paid` goes out would lose which
+    // account opened the escrow, and with it the refund.
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the note's file should go: writing it fails.
+    std::fs::create_dir(dir.path().join("service-payments.json")).unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
