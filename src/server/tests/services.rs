@@ -2782,3 +2782,41 @@ async fn an_open_that_isnt_sent_keeps_the_earlier_note() {
     let b = body(&s.service_jobs().await.unwrap());
     assert_eq!(b["jobs"][0]["escrow"]["state"], "open", "{b}");
 }
+
+#[tokio::test]
+async fn a_payment_file_that_cant_be_read_is_never_overwritten() {
+    // It may hold the only record of which account opened an escrow: an
+    // empty map saved over it would lose every refund it points to.
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("service-payments.json");
+    let corrupt = r#"{"0123": {"tx_hash": "open1", "escrow_buy"#;
+    std::fs::write(&file, corrupt).unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let b = body(&s.service_jobs().await.unwrap());
+    assert!(
+        b["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("service-payments.json"),
+        "{b}"
+    );
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("service-payments.json"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), corrupt);
+}

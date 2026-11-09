@@ -199,6 +199,9 @@ pub(super) struct Services {
     /// so it is kept in `PAYMENTS` too and survives a restart.
     submitted: BTreeMap<String, Payment>,
     payments_loaded: bool,
+    /// Why `PAYMENTS` couldn't be read: until it can, it is read again on
+    /// each use and never written over.
+    payments_unreadable: Option<String>,
     /// The last escrow call sent for each job, until it lands or counts as
     /// dropped. Kept in `IN_FLIGHT` too.
     in_flight: BTreeMap<String, InFlight>,
@@ -760,15 +763,26 @@ impl LogosServer {
     async fn with_payments(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
         if !state.payments_loaded {
-            let saved: BTreeMap<String, Payment> = self
-                .wallet_side_file(PAYMENTS)
-                .and_then(|f| std::fs::read(f).ok())
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-            for (job, tx) in saved {
-                state.submitted.entry(job).or_insert(tx);
+            let read = match self.wallet_side_file(PAYMENTS).map(std::fs::read) {
+                None => Ok(BTreeMap::new()),
+                Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+                Some(Err(e)) => Err(e.to_string()),
+                Some(Ok(bytes)) => serde_json::from_slice::<BTreeMap<String, Payment>>(&bytes)
+                    .map_err(|e| e.to_string()),
+            };
+            match read {
+                Ok(saved) => {
+                    for (job, tx) in saved {
+                        state.submitted.entry(job).or_insert(tx);
+                    }
+                    state.payments_loaded = true;
+                    state.payments_unreadable = None;
+                }
+                Err(e) => {
+                    tracing::warn!("can't read {PAYMENTS}, so it won't be written: {e}");
+                    state.payments_unreadable = Some(e);
+                }
             }
-            state.payments_loaded = true;
         }
         state
     }
@@ -787,6 +801,11 @@ impl LogosServer {
             .wallet_side_file(PAYMENTS)
             .ok_or("no wallet is configured")?;
         let mut state = self.with_payments().await;
+        if let Some(e) = &state.payments_unreadable {
+            return Err(format!(
+                "{PAYMENTS} next to the wallet can't be read ({e}), and it may hold which accounts paid for which escrows: fix or move it, nothing is written over it until then"
+            ));
+        }
         let before = match payment {
             Some(tx) => state.submitted.insert(job.to_string(), tx),
             None => state.submitted.remove(job),
@@ -2037,10 +2056,27 @@ impl LogosServer {
             .iter()
             .map(|(id, o)| json!({ "service_id": id, "price_lepta": o.price_lepta, "chat_address": o.advertised_to }))
             .collect();
+        let unreadable = self
+            .with_payments()
+            .await
+            .payments_unreadable
+            .clone()
+            .map(|e| {
+                format!(
+                    "{PAYMENTS} next to the wallet can't be read ({e}): escrow payments it records are missing here, and no escrow is opened until it is fixed or moved"
+                )
+            });
+        let warning = [
+            refreshed.map(|e| format!("could not advertise the offers again: {e}")),
+            unreadable,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         ok(json!({
             "jobs": listed,
             "offers": offers,
-            "warning": refreshed.map(|e| format!("could not advertise the offers again: {e}")),
+            "warning": (!warning.is_empty()).then(|| warning.join("; ")),
         }))
     }
 }
