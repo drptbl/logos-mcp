@@ -86,7 +86,7 @@ Download the binary for your platform from the [latest release](https://github.c
 Check it against its `.sha256` before you run it. On macOS:
 
 ```bash
-v=v0.2.0 target=aarch64-apple-darwin
+v=v0.2.1 target=aarch64-apple-darwin
 curl -LO https://github.com/drptbl/logos-mcp/releases/download/$v/logos-mcp-$v-$target.tar.gz
 curl -LO https://github.com/drptbl/logos-mcp/releases/download/$v/logos-mcp-$v-$target.tar.gz.sha256
 shasum -a 256 -c logos-mcp-$v-$target.tar.gz.sha256
