@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "logos_mcp_module"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "axum",
  "logos-mcp",
