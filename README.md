@@ -65,7 +65,7 @@ Escrow steps take minutes to land on the testnet. `service_jobs` always says wha
 2. `delivery_module` => `logosctl package install delivery_module --yes`
 3. `storage_module` => ships with `logosctl`
 4. `chat_module` and `libp2p_module`, for chat, discovery and services => `logosctl package install chat_module --yes`, and the same for `libp2p_module`
-5. Rust `1.89` or newer to build
+5. Rust `1.89` or newer, only to build from source
 
 Start the daemon before you start the server:
 
@@ -75,7 +75,27 @@ logosctl catalog refresh
 logosctl package install delivery_module --yes
 ```
 
-## Build
+## Install
+
+Download the binary for your platform from the [latest release](https://github.com/drptbl/logos-mcp/releases/latest):
+
+1. macOS, Apple Silicon => `aarch64-apple-darwin`
+2. Linux x86_64 => `x86_64-unknown-linux-gnu`
+3. Linux arm64 => `aarch64-unknown-linux-gnu`
+
+Check it against its `.sha256` before you run it. On macOS:
+
+```bash
+v=v0.2.0 target=aarch64-apple-darwin
+curl -LO https://github.com/drptbl/logos-mcp/releases/download/$v/logos-mcp-$v-$target.tar.gz
+curl -LO https://github.com/drptbl/logos-mcp/releases/download/$v/logos-mcp-$v-$target.tar.gz.sha256
+shasum -a 256 -c logos-mcp-$v-$target.tar.gz.sha256
+tar xzf logos-mcp-$v-$target.tar.gz
+```
+
+On Linux, use `sha256sum -c` instead of `shasum -a 256 -c`. The binary is `logos-mcp-$v-$target/logos-mcp`.
+
+To build it yourself instead:
 
 ```bash
 git clone https://github.com/drptbl/logos-mcp
@@ -83,7 +103,7 @@ cd logos-mcp
 cargo build --release
 ```
 
-The binary is `target/release/logos-mcp`.
+The binary is then `target/release/logos-mcp`.
 
 ## Add it to your MCP client
 
