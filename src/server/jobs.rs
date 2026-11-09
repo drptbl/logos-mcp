@@ -175,6 +175,9 @@ pub(super) struct Services {
     /// so it is kept in `PAYMENTS` too and survives a restart.
     submitted: BTreeMap<String, Payment>,
     payments_loaded: bool,
+    /// The last escrow call sent for each job, until it lands: job ->
+    /// (instruction variant, tx hash).
+    in_flight: BTreeMap<String, (u8, String)>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
 }
@@ -488,6 +491,44 @@ impl LogosServer {
             Ok(other) => Err(format!("unexpected get_account_public result: {other}")),
             Err(err) => Err(err.to_string()),
         }
+    }
+
+    /// Send a job's escrow instruction unless the same one is still on its
+    /// way: once the first lands, a second is refused on chain and still
+    /// costs its whole fee.
+    async fn escrow_send_once(
+        &self,
+        job: &str,
+        signer: &Id,
+        accounts: &[Id],
+        ix: Instruction,
+    ) -> Result<String, String> {
+        let kind = ix.encode()[0];
+        let earlier = self.services.lock().await.in_flight.get(job).cloned();
+        if let Some((k, tx)) = earlier
+            && k == kind
+        {
+            let included = matches!(
+                self.node
+                    .call(LEZ, "poll_transaction_status", &[Arg::str(&tx)])
+                    .await,
+                Ok(Value::Bool(true))
+            );
+            // Included while the escrow still takes this call: that one was
+            // refused on chain, so it may go again.
+            if !included {
+                return Err(format!(
+                    "the same call, {tx}, hasn't landed yet: check service_jobs in a few minutes before trying again"
+                ));
+            }
+        }
+        let tx = self.escrow_send(signer, accounts, ix).await?;
+        self.services
+            .lock()
+            .await
+            .in_flight
+            .insert(job.to_string(), (kind, tx.clone()));
+        Ok(tx)
     }
 
     /// Send an escrow instruction signed by `signer`, an agent account that
@@ -1055,7 +1096,12 @@ impl LogosServer {
                     JobState::Open if now_ms() >= e.deadline => {}
                     JobState::Open => {
                         let tx = self
-                            .escrow_send(&e.provider, &[e.account], Instruction::Return)
+                            .escrow_send_once(
+                                &job.job,
+                                &e.provider,
+                                &[e.account],
+                                Instruction::Return,
+                            )
                             .await
                             .map_err(|err| format!("the job wasn't returned in escrow: {err}"))?;
                         returned = Some(tx);
@@ -1151,7 +1197,7 @@ impl LogosServer {
                         deadline: e.deadline,
                     };
                     let tx = self
-                        .escrow_send(&e.provider, &[e.account], deliver)
+                        .escrow_send_once(&job.job, &e.provider, &[e.account], deliver)
                         .await
                         .map_err(|err| format!("the delivery wasn't recorded in escrow: {err}"))?;
                     return Ok(json!({
@@ -1241,7 +1287,9 @@ impl LogosServer {
             amount: e.amount,
         };
         // Paid to the provider itself, so `pay_to` is left out of the accounts.
-        let tx = self.escrow_send(&e.provider, &[e.account], claim).await?;
+        let tx = self
+            .escrow_send_once(&job.job, &e.provider, &[e.account], claim)
+            .await?;
         Ok(json!({
             "job": job.job,
             "claim_tx": tx,
@@ -1321,7 +1369,9 @@ impl LogosServer {
             deadline,
         };
         // Paid back to the buyer itself, so `refund_to` is left out of the accounts.
-        let tx = self.escrow_send(&e.buyer, &[e.account], refund).await?;
+        let tx = self
+            .escrow_send_once(&job.job, &e.buyer, &[e.account], refund)
+            .await?;
         self.note_payment(&p.job, None).await;
         Ok(json!({
             "job": job.job,

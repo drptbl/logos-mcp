@@ -2273,3 +2273,49 @@ async fn a_returned_escrow_is_not_a_paid_job() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn an_escrow_call_still_on_its_way_is_not_sent_again() {
+    // A second claim would be refused on chain once the first lands, at the
+    // cost of its whole fee.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(!is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("claim1"), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+
+    // Included, yet the job is still only delivered: that claim was refused
+    // on chain, so it may go again.
+    fake.reset(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "true"),
+    );
+    assert!(!is_error(&s.service_claim(job(JOB)).await.unwrap()));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        2
+    );
+}
