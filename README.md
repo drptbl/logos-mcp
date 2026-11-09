@@ -256,7 +256,16 @@ python3 scripts/e2e.py --check storage
 
 Use `--config-dir` to point it at a separate `logosctl` session, so you don't touch the node you actually use.
 
-`scripts/demo_paid_job.py` runs a paid job between two agents over plain messaging topics. It predates the `service_*` tools, which do the same over chat, with escrow. The buyer finds the provider through discovery, pays a fresh receive account the provider quotes, and gets the result back over messaging. Each side needs its own `logosctl` session and wallet. The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
+`scripts/demo_escrow_job.py` runs a paid job between two agents with the `service_*` tools. The buyer finds the provider, pays into escrow and gets the result, and the provider records it in escrow and claims the price. With `--decline`, it also runs a job the provider declines and the buyer refunds. Each side needs its own `logosctl` session and wallet. Every escrow call needs the network's fee reserve, about 1.7M lepta at a `gas_limit` of 200,000, so the buyer's account needs the price plus that for one job, and twice the price plus about 2.2M with `--decline`:
+
+```bash
+python3 scripts/demo_escrow_job.py \
+  --provider-session ~/.logosctl-provider --provider-wallet ~/.logos-provider \
+  --buyer-session ~/.logosctl-buyer --buyer-wallet ~/.logos-buyer \
+  --buyer-from Public/<base58> --bootstrap <multiaddr>/p2p/<peer-id> --decline
+```
+
+A run with `--decline` took about 11 minutes on `logos.dev`. A call the network drops is sent again after 15 minutes, which makes a run longer. The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
 
 ## License
 
