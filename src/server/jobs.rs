@@ -781,17 +781,26 @@ impl LogosServer {
     }
 
     /// `note_payment`, for a caller that must not go on unless it is saved.
+    /// Memory keeps what the file holds: a failed save changes neither.
     async fn save_payment(&self, job: &str, payment: Option<Payment>) -> Result<(), String> {
-        let mut state = self.with_payments().await;
-        match payment {
-            Some(tx) => state.submitted.insert(job.to_string(), tx),
-            None => state.submitted.remove(job),
-        };
         let file = self
             .wallet_side_file(PAYMENTS)
             .ok_or("no wallet is configured")?;
-        let bytes = serde_json::to_vec_pretty(&state.submitted).map_err(|e| e.to_string())?;
-        guard::write_private(&file, &bytes).map_err(|e| e.to_string())
+        let mut state = self.with_payments().await;
+        let before = match payment {
+            Some(tx) => state.submitted.insert(job.to_string(), tx),
+            None => state.submitted.remove(job),
+        };
+        let saved = serde_json::to_vec_pretty(&state.submitted)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()));
+        if saved.is_err() {
+            match before {
+                Some(tx) => state.submitted.insert(job.to_string(), tx),
+                None => state.submitted.remove(job),
+            };
+        }
+        saved
     }
 
     /// Which accounts were made for which job: account id -> `{job, service}`.
@@ -1731,7 +1740,9 @@ impl LogosServer {
             None => (q.pay_to.clone(), None),
         };
         // An escrow payment is noted before it is asked for, so a restart
-        // can't lose which account it goes from: without that, no open.
+        // can't lose which account it goes from: without that, no open. An
+        // earlier note, from an open with no clear outcome, outlives this try.
+        let earlier = self.with_payments().await.submitted.get(&p.job).cloned();
         if escrow.is_some()
             && let Err(e) = self
                 .save_payment(
@@ -1743,7 +1754,6 @@ impl LogosServer {
                 )
                 .await
         {
-            self.note_payment(&p.job, None).await;
             return Err(format!(
                 "can't save which account pays, so a restart could lose the refund: not opening the escrow ({e})"
             ));
@@ -1769,8 +1779,8 @@ impl LogosServer {
                         self.note_payment(&p.job, Some(Payment::Transfer(None)))
                             .await;
                     }
-                    // Nothing went out.
-                    (Some(_), false) => self.note_payment(&p.job, None).await,
+                    // Nothing went out this time.
+                    (Some(_), false) => self.note_payment(&p.job, earlier).await,
                     _ => {}
                 }
                 return Err(e);

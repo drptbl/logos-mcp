@@ -2672,3 +2672,71 @@ async fn an_escrow_is_not_opened_when_its_note_cant_be_saved() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_failed_save_keeps_the_earlier_note() {
+    use std::os::unix::fs::PermissionsExt;
+    // An earlier open had no clear outcome: its note is all that says which
+    // account it came from. A retry whose save fails must not lose it.
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-payments.json"),
+        json!({ JOB: { "tx_hash": null, "escrow_buyer": AGENT_FROM } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    // The first open landed after all: the note still finds it.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    let b = body(&s.service_jobs().await.unwrap());
+    assert_eq!(b["jobs"][0]["escrow"]["state"], "open", "{b}");
+}
+
+#[tokio::test]
+async fn an_open_that_isnt_sent_keeps_the_earlier_note() {
+    // Likewise when the retry is refused before sending.
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    // Short of price plus fee reserve: refused before sending.
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""1000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-payments.json"),
+        json!({ JOB: { "tx_hash": null, "escrow_buyer": AGENT_FROM } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    let b = body(&s.service_jobs().await.unwrap());
+    assert_eq!(b["jobs"][0]["escrow"]["state"], "open", "{b}");
+}
