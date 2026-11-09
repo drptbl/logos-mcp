@@ -2608,3 +2608,40 @@ async fn a_returned_or_refunded_escrow_is_not_announced_as_paid() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_escrow_known_only_from_the_note_still_shows_its_next_step() {
+    // The open landed, but the `paid` message never went out: only this
+    // server's note says which account opened it.
+    for (deadline, next) in [
+        (1_000_000, "service_refund"),
+        (FAR + 600_000, "service_pay"),
+    ] {
+        let q = escrow_quote_text(PROVIDER_ACCOUNT, deadline - 600_000, deadline);
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, deadline, 0),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("service-payments.json"),
+            json!({ JOB: { "tx_hash": "open1", "escrow_buyer": AGENT_FROM } }).to_string(),
+        )
+        .unwrap();
+        let s = services_server_in(fake, dir.path());
+        let b = body(&s.service_jobs().await.unwrap());
+        assert_eq!(b["jobs"][0]["escrow"]["state"], "open", "{b}");
+        assert!(
+            b["jobs"][0]["next"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(next),
+            "{b}"
+        );
+    }
+}

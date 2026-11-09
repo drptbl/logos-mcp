@@ -1891,6 +1891,18 @@ impl LogosServer {
             Err(e) => return fail(e),
         };
         let now = now_ms();
+        // Escrows this server opened, including ones whose `paid` message
+        // never went out.
+        let noted: BTreeMap<String, String> = self
+            .with_payments()
+            .await
+            .submitted
+            .iter()
+            .filter_map(|(job, p)| match p {
+                Payment::Escrow { escrow_buyer, .. } => Some((job.clone(), escrow_buyer.clone())),
+                Payment::Transfer(_) => None,
+            })
+            .collect();
         let mut listed = Vec::with_capacity(jobs.len());
         for Found {
             convo,
@@ -1899,7 +1911,14 @@ impl LogosServer {
         } in jobs
         {
             // An escrow job's record says what the chat can't: paid, delivered, claimed.
-            let escrow = match job.escrow_buyer.as_deref().map(|b| escrow_job(&job, b)) {
+            let untold = job.role == Role::Buyer
+                && job.escrow_buyer.is_none()
+                && noted.contains_key(&job.job);
+            let buyer = match job.role {
+                Role::Buyer => job.escrow_buyer.as_ref().or(noted.get(&job.job)),
+                Role::Provider => job.escrow_buyer.as_ref(),
+            };
+            let escrow = match buyer.map(|b| escrow_job(&job, b)) {
                 Some(Ok(Some(e))) => Some((self.escrow_record(&e).await, e)),
                 _ => None,
             };
@@ -1959,6 +1978,9 @@ impl LogosServer {
                     Some(
                         "nothing was delivered by the deadline: take the money back with service_refund",
                     )
+                }
+                (Role::Buyer, State::Paid, Some(JobState::Open)) if untold => {
+                    Some("the escrow is open, but the provider wasn't told: call service_pay again")
                 }
                 _ if !can_send => None,
                 _ => next_step(job.role, state),
