@@ -73,3 +73,37 @@ jobs:
       signing_mode: inline
     secrets:
       signing_key: ${{ secrets.LOGOS_SIGNING_KEY }}
+
+  # GitHub marks the release published last as "Latest", which after this
+  # workflow is a Basecamp package without binaries. Hand it back to the newest
+  # binary release, so the releases/latest link stays on something to download.
+  latest:
+    needs: [module, app]
+    # Also after a failed run: the action may have published a package anyway.
+    if: ${{ !cancelled() && needs.module.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: mark the newest binary release latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          newest() {
+            gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases --limit 1000 \
+              --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+                | sort_by(ltrimstr("v") | split(".") | map(tonumber)) | last // empty'
+          }
+          tag=$(newest)
+          if [[ -z "$tag" ]]; then
+            echo "::notice::no binary release yet: leaving Latest as it is"
+            exit 0
+          fi
+          gh release edit "$tag" --repo "$REPO" --latest
+          # A binary release published meanwhile is the newest one: mark that.
+          again=$(newest)
+          if [[ "$again" != "$tag" ]]; then
+            gh release edit "$again" --repo "$REPO" --latest
+          fi
