@@ -2319,3 +2319,48 @@ async fn an_escrow_call_still_on_its_way_is_not_sent_again() {
         2
     );
 }
+
+#[tokio::test]
+async fn a_refund_keeps_the_paying_account_until_it_lands() {
+    // The `paid` message never went out: only this server's note says which
+    // account opened the escrow.
+    let past = 1_000_000;
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, past - 600_000, past);
+    let fake_with = |state: u8| {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, past, state),
+        );
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("refund1"),
+        );
+        fake
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-payments.json"),
+        json!({ JOB: { "tx_hash": "open1", "escrow_buyer": AGENT_FROM } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake_with(0), dir.path());
+    assert!(!is_error(&s.service_refund(job(JOB)).await.unwrap()));
+
+    // After a restart the refund hasn't landed: the account is still known.
+    let s = services_server_in(fake_with(0), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+
+    // Once it landed, the note goes.
+    let s = services_server_in(fake_with(4), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let s = services_server_in(fake_with(4), dir.path());
+    let r = s.service_refund(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+}

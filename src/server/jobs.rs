@@ -1337,6 +1337,8 @@ impl LogosServer {
                 JobState::Open => e.deadline,
                 JobState::Returned => 0,
                 JobState::Refunded => {
+                    // Landed: the note of which account paid has served.
+                    self.note_payment(&p.job, None).await;
                     return Ok(
                         json!({ "job": job.job, "refunded": true, "note": "already refunded" }),
                     );
@@ -1372,7 +1374,6 @@ impl LogosServer {
         let tx = self
             .escrow_send_once(&job.job, &e.buyer, &[e.account], refund)
             .await?;
-        self.note_payment(&p.job, None).await;
         Ok(json!({
             "job": job.job,
             "refund_tx": tx,
