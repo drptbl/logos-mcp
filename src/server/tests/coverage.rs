@@ -1241,3 +1241,19 @@ async fn a_chain_send_whose_balance_fell_meanwhile_is_not_sent() {
     assert!(is_error(&r));
     assert!(chain_sends(&fake).is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn turning_transfers_off_stops_a_chain_transfer_already_waiting() {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.extend(chain_sender_ok());
+    replies.push(chain("wallet_transfer_funds", json!(TX)));
+    let fake = FakeRunner::with(replies);
+    let (switches, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = hosted_server(fake.clone()).with_tool_groups(rx);
+    let (call, id) = request_chain_transfer(&s).await;
+    switches.send_modify(|g| g.set("transfers", false).unwrap());
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(chain_sends(&fake).is_empty());
+}

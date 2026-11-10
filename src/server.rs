@@ -2255,6 +2255,12 @@ impl LogosServer {
         self.chain_sendable(from, amount)
             .await
             .map_err(SendError::NotSent)?;
+        // Last look before sending: the user may have turned transfers off while it waited.
+        if !self.allows("chain_transfer") {
+            return Err(SendError::NotSent(
+                "transfer cancelled: the user turned off transfers; nothing was sent".into(),
+            ));
+        }
         let args = [
             Arg::str(from),
             Arg::Json(json!([from])),
