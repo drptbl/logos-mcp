@@ -609,3 +609,17 @@ async fn a_block_the_node_lacks_is_not_found_rather_than_failed() {
     assert_eq!(b["found"], false, "{b}");
     assert!(b["note"].as_str().unwrap().contains("chain_info"), "{b}");
 }
+
+#[tokio::test]
+async fn wallet_status_keeps_sequencer_credentials_out() {
+    let mut replies = opened_with_sequencer("https://user:hunter2@seq.example/rpc?key=k");
+    replies.push(lez("get_current_block_height", "80205"));
+    replies.push(lez("get_last_synced_block", "80100"));
+    let b = body(
+        &wallet_server(FakeRunner::with(replies))
+            .wallet_status()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["sequencer"], "https://seq.example/rpc", "{b}");
+}

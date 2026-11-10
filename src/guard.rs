@@ -114,6 +114,20 @@ pub fn public_account_hex(input: &str) -> Result<String, String> {
     Ok(bytes.iter().rev().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A URL as it may be shown to an agent: no user info, query or fragment, where
+/// a credential could sit.
+pub fn shown_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
+}
+
 /// An account as `Public/<base58>`, `Private/<base58>` or 64 hex characters
 /// (public): its id in hex, and whether it is private.
 pub fn account_hex(input: &str) -> Result<(String, bool), String> {

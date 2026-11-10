@@ -1151,7 +1151,7 @@ impl LogosServer {
             "opened_now": w.opened_now,
             "opened_by_this_server": w.trusted && !w.shared,
             "warning": w.warning(),
-            "sequencer": w.sequencer,
+            "sequencer": guard::shown_url(&w.sequencer),
             "block_height": height,
             "private_synced_block": synced,
         }))
