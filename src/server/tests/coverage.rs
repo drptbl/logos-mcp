@@ -820,3 +820,200 @@ async fn peer_tools_refuse_a_malformed_peer_id_without_touching_the_node() {
     assert!(is_error(&s.discovery_disconnect(bad()).await.unwrap()));
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
+const FAUCET_LOADED: &str = r#"[{"name":"lez_faucet","status":"loaded"}]"#;
+
+/// A lez_faucet reply: its methods return a JSON document as a string.
+fn faucet(method: &str, envelope: Value) -> crate::logosctl::RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "lez_faucet",
+        "result": envelope.to_string(),
+        "status": "ok",
+    })
+    .to_string())
+}
+
+fn agent_address() -> String {
+    format!("Public/{}", guard::account_id_base58(AGENT_ID).unwrap())
+}
+
+#[tokio::test]
+async fn the_faucet_pays_an_agent_account_and_waits_for_the_receipt() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
+        ),
+        faucet(
+            "jobStatus",
+            json!({
+                "ok": true, "job_id": "job-1", "status": "succeeded",
+                "result": { "amount": "100000000", "balance_before": "0",
+                            "balance_after": "100000000", "tx_hash": TX },
+            }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+    ]);
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["status"], "succeeded", "{b}");
+    assert_eq!(b["receipt"]["tx_hash"], TX, "{b}");
+    let calls = fake.calls.lock().unwrap();
+    let configure = calls
+        .iter()
+        .find(|c| c.get(3).map(String::as_str) == Some("configure"))
+        .unwrap();
+    assert_eq!(configure[4], "str:https://testnet.lez.logos.co/");
+    let drop = calls
+        .iter()
+        .find(|c| c.get(3).map(String::as_str) == Some("requestDrop"))
+        .unwrap();
+    assert_eq!(drop[4], format!("str:{}", agent_address()));
+    // A fresh lowercase UUID, so a retry can never claim twice.
+    let key = drop[5].strip_prefix("str:").unwrap();
+    assert_eq!(key.len(), 36, "{key}");
+    assert!(
+        key.chars()
+            .all(|c| c == '-' || c.is_ascii_digit() || c.is_ascii_lowercase()),
+        "{key}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("jobResultAck"))
+    );
+}
+
+#[tokio::test]
+async fn the_faucet_never_pays_an_account_outside_the_agent_wallet() {
+    let fake = FakeRunner::with(opened_by_server());
+    let other = format!(
+        "Public/{}",
+        guard::account_id_base58(
+            "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc"
+        )
+        .unwrap()
+    );
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(other),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(2).map(String::as_str) == Some("lez_faucet"))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_drop_says_why() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet(
+            "requestDrop",
+            json!({ "ok": false, "error": { "code": "rate_limited",
+                    "message": "The faucet service is limiting claims right now. Try again later." } }),
+        ),
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("limiting claims"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_running_drop_is_checked_again_by_its_job_id() {
+    let fake = FakeRunner::with(vec![
+        out(FAUCET_LOADED),
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "job-1", "status": "running", "phase": "reconciling" }),
+        ),
+    ]);
+    let b = body(
+        &wallet_server(fake.clone())
+            .wallet_faucet(
+                CancellationToken::new(),
+                Parameters(FaucetParams {
+                    account: None,
+                    job_id: Some("job-1".into()),
+                }),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["status"], "running", "{b}");
+    assert_eq!(b["job_id"], "job-1", "{b}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("jobResultAck"))
+    );
+}
+
+#[tokio::test]
+async fn without_lez_faucet_the_faucet_says_where_to_get_it() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(r#"[{"name":"lez_core","status":"loaded"}]"#),
+        crate::logosctl::RawOutput {
+            code: 3,
+            stdout: r#"{"code":"MODULE_LOAD_FAILED","message":"Failed to load module 'lez_faucet'.","status":"error"}"#.into(),
+            stderr: String::new(),
+        },
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("LEZ Faucet"), "{}", text(&r));
+}

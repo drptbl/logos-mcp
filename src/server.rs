@@ -33,6 +33,9 @@ const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 const BLOCKCHAIN: &str = "blockchain_module";
+const FAUCET: &str = "lez_faucet";
+/// How long wallet_faucet waits for a drop before handing back its job id.
+const FAUCET_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 /// How long a ping waits for a peer, in milliseconds. Dialing gets twice this.
 const PEER_TIMEOUT_MS: i64 = 5_000;
 /// The largest chat message the agent may send, in bytes: well under the
@@ -368,6 +371,14 @@ pub struct ChainTxParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FaucetParams {
+    /// One of the agent's own public accounts, Public/<base58>, to receive the drop.
+    pub account: Option<String>,
+    /// A drop still running, as an earlier wallet_faucet call returned it, to check again.
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct PeerAddrParams {
     /// The peer's multiaddr, ending in /p2p/<peer id>, e.g. /ip4/1.2.3.4/tcp/30304/p2p/16Uiu2…
     pub multiaddr: String,
@@ -585,6 +596,17 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
     fail(message)
 }
 
+/// A lez_faucet failure, with where to get the module when it isn't there.
+fn faucet_error(e: LogosError) -> String {
+    let message = e.to_string();
+    if matches!(e, LogosError::Module(_)) {
+        return format!(
+            "{message}: the faucet needs Basecamp's LEZ Faucet module, from its catalog or https://github.com/logos-co/lez-faucet"
+        );
+    }
+    message
+}
+
 /// A blockchain_module failure, with the way out when the module or its node isn't running.
 fn chain_error(e: LogosError) -> String {
     let message = e.to_string();
@@ -600,6 +622,23 @@ fn chain_error(e: LogosError) -> String {
         );
     }
     message
+}
+
+/// A fresh random UUID, lowercase, as lez_faucet takes its request keys.
+fn uuid_v4() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| e.to_string())?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
 }
 
 fn validate_conversation_id(id: &str) -> Result<(), String> {
@@ -2087,6 +2126,143 @@ impl LogosServer {
                         "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
                     )),
                 }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Ask the LEZ testnet faucet for its drop, 0.1 LEZ on the v0.3 testnet, into one of the agent's own public accounts. One claim per account per day. Waits up to 90 seconds for the receipt; a drop still running comes back with a job_id to check again. Needs Basecamp's LEZ Faucet module."
+    )]
+    pub async fn wallet_faucet(
+        &self,
+        ct: CancellationToken,
+        Parameters(p): Parameters<FaucetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match (p.account, p.job_id) {
+            (Some(account), None) => match self.faucet_drop(&ct, account.trim()).await {
+                Ok(done) => ok(done),
+                Err(e) => fail(e),
+            },
+            (None, Some(job)) => {
+                let job = job.trim();
+                if job.is_empty()
+                    || job.len() > 128
+                    || !job
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return fail("job_id must be the one wallet_faucet returned");
+                }
+                let checked = async {
+                    self.faucet_ready().await?;
+                    self.faucet_wait(&ct, job, std::time::Duration::ZERO).await
+                };
+                match checked.await {
+                    Ok(done) => ok(done),
+                    Err(e) => fail(e),
+                }
+            }
+            _ => fail("give an account to fund, or the job_id of a drop to check, not both"),
+        }
+    }
+
+    async fn faucet_drop(&self, ct: &CancellationToken, account: &str) -> Result<Value, String> {
+        let id = guard::public_account_hex(account)?;
+        let w = self.ensure_wallet().await?;
+        if !w.is_agent(&id) {
+            return Err("the faucet only pays the agent's own accounts: give one wallet_accounts marks as an agent account".into());
+        }
+        let address = guard::account_id_base58(&id)
+            .map(|b58| format!("Public/{b58}"))
+            .ok_or("unreadable account id")?;
+        self.faucet_ready().await?;
+        // The faucet module serves one network at a time: the wallet's.
+        self.faucet_call("configure", &[Arg::str(&w.sequencer)])
+            .await?;
+        let started = self
+            .faucet_call("requestDrop", &[Arg::str(&address), Arg::str(uuid_v4()?)])
+            .await?;
+        let job = started["job_id"]
+            .as_str()
+            .ok_or_else(|| "lez_faucet started no job".to_string())?
+            .to_string();
+        self.faucet_wait(ct, &job, FAUCET_WAIT).await
+    }
+
+    /// Load lez_faucet when this server runs on its own; Basecamp loads it itself.
+    async fn faucet_ready(&self) -> Result<(), String> {
+        if !self.settings.host_owns_messaging {
+            self.load(FAUCET).await.map_err(faucet_error)?;
+        }
+        Ok(())
+    }
+
+    /// One lez_faucet call, its `{ok, error}` envelope unwrapped.
+    async fn faucet_call(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
+        let reply = self
+            .node
+            .call(FAUCET, method, args)
+            .await
+            .map(embedded_json)
+            .map_err(faucet_error)?;
+        if reply["ok"].as_bool() == Some(true) {
+            return Ok(reply);
+        }
+        let error = &reply["error"];
+        Err(error["message"]
+            .as_str()
+            .or(error["code"].as_str())
+            .map_or_else(
+                || format!("unexpected lez_faucet reply: {reply}"),
+                str::to_string,
+            ))
+    }
+
+    /// Follow a drop until it settles or `wait` runs out. A settled one is
+    /// acknowledged, so the module can forget it.
+    async fn faucet_wait(
+        &self,
+        ct: &CancellationToken,
+        job: &str,
+        wait: std::time::Duration,
+    ) -> Result<Value, String> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let now = self.faucet_call("jobStatus", &[Arg::str(job)]).await?;
+            let status = now["status"].as_str().unwrap_or_default().to_string();
+            if matches!(
+                status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+            ) {
+                let _ = self.faucet_call("jobResultAck", &[Arg::str(job)]).await;
+                return match status.as_str() {
+                    "succeeded" => {
+                        Ok(json!({ "status": status, "job_id": job, "receipt": now["result"] }))
+                    }
+                    "outcome_unknown" => Ok(json!({
+                        "status": status,
+                        "job_id": job,
+                        "note": "the faucet can't confirm whether it paid: check the account's balance with wallet_account before asking again",
+                    })),
+                    _ => Err(now["error"]["message"].as_str().map_or_else(
+                        || format!("the drop {status}: nothing was sent"),
+                        str::to_string,
+                    )),
+                };
+            }
+            let running = json!({
+                "status": status,
+                "job_id": job,
+                "phase": now["phase"],
+                "note": "still running: call wallet_faucet with this job_id to check again",
+            });
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(running);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                // The drop goes on without us: say how to find it.
+                () = ct.cancelled() => return Ok(running),
             }
         }
     }
