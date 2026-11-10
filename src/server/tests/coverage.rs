@@ -292,7 +292,11 @@ async fn chain_info_says_how_to_install_the_module() {
     }]);
     let r = server(fake, None).chain_info().await.unwrap();
     assert!(is_error(&r), "{}", text(&r));
-    assert!(text(&r).contains("package install blockchain_module"), "{}", text(&r));
+    assert!(
+        text(&r).contains("package install blockchain_module"),
+        "{}",
+        text(&r)
+    );
 }
 
 const HEADER: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
@@ -384,12 +388,23 @@ async fn rln_status_lists_the_memberships_of_the_registry() {
 #[tokio::test]
 async fn an_unreadable_membership_list_leaves_rln_status_standing() {
     let bad = r#"{"method":"get_memberships","module":"liblogos_rln_module","result":"{\"error\":{\"class\":\"permanent\",\"kind\":\"invalid_argument\",\"message\":\"bad registry\"}}","status":"ok"}"#;
-    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_ACTIVE), out(QUOTA_99), out(bad)]);
+    let fake = FakeRunner::with(vec![
+        out(RLN_READY),
+        out(MEMBERSHIP_ACTIVE),
+        out(QUOTA_99),
+        out(bad),
+    ]);
     let r = server(fake, None).rln_status().await.unwrap();
     assert!(!is_error(&r), "{}", text(&r));
     let b = body(&r);
     assert_eq!(b["can_send"], true, "{b}");
-    assert!(b["memberships_error"].as_str().unwrap().contains("bad registry"), "{b}");
+    assert!(
+        b["memberships_error"]
+            .as_str()
+            .unwrap()
+            .contains("bad registry"),
+        "{b}"
+    );
 }
 
 #[tokio::test]
@@ -414,4 +429,41 @@ fn last_call_named(fake: &FakeRunner, method: &str) -> Vec<String> {
         .find(|c| c.get(3).map(String::as_str) == Some(method))
         .expect("called")[2..]
         .to_vec()
+}
+
+#[tokio::test]
+async fn discovery_peers_lists_inbound_and_outbound_connections() {
+    let fake = FakeRunner::with(vec![
+        p2p("peerInfo", PEER_INFO),
+        p2p("start", "null"),
+        p2p("discoStart", "null"),
+        p2p(
+            "connectedPeers",
+            r#"["12D3KooWR2tcuzVsLXZ9K26L8oTpr55b5bFQa13VVad9cn9huXzW"]"#,
+        ),
+        p2p(
+            "connectedPeers",
+            r#"["16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc","16Uiu2HAmGBJ6wbRC2QGJreX3bA25g5yhMFajNVVKM9483CgcPkSu"]"#,
+        ),
+    ]);
+    let b = body(&wallet_server(fake.clone()).discovery_peers().await.unwrap());
+    assert_eq!(
+        b["peer_id"], "12D3KooWCkksEAUcgsSdPaznKfzcRtKgsEuXARXzog18fcNovQMh",
+        "{b}"
+    );
+    assert_eq!(b["inbound"].as_array().unwrap().len(), 1, "{b}");
+    assert_eq!(b["outbound"].as_array().unwrap().len(), 2, "{b}");
+    let calls = fake.calls.lock().unwrap();
+    // libp2p_module numbers the directions 0 for inbound and 1 for outbound.
+    assert_eq!(calls[3][3..], ["connectedPeers", "0"]);
+    assert_eq!(calls[4][3..], ["connectedPeers", "1"]);
+}
+
+#[tokio::test]
+async fn discovery_peers_needs_bootstrap_peers_like_the_other_discovery_tools() {
+    let fake = FakeRunner::with(vec![]);
+    let r = server(fake.clone(), None).discovery_peers().await.unwrap();
+    assert!(is_error(&r));
+    assert!(text(&r).contains("--discovery-bootstrap"), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
 }

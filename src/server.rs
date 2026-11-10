@@ -2390,6 +2390,32 @@ impl LogosServer {
         }
     }
 
+    #[tool(
+        description = "The peers this node's discovery network is connected to, inbound and outbound, and this node's own peer id."
+    )]
+    async fn discovery_peers(&self) -> Result<CallToolResult, McpError> {
+        let own = match self.ensure_discovery().await {
+            Ok(id) => id,
+            Err(e) => return fail(e),
+        };
+        let mut peers = serde_json::Map::new();
+        // libp2p_module numbers the directions 0 for inbound and 1 for outbound.
+        for (key, direction) in [("inbound", 0), ("outbound", 1)] {
+            match self
+                .node
+                .call(P2P, "connectedPeers", &[Arg::Int(direction)])
+                .await
+            {
+                Ok(list) => {
+                    peers.insert(key.into(), list);
+                }
+                Err(e) => return logos_fail(e),
+            }
+        }
+        peers.insert("peer_id".into(), json!(own));
+        ok(Value::Object(peers))
+    }
+
     /// One blockchain_module read, decoded when it comes back as a JSON string.
     async fn chain_read(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
         self.node
