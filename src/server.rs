@@ -34,7 +34,7 @@ const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
-const MAX_CHAT_BYTES: usize = 64 * 1024;
+pub const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
 /// How many seconds chat waits for a messaging node it just created to connect.
 const CONNECT_WAIT_TRIES: usize = 60;
@@ -158,12 +158,12 @@ impl TransferOutcome {
 
 /// Text another peer controls, made safe to show an agent: no control characters
 /// and at most 64 characters. It is still untrusted content.
-fn sanitise_peer_text(text: &str) -> String {
+pub fn sanitise_peer_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 /// The raw data a peer record carries under service entry `id`.
-fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
+pub fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
     record
         .get("services")?
         .as_array()?
@@ -834,7 +834,8 @@ impl LogosServer {
         })
     }
 
-    fn wallet(&self) -> Result<&WalletMode, String> {
+    /// The agent wallet's setup, or why wallet tools are off.
+    pub fn wallet(&self) -> Result<&WalletMode, String> {
         self.settings.wallet.as_ref().ok_or_else(|| {
             "wallet tools are disabled: start the server with --wallet-config and --wallet-storage"
                 .to_string()
