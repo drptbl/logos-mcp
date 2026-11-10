@@ -3011,3 +3011,21 @@ async fn an_unreadable_job_accounts_file_is_reported_not_ignored() {
         "{b}"
     );
 }
+
+#[tokio::test]
+async fn actions_taken_without_a_tool_call_show_in_the_activity() {
+    // logos-agents claims and refunds on its own: the user still sees them.
+    let log = Arc::new(ActivityLog::in_memory());
+    let s = wallet_server(FakeRunner::with(vec![])).with_activity(log.clone());
+    s.record_activity(
+        "auto:service_claim",
+        &json!({ "job": "j1" }),
+        true,
+        "claim tx t1",
+    );
+    let entries = log.since(0);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].tool, "auto:service_claim");
+    assert!(entries[0].args.contains("j1"), "{}", entries[0].args);
+    assert_eq!(entries[0].result, "claim tx t1");
+}
