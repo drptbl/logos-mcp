@@ -1,5 +1,5 @@
 module logos_mcp {
-  version "0.10.0"
+  version "0.10.1"
   description "MCP server for AI agents, inside Basecamp: messaging, chat, storage, wallet and discovery"
   method status() -> tstr
   method token() -> tstr

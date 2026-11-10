@@ -48,7 +48,6 @@ const FIRST_MESSAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// What rln_status says before the messaging node exists. A send then fails
 /// with its own clear error, so the RLN check lets it through.
 const NO_NODE: &str = "messaging node not created yet";
-/// How long wallet_transfer waits for the user before returning the request id.
 /// The wallet's gas limit when its config sets none.
 const DEFAULT_GAS_LIMIT: u64 = 2_000_000;
 /// LEZ's lowest base fee per unit of gas, for execution and for storage.
@@ -56,6 +55,7 @@ const BASE_FEE_MIN: u128 = 8;
 /// Storage gas allowance: a transaction's size in bytes. An escrow call was
 /// about 4.3 KB live.
 const TX_BYTES: u128 = 8 * 1024;
+/// How long wallet_transfer waits for the user before returning the request id.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
 const WATCH_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
