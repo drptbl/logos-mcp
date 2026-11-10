@@ -356,3 +356,49 @@ fn the_chain_tools_have_their_own_switch() {
     }
     assert!(groups.allows("wallet_status"));
 }
+
+// get_memberships as liblogos_rln_module 0.12.0 answered it on logos.test.
+const MEMBERSHIPS: &str = r#"{"method":"get_memberships","module":"liblogos_rln_module","result":"{\"memberships\":[{\"credential\":{\"identity_commitment\":\"e7a1\"},\"leaf_index\":17,\"membership_hash\":\"785e\",\"rate_limit\":100,\"registry_id\":\"logos:testnet:fd32\",\"rln_identifier\":\"5e26\",\"state\":\"active\",\"submitted_at\":1793984466,\"tx_result\":\"{}\"}]}","status":"ok"}"#;
+
+#[tokio::test]
+async fn rln_status_lists_the_memberships_of_the_registry() {
+    let fake = FakeRunner::with(vec![
+        out(RLN_READY),
+        out(MEMBERSHIP_ACTIVE),
+        out(QUOTA_99),
+        out(MEMBERSHIPS),
+    ]);
+    let b = body(&server(fake.clone(), None).rln_status().await.unwrap());
+    let m = &b["memberships"][0];
+    assert_eq!(m["state"], "active", "{b}");
+    assert_eq!(m["leaf_index"], 17, "{b}");
+    assert_eq!(m["rate_limit"], 100, "{b}");
+    assert!(m.get("credential").is_none(), "{b}");
+    assert!(m.get("tx_result").is_none(), "{b}");
+    assert_eq!(
+        last_call_named(&fake, "get_memberships")[2],
+        "str:logos:testnet:fd322d32a46ddf57eece9db8d68e9b722262d1f770760fca63b8cb9e7775b971"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_membership_list_leaves_rln_status_standing() {
+    let bad = r#"{"method":"get_memberships","module":"liblogos_rln_module","result":"{\"error\":{\"class\":\"permanent\",\"kind\":\"invalid_argument\",\"message\":\"bad registry\"}}","status":"ok"}"#;
+    let fake = FakeRunner::with(vec![out(RLN_READY), out(MEMBERSHIP_ACTIVE), out(QUOTA_99), out(bad)]);
+    let r = server(fake, None).rln_status().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["can_send"], true, "{b}");
+    assert!(b["memberships_error"].as_str().unwrap().contains("bad registry"), "{b}");
+}
+
+fn last_call_named(fake: &FakeRunner, method: &str) -> Vec<String> {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|c| c.get(3).map(String::as_str) == Some(method))
+        .expect("called")[2..]
+        .to_vec()
+}

@@ -1824,11 +1824,52 @@ impl LogosServer {
     async fn rln_status(&self) -> Result<CallToolResult, McpError> {
         match tool_json(self.rln_report().await) {
             Ok(mut report) => {
+                if let Some(registry) = report["registry_id"].as_str().map(str::to_string) {
+                    match self.memberships(&registry).await {
+                        Ok(list) => report["memberships"] = json!(list),
+                        Err(e) => report["memberships_error"] = json!(e),
+                    }
+                }
                 report["network"] = json!(self.network().await);
                 ok(report)
             }
             Err(e) => fail(e),
         }
+    }
+
+    /// This node's memberships in `registry`, with only the fields an agent needs:
+    /// never the credential.
+    async fn memberships(&self, registry: &str) -> Result<Vec<Value>, String> {
+        let found = self
+            .node
+            .call(RLN, "get_memberships", &[Arg::str(registry)])
+            .await
+            .map(embedded_json)
+            .map_err(|e| e.to_string())?;
+        if let Some(error) = found.get("error") {
+            return Err(error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_string));
+        }
+        let list = found
+            .get("memberships")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("unexpected get_memberships reply: {found}"))?;
+        Ok(list
+            .iter()
+            .map(|m| {
+                json!({
+                    "state": m.get("state"),
+                    "leaf_index": m.get("leaf_index"),
+                    "rate_limit": m.get("rate_limit"),
+                    "registry_id": m.get("registry_id"),
+                    "rln_identifier": m.get("rln_identifier"),
+                    "membership_hash": m.get("membership_hash"),
+                    "submitted_at": m.get("submitted_at"),
+                })
+            })
+            .collect())
     }
 
     /// What rln_status reports, without the network: the check before every send.
@@ -1905,6 +1946,7 @@ impl LogosServer {
         };
         ok(json!({
             "rln": "on",
+            "registry_id": registry,
             "can_send": reason.is_none(),
             "reason": reason,
             "membership": {
