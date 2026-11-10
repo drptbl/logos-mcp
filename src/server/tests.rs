@@ -2669,11 +2669,13 @@ async fn concurrent_first_chat_status_calls_start_chat_once() {
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
         node_enr(ENR_LOGOS_DEV),
+        chat("health", "true"),
         // The second call finds chat already running.
         out(CHAT_LOADED),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
         node_enr(ENR_LOGOS_DEV),
+        chat("health", "true"),
     ]);
     let s = server(fake.clone(), None);
     let (a, b) = tokio::join!(s.chat_status(), s.chat_status());

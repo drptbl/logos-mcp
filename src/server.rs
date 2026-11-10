@@ -1648,11 +1648,19 @@ impl LogosServer {
         } else {
             "chat is still connecting: call chat_status again in a few seconds before sending"
         };
+        let network = self.network().await;
+        let healthy = self
+            .node
+            .call(CHAT, "health", &[])
+            .await
+            .ok()
+            .and_then(|v| v.as_bool());
         ok(json!({
             "address": address,
-            "network": self.network().await,
+            "network": network,
             "delivery_state": state,
             "detail": status["detail"],
+            "healthy": healthy,
             "conversations": status["convo_count"],
             "started_now": started_now,
             "note": note,

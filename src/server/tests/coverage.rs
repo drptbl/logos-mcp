@@ -392,6 +392,19 @@ async fn an_unreadable_membership_list_leaves_rln_status_standing() {
     assert!(b["memberships_error"].as_str().unwrap().contains("bad registry"), "{b}");
 }
 
+#[tokio::test]
+async fn chat_status_says_whether_chat_is_healthy() {
+    let fake = FakeRunner::with(vec![
+        out(CHAT_LOADED),
+        chat("get_address", &format!(r#""{SELF_ADDR}""#)),
+        chat("status", CHAT_ONLINE),
+        node_enr(ENR_LOGOS_TEST),
+        chat("health", "true"),
+    ]);
+    let b = body(&server(fake, None).chat_status().await.unwrap());
+    assert_eq!(b["healthy"], true, "{b}");
+}
+
 fn last_call_named(fake: &FakeRunner, method: &str) -> Vec<String> {
     fake.calls
         .lock()
