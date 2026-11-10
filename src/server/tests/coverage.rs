@@ -1366,3 +1366,39 @@ async fn the_faucet_only_checks_drops_this_server_started() {
     assert!(is_error(&r), "{}", text(&r));
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn an_unconfirmed_drop_passes_on_the_faucets_reason() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet("requestDrop", json!({ "ok": true, "job_id": "job-2", "status": "queued" })),
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "job-2", "status": "outcome_unknown",
+                    "error": { "code": "unconfirmed", "message": "The claim was submitted but its outcome could not be confirmed in time." } }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["status"], "outcome_unknown", "{b}");
+    assert!(
+        b["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not be confirmed"),
+        "{b}"
+    );
+}

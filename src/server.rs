@@ -2431,6 +2431,7 @@ impl LogosServer {
                     "outcome_unknown" => Ok(json!({
                         "status": status,
                         "job_id": job,
+                        "reason": now["error"]["message"],
                         "note": "the faucet can't confirm whether it paid: check the account's balance with wallet_account before asking again",
                     })),
                     _ => Err(now["error"]["message"].as_str().map_or_else(
