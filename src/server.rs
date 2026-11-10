@@ -769,6 +769,57 @@ impl LogosServer {
         }
     }
 
+    /// Call a tool from `router` on `service` as this server calls its own:
+    /// refused when the user switched its group off, and recorded in the
+    /// activity log. Crates that add tools on top of this server call theirs
+    /// this way.
+    pub async fn guarded_call<S: Send + Sync + 'static>(
+        &self,
+        router: &ToolRouter<S>,
+        service: &S,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let args = Value::Object(request.arguments.clone().unwrap_or_default());
+        let response = if self.allows(&tool) {
+            let tcc = rmcp::handler::server::tool::ToolCallContext::new(service, request, context);
+            router.call(tcc).await
+        } else {
+            let group = ToolGroups::group_of(&tool).unwrap_or("this");
+            fail(format!(
+                "the user turned off the {group} tools in the Agent app"
+            ))
+            .map(Into::into)
+        };
+        if let Some(log) = &self.activity {
+            let (ok, result) = match &response {
+                Ok(rmcp::model::CallToolResponse::Complete(r)) => (
+                    r.is_error != Some(true),
+                    r.content
+                        .first()
+                        .and_then(|c| c.as_text())
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default(),
+                ),
+                Ok(_) => (true, "waiting for input".to_string()),
+                Err(e) => (false, e.message.to_string()),
+            };
+            log.record(&tool, &args, ok, &result);
+        }
+        response
+    }
+
+    /// Whether the user approves each transfer.
+    pub fn asks_before_transfer(&self) -> bool {
+        self.tool_groups.borrow().ask_before_transfer
+    }
+
+    /// Where a transfer that waited for the user's approval stands.
+    pub fn approval_status(&self, request_id: &str) -> Option<Value> {
+        self.approvals.status(request_id)
+    }
+
     pub fn allows(&self, tool: &str) -> bool {
         self.tool_groups.borrow().allows(tool)
     }
@@ -2209,34 +2260,8 @@ impl ServerHandler for LogosServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
-        let tool = request.name.to_string();
-        let args = Value::Object(request.arguments.clone().unwrap_or_default());
-        let response = if self.allows(&tool) {
-            let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-            self.tool_router.call(tcc).await
-        } else {
-            let group = ToolGroups::group_of(&tool).unwrap_or("this");
-            fail(format!(
-                "the user turned off the {group} tools in the Agent app"
-            ))
-            .map(Into::into)
-        };
-        if let Some(log) = &self.activity {
-            let (ok, result) = match &response {
-                Ok(rmcp::model::CallToolResponse::Complete(r)) => (
-                    r.is_error != Some(true),
-                    r.content
-                        .first()
-                        .and_then(|c| c.as_text())
-                        .map(|t| t.text.clone())
-                        .unwrap_or_default(),
-                ),
-                Ok(_) => (true, "waiting for input".to_string()),
-                Err(e) => (false, e.message.to_string()),
-            };
-            log.record(&tool, &args, ok, &result);
-        }
-        response
+        self.guarded_call(&self.tool_router, self, request, context)
+            .await
     }
 
     fn get_info(&self) -> ServerConfig {
