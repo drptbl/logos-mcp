@@ -116,6 +116,17 @@ pub fn public_account_hex(input: &str) -> Result<String, String> {
 
 /// A positive amount in lepta, given as a decimal string, encoded the way
 /// `lez_core` takes it: 16 bytes little-endian as 32 hex characters.
+/// An account as `Public/<base58>`, `Private/<base58>` or 64 hex characters
+/// (public): its id in hex, and whether it is private.
+pub fn account_hex(input: &str) -> Result<(String, bool), String> {
+    match input.strip_prefix("Private/") {
+        Some(b58) => public_account_hex(&format!("Public/{b58}"))
+            .map(|hex| (hex, true))
+            .map_err(|_| "a private account is Private/<base58>".to_string()),
+        None => public_account_hex(input).map(|hex| (hex, false)),
+    }
+}
+
 pub fn amount_le16_hex(lepta: &str) -> Result<String, String> {
     if lepta.is_empty() || !lepta.chars().all(|c| c.is_ascii_digit()) {
         return Err("amount must be a whole number of lepta, as digits".into());

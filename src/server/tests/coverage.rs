@@ -1,0 +1,239 @@
+//! The read-only tools that round out node coverage: wallet accounts, labels
+//! and transactions, the Logos chain, RLN memberships, chat health and peers.
+
+use super::*;
+
+/// The replies `ensure_wallet` reads when it opens the agent wallet, with the
+/// sequencer at `sequencer`.
+fn opened_with_sequencer(sequencer: &str) -> Vec<crate::logosctl::RawOutput> {
+    vec![
+        lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
+        lez("open", "0"),
+        lez("get_sequencer_addr", &format!("{sequencer:?}")),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        daemon_status(80675, 301),
+    ]
+}
+
+const PROGRAM_HEX: &str = "f9eba477278c918fadafbcb4a6463e947d0fd8de344b5431ee0aa3cd41d7e3a4";
+
+fn last_call(fake: &FakeRunner) -> Vec<String> {
+    fake.calls.lock().unwrap().last().unwrap()[2..].to_vec()
+}
+
+#[tokio::test]
+async fn an_account_shows_its_balance_nonce_and_program_data() {
+    let mut replies = opened_by_server();
+    let account = json!({
+        "nonce": "01000000000000000000000000000000",
+        "shards": [{ "program": PROGRAM_HEX, "data": "0a0b" }]
+    })
+    .to_string();
+    replies.push(lez(
+        "get_account_public",
+        &serde_json::to_string(&account).unwrap(),
+    ));
+    replies.push(lez("get_balance", r#""250""#));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_account(Parameters(AccountParams {
+            account: AGENT_FROM.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["address"], AGENT_FROM, "{b}");
+    assert_eq!(b["account_id"], AGENT_ID, "{b}");
+    assert_eq!(b["balance_lepta"], "250", "{b}");
+    assert_eq!(b["nonce"], 1, "{b}");
+    assert_eq!(b["programs"][0]["program_id"], PROGRAM_HEX, "{b}");
+    assert_eq!(
+        b["programs"][0]["program"], "HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d",
+        "{b}"
+    );
+    assert_eq!(b["programs"][0]["data_hex"], "0a0b", "{b}");
+}
+
+#[tokio::test]
+async fn a_malformed_account_is_refused_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .wallet_account(Parameters(AccountParams {
+            account: "not an account".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_label_resolves_to_its_account() {
+    let mut replies = opened_by_server();
+    // lez_core answers with the account's kind and its id in hex.
+    replies.push(lez("resolve_label", &format!("\"Public/{AGENT_ID}\"")));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_labels(Parameters(LabelsParams {
+            label: Some("alice".into()),
+            account: None,
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["account"], AGENT_FROM, "{b}");
+    assert_eq!(b["account_id"], AGENT_ID, "{b}");
+    assert_eq!(b["private"], false, "{b}");
+    assert_eq!(last_call(&fake)[2], "str:alice");
+}
+
+#[tokio::test]
+async fn an_unknown_label_says_so() {
+    let mut replies = opened_by_server();
+    replies.push(lez("resolve_label", r#""""#));
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_labels(Parameters(LabelsParams {
+            label: Some("nobody".into()),
+            account: None,
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["account"], Value::Null, "{b}");
+}
+
+#[tokio::test]
+async fn an_account_lists_its_labels() {
+    let mut replies = opened_by_server();
+    replies.push(lez("get_all_labels_for_account", r#"["alice","shop"]"#));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_labels(Parameters(LabelsParams {
+            label: None,
+            account: Some(AGENT_FROM.into()),
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["labels"], json!(["alice", "shop"]), "{b}");
+    let call = last_call(&fake);
+    assert_eq!(call[2], format!("str:{AGENT_ID}"));
+    assert_eq!(call[3], "false");
+}
+
+#[tokio::test]
+async fn labels_take_a_label_or_an_account_not_both() {
+    let fake = FakeRunner::with(vec![]);
+    for (label, account) in [
+        (None, None),
+        (Some("a".to_string()), Some(AGENT_FROM.to_string())),
+    ] {
+        let r = wallet_server(fake.clone())
+            .wallet_labels(Parameters(LabelsParams { label, account }))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// A sequencer on localhost that answers one JSON-RPC call with `result`,
+/// and hands back the request it saw.
+async fn fake_sequencer(result: Value) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let served = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        // Read the headers and the JSON body after them.
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            seen.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&seen).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if seen.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let reply = json!({ "jsonrpc": "2.0", "id": 1, "result": result }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&seen).to_string()
+    });
+    (url, served)
+}
+
+const TX: &str = "1f0f6eafe1e058d5d657cd26972de2a0ea3de547eae66b758f6531a516deae1c";
+
+#[tokio::test]
+async fn a_landed_transaction_is_reported_included() {
+    let (url, served) = fake_sequencer(json!(["AAEC"])).await;
+    let s = wallet_server(FakeRunner::with(opened_with_sequencer(&url)));
+    let r = s
+        .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["included"], true, "{}", text(&r));
+    let request = served.await.unwrap();
+    assert!(request.contains("getTransaction"), "{request}");
+    assert!(request.contains(TX), "{request}");
+}
+
+#[tokio::test]
+async fn a_transaction_not_landed_is_reported_not_included() {
+    let (url, _served) = fake_sequencer(Value::Null).await;
+    let s = wallet_server(FakeRunner::with(opened_with_sequencer(&url)));
+    let r = s
+        .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["included"], false, "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_malformed_tx_hash_is_refused_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .wallet_tx_status(Parameters(TxParams {
+            tx_hash: "abc".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn wallet_status_shows_how_far_private_state_is_synced() {
+    let mut replies = opened_by_server();
+    replies.push(lez("get_current_block_height", "80205"));
+    replies.push(lez("get_last_synced_block", "80100"));
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_status()
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["block_height"], 80205, "{b}");
+    assert_eq!(b["private_synced_block"], 80100, "{b}");
+}

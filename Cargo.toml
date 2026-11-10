@@ -39,6 +39,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "fs"] }
 tokio-util = "0.7"
 tracing = "0.1.44"
+# The sequencer, asked directly: lez_core has no transaction lookup that doesn't block.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
