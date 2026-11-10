@@ -35,7 +35,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `discovery_lookup` | finds nodes that advertise a service |
 | `discovery_peers` | the peers the discovery node is connected to, inbound and outbound |
 | `chain_info` | the Logos chain's id, consensus tip, slot timing and network peers |
-| `chain_block` / `chain_transaction` | a chain block by its header id, or a chain transaction by its hash |
+| `chain_block` / `chain_transaction` | a chain block and its transactions by its header id, or a transaction still waiting in the mempool by its hash. The node finds a mined transaction only through its block |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
