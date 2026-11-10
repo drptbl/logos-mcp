@@ -1194,3 +1194,50 @@ async fn malformed_chain_transfers_are_refused_without_touching_the_node() {
     }
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+/// Approve a chain transfer whose send gets `reply`, and return the agent's answer.
+async fn approved_chain_send(reply: crate::logosctl::RawOutput) -> CallToolResult {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.extend(chain_sender_ok());
+    replies.push(reply);
+    let s = hosted_server(FakeRunner::with(replies));
+    let (call, id) = request_chain_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    call.await.unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_chain_send_may_still_have_gone_out() {
+    // The node may refuse after broadcasting, so a refusal is never "not sent".
+    let r = approved_chain_send(chain_refused("wallet_transfer_funds", "timed out")).await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_without_a_hash_may_have_gone_out() {
+    let r = approved_chain_send(chain("wallet_transfer_funds", Value::Null)).await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_reporting_its_hash_in_an_object_is_sent() {
+    let r = approved_chain_send(chain("wallet_transfer_funds", json!({ "tx_hash": TX }))).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], TX);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_whose_balance_fell_meanwhile_is_not_sent() {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.push(chain_sender_ok()[0].clone());
+    replies.push(chain("wallet_get_balance", json!("10")));
+    let fake = FakeRunner::with(replies);
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(chain_sends(&fake).is_empty());
+}

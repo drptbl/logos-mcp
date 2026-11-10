@@ -2279,8 +2279,7 @@ impl LogosServer {
                     "the chain node gave no transaction hash ({other}): it may have been sent, check chain_wallet"
                 ))),
             },
-            // The module turned it down before sending.
-            Err(LogosError::Refused(reason)) => Err(SendError::NotSent(reason)),
+            // Even a refusal may come after the broadcast, so never claim it wasn't sent.
             Err(e) => Err(SendError::MaybeSent(format!(
                 "{e}: it may have been sent, check chain_wallet before trying again"
             ))),
