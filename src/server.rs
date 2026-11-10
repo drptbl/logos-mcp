@@ -2425,6 +2425,15 @@ impl LogosServer {
         ok(Value::Object(peers))
     }
 
+    /// Load blockchain_module when this server runs on its own. In Basecamp the
+    /// Blockchain app loads it.
+    async fn chain_ready(&self) -> Result<(), String> {
+        if !self.settings.host_owns_messaging {
+            self.load(BLOCKCHAIN).await.map_err(chain_error)?;
+        }
+        Ok(())
+    }
+
     /// One blockchain_module read, decoded when it comes back as a JSON string.
     async fn chain_read(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
         self.node
@@ -2438,6 +2447,9 @@ impl LogosServer {
         description = "The Logos chain as this node's blockchain_module sees it: chain id, consensus tip and height, slot timing and network peers. Needs the chain node running."
     )]
     async fn chain_info(&self) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
         let mut info = serde_json::Map::new();
         for (key, method) in [
             ("chain_id", "get_chain_id"),
@@ -2464,6 +2476,9 @@ impl LogosServer {
             Ok(id) => id,
             Err(e) => return fail(e),
         };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
         match self.chain_read("get_block", &[Arg::str(&id)]).await {
             Ok(block) => ok(json!({ "header_id": id, "block": block })),
             Err(e) => fail(e),
@@ -2481,6 +2496,9 @@ impl LogosServer {
             Ok(tx) => tx,
             Err(e) => return fail(e),
         };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
         match self.chain_read("get_transaction", &[Arg::str(&tx)]).await {
             Ok(found) => ok(json!({ "tx_hash": tx, "transaction": found })),
             Err(e) => fail(e),
