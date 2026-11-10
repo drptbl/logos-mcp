@@ -126,6 +126,7 @@ Every flag also has an environment variable.
 | `--wallet-config` | `LOGOS_MCP_WALLET_CONFIG` | none | the agent wallet's `lez_core` config, wallet tools are off without it |
 | `--wallet-storage` | `LOGOS_MCP_WALLET_STORAGE` | none | the agent wallet's key storage |
 | `--discovery-bootstrap` | `LOGOS_MCP_DISCOVERY_BOOTSTRAP` | none | discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them |
+| `--timeout-secs` | | `60` | timeout for each `logosctl` call |
 
 Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
 
@@ -135,7 +136,10 @@ logosctl call lez_core save
 ```
 
 The reply carries the wallet's recovery phrase, so keep it somewhere safe.
-| `--timeout-secs` | | `60` | timeout for each `logosctl` call |
+
+Every LEZ transaction holds back a fee reserve of the wallet's `gas_limit` times the base fee. A `gas_limit` of about 200,000 in `wallet_config.json` keeps that near 1.7M lepta.
+
+The `logos.dev` fleet publishes discovery peers (`libp2p_multiaddr` and `libp2p_peer_id`) at https://fleets.logos.co/data.json.
 
 ## Run it inside Basecamp
 
