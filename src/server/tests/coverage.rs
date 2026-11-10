@@ -623,3 +623,40 @@ async fn wallet_status_keeps_sequencer_credentials_out() {
     );
     assert_eq!(b["sequencer"], "https://seq.example/rpc", "{b}");
 }
+
+#[tokio::test]
+async fn chain_blocks_reads_a_slot_range() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain(
+            "get_blocks",
+            json!("[{\"header\":{\"slot\":101}},{\"header\":{\"slot\":105}}]"),
+        ),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_blocks(Parameters(SlotRangeParams {
+                from_slot: 100,
+                to_slot: 110,
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["blocks"].as_array().unwrap().len(), 2, "{b}");
+    assert_eq!(b["blocks"][1]["header"]["slot"], 105, "{b}");
+    assert_eq!(last_call(&fake)[1..], ["get_blocks", "100", "110"]);
+}
+
+#[tokio::test]
+async fn chain_blocks_refuses_a_backwards_or_huge_range_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    for (from_slot, to_slot) in [(10, 9), (0, MAX_SLOT_RANGE + 1), (u64::MAX - 1, u64::MAX)] {
+        let r = s
+            .chain_blocks(Parameters(SlotRangeParams { from_slot, to_slot }))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{from_slot}..{to_slot}: {}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}

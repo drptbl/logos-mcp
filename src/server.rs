@@ -340,6 +340,17 @@ pub struct HeaderParams {
     pub header_id: String,
 }
 
+/// The most slots chain_blocks reads at once: about ten minutes of chain.
+pub const MAX_SLOT_RANGE: u64 = 600;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SlotRangeParams {
+    /// The first slot, inclusive. chain_info's consensus slot is the latest.
+    pub from_slot: u64,
+    /// The last slot, inclusive. At most 600 slots after from_slot.
+    pub to_slot: u64,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChainTxParams {
     /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
@@ -2479,6 +2490,35 @@ impl LogosServer {
                 "consensus": consensus,
                 "time": time,
                 "network": network,
+            })),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(
+        description = "The Logos chain blocks in a range of slots, oldest first, at most 600 slots at a time. Needs the chain node running, and only returns blocks it has synced."
+    )]
+    async fn chain_blocks(
+        &self,
+        Parameters(p): Parameters<SlotRangeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.to_slot < p.from_slot || p.to_slot - p.from_slot > MAX_SLOT_RANGE {
+            return fail(format!(
+                "give from_slot <= to_slot, at most {MAX_SLOT_RANGE} slots apart"
+            ));
+        }
+        let (Ok(from), Ok(to)) = (i64::try_from(p.from_slot), i64::try_from(p.to_slot)) else {
+            return fail("slot out of range");
+        };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
+        let range = [Arg::Int(from), Arg::Int(to)];
+        match self.chain_read("get_blocks", &range).await {
+            Ok(blocks) => ok(json!({
+                "from_slot": p.from_slot,
+                "to_slot": p.to_slot,
+                "blocks": blocks,
             })),
             Err(e) => fail(e),
         }
