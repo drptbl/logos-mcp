@@ -303,11 +303,11 @@ pub struct TransferParams {
     pub to: String,
     /// Amount in lepta as a decimal string (1 LEZ = 1,000,000,000 lepta).
     pub amount_lepta: String,
-    /// Locks the amount in escrow instead, `to` being the job's account. Only
-    /// service_pay sets it: agents can't.
+    /// Moves the amount through this program call instead, `to` being its
+    /// first account. Only code sets it: agents can't.
     #[serde(skip)]
     #[schemars(skip)]
-    pub escrow: Option<crate::control::EscrowOpen>,
+    pub call: Option<crate::control::ProgramCall>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,57 +397,12 @@ impl From<&str> for SendError {
     }
 }
 
-/// The `send_generic_public_transaction` arguments that open an escrow job:
-/// the buyer `from` signs and pays its fee, `to` must be the job's account.
-fn escrow_open(
-    from: &str,
-    to: &str,
-    amount_lepta: &str,
-    terms: &crate::control::EscrowOpen,
-) -> Result<Vec<Arg>, SendError> {
-    use crate::escrow::{Instruction, PROGRAM_ID_HEX, job_account};
-    let id = |hex: &str| -> Option<[u8; 32]> {
-        (hex.len() == 64)
-            .then(|| {
-                (0..32)
-                    .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
-                    .collect::<Option<Vec<u8>>>()?
-                    .try_into()
-                    .ok()
-            })
-            .flatten()
-    };
-    let (Some(buyer), Some(job), Some(job_ref)) = (id(from), id(to), id(&terms.job_ref)) else {
-        return Err("escrow payment: an account or the job reference is not 32 bytes".into());
-    };
-    if job_account(&buyer, &job_ref) != job {
-        return Err("escrow payment: the recipient isn't this job's escrow account".into());
-    }
-    let provider = guard::public_account_hex(&terms.provider)
-        .ok()
-        .and_then(|h| id(&h))
-        .ok_or("escrow payment: the provider account is not a public account")?;
-    let amount: u128 = amount_lepta
-        .parse()
-        .map_err(|_| "escrow payment: the amount is not a number")?;
-    // The provider is paid to the account it quoted, and the deposit goes
-    // back to the account that paid it.
-    let open = Instruction::Open {
-        job_ref,
-        provider,
-        pay_to: provider,
-        refund_to: buyer,
-        amount,
-        deadline: terms.deadline,
-    };
-    Ok(vec![
-        Arg::Json(json!([from, to])),
-        Arg::Json(json!([true, false])),
-        Arg::Bytes(open.encode()),
-        Arg::str(PROGRAM_ID_HEX),
-        Arg::str(""),
-        Arg::Json(json!([])),
-    ])
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 /// A submitted transfer, as wallet_transfer reports it.
@@ -615,7 +570,7 @@ impl LogosServer {
                 from: request.from,
                 to: request.to,
                 amount_lepta: request.amount_lepta,
-                escrow: request.escrow,
+                call: request.call,
             };
             let outcome = match server
                 .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
@@ -790,10 +745,10 @@ impl LogosServer {
         (u128::from(gas_limit) + TX_BYTES) * BASE_FEE_MIN
     }
 
-    /// Refuse an escrow open `from` can't pay for: the wallet only checks the
-    /// fee, so an open short of price plus fee goes out, is refused on
-    /// chain, and still costs the whole reserve.
-    async fn check_open_funds(&self, from: &str, amount: u128) -> Result<(), String> {
+    /// Refuse a program call `from` can't pay for: the wallet only checks the
+    /// fee, so a call short of amount plus fee goes out, is refused on chain,
+    /// and still costs the whole reserve.
+    async fn check_call_funds(&self, from: &str, amount: u128) -> Result<(), String> {
         let id = guard::public_account_hex(from)?;
         let held = match self
             .node
@@ -803,11 +758,11 @@ impl LogosServer {
             Ok(Value::String(b)) => b.parse::<u128>().ok(),
             _ => None,
         }
-        .ok_or_else(|| format!("can't read {from}'s balance: not opening the escrow"))?;
+        .ok_or_else(|| format!("can't read {from}'s balance: nothing was sent"))?;
         let reserve = self.fee_reserve().await;
         if held < amount.saturating_add(reserve) {
             return Err(format!(
-                "{from} holds {held} lepta, less than the {amount} lepta price plus the network's {reserve} lepta fee reserve: not opening the escrow"
+                "{from} holds {held} lepta, less than the {amount} lepta it would move plus the network's {reserve} lepta fee reserve: nothing was sent"
             ));
         }
         Ok(())
@@ -1596,7 +1551,7 @@ impl LogosServer {
         let (id, mut decision) =
             match self
                 .approvals
-                .request(&p.from, &p.to, &p.amount_lepta, p.escrow.clone())
+                .request(&p.from, &p.to, &p.amount_lepta, p.call.clone())
             {
                 Ok(filed) => filed,
                 Err(e) => return fail(e),
@@ -1707,24 +1662,20 @@ impl LogosServer {
         if from == to {
             return Err("sender and recipient are the same account".into());
         }
-        // An escrow open the chain would refuse still costs its whole fee.
+        // A program call the chain would refuse still costs its whole fee.
         // Checked here, after any approval wait and before the last looks.
-        if let Some(terms) = &p.escrow {
-            if guard::public_account_hex(&terms.provider).ok().as_deref() == Some(from.as_str()) {
-                return Err(
-                    "escrow payment: the quote names the paying account as its provider".into(),
-                );
+        if let Some(call) = &p.call {
+            if call.accounts.first() != Some(&to) {
+                return Err("program call: the recipient isn't the call's first account".into());
             }
-            if jobs::too_late_for(terms.deadline) {
-                return Err(
-                    "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
-                );
+            if call.send_by_ms.is_some_and(|t| now_ms() >= t) {
+                return Err("too late to send this payment: nothing was sent".into());
             }
             let amount = p
                 .amount_lepta
                 .parse()
-                .map_err(|_| "escrow payment: the amount is not a number")?;
-            self.check_open_funds(&p.from, amount).await?;
+                .map_err(|_| "the amount is not a number")?;
+            self.check_call_funds(&p.from, amount).await?;
         }
         if ct.is_cancelled() {
             return Err("transfer cancelled before sending: nothing was sent".into());
@@ -1742,13 +1693,25 @@ impl LogosServer {
         if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
             return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
         }
-        let reply = match &p.escrow {
+        let reply = match &p.call {
             None => {
                 let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
                 self.node.call(LEZ, "transfer_public", &args).await
             }
-            Some(terms) => {
-                let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
+            Some(call) => {
+                let mut ids = vec![from.clone()];
+                ids.extend(call.accounts.iter().cloned());
+                let signs: Vec<bool> = std::iter::once(true)
+                    .chain(call.accounts.iter().map(|_| false))
+                    .collect();
+                let open = [
+                    Arg::Json(json!(ids)),
+                    Arg::Json(json!(signs)),
+                    Arg::Bytes(call.instruction.clone()),
+                    Arg::str(&call.program_id_hex),
+                    Arg::str(""),
+                    Arg::Json(json!([])),
+                ];
                 self.node
                     .call(LEZ, "send_generic_public_transaction", &open)
                     .await

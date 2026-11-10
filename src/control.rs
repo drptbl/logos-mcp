@@ -144,20 +144,29 @@ pub struct TransferRequest {
     pub amount_lepta: String,
     /// Unix seconds.
     pub requested_at: u64,
-    /// Set when the payment locks the amount in escrow, `to` being the job's account.
+    /// Set when the amount moves through a program call, such as an escrow
+    /// open, instead of a plain transfer.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub escrow: Option<EscrowOpen>,
+    pub call: Option<ProgramCall>,
 }
 
-/// The terms a payment into escrow locks the amount under.
+/// A program call that moves the amount out of `from` in place of a plain
+/// transfer, such as opening an escrow. Code builds it, never an agent: it
+/// goes through the same checks and approval as a transfer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct EscrowOpen {
-    /// The job reference, 64 hex characters.
-    pub job_ref: String,
-    /// The provider account the escrow pays, `Public/<base58>`.
-    pub provider: String,
-    /// Delivery deadline, milliseconds since the Unix epoch.
-    pub deadline: u64,
+pub struct ProgramCall {
+    /// The program, 64 hex characters.
+    pub program_id_hex: String,
+    /// The accounts after the signing `from`, 64 hex characters each. The
+    /// first is the transfer's `to`.
+    pub accounts: Vec<String>,
+    /// The instruction, as the program decodes it.
+    #[serde(skip)]
+    pub instruction: Vec<u8>,
+    /// What the user approves, as a clause after "from <account>".
+    pub description: String,
+    /// Milliseconds since the Unix epoch: not sent at or after this.
+    pub send_by_ms: Option<u64>,
 }
 
 struct Pending {
@@ -187,7 +196,7 @@ impl Approvals {
         from: &str,
         to: &str,
         amount_lepta: &str,
-        escrow: Option<EscrowOpen>,
+        call: Option<ProgramCall>,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         // Unique across restarts too, so an old id never names a new request.
         let id = format!(
@@ -218,7 +227,7 @@ impl Approvals {
                     to: to.to_string(),
                     amount_lepta: amount_lepta.to_string(),
                     requested_at: unix_now(),
-                    escrow,
+                    call,
                 },
                 expires: tokio::time::Instant::now() + APPROVAL_EXPIRES,
                 decision,

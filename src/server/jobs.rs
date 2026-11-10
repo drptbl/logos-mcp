@@ -142,6 +142,54 @@ impl EscrowJob {
     }
 }
 
+impl EscrowJob {
+    /// The escrow open as a program call: the provider is paid to the account
+    /// it quoted, and the deposit goes back to the account that paid it. Not
+    /// sent once too late for the provider to deliver.
+    fn open_call(&self) -> crate::control::ProgramCall {
+        let open = Instruction::Open {
+            job_ref: self.job_ref,
+            provider: self.provider,
+            pay_to: self.provider,
+            refund_to: self.buyer,
+            amount: self.amount,
+            deadline: self.deadline,
+        };
+        crate::control::ProgramCall {
+            program_id_hex: escrow::PROGRAM_ID_HEX.to_string(),
+            accounts: vec![id_hex(&self.account)],
+            instruction: open.encode(),
+            description: format!(
+                "into escrow for {}, refunded if nothing is delivered by {}",
+                self.provider_address,
+                utc(self.deadline)
+            ),
+            send_by_ms: Some(self.deadline.saturating_sub(DEADLINE_MARGIN_MS)),
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch as a UTC date and time, to the minute.
+pub(super) fn utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = i64::try_from(days).unwrap_or(i64::MAX) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
+}
+
 fn id_hex(id: &Id) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1794,15 +1842,17 @@ impl LogosServer {
                 q.network
             ));
         }
-        let (to, terms) = match &escrow {
-            Some(e) => (
-                id_hex(&e.account),
-                Some(crate::control::EscrowOpen {
-                    job_ref: id_hex(&e.job_ref),
-                    provider: e.provider_address.clone(),
-                    deadline: e.deadline,
-                }),
-            ),
+        let (to, call) = match &escrow {
+            Some(e) => {
+                // The program refuses it, and a refused call still costs its whole fee.
+                if e.buyer == e.provider {
+                    return Err(
+                        "the quote names the paying account as its provider: not paying into it"
+                            .into(),
+                    );
+                }
+                (id_hex(&e.account), Some(e.open_call()))
+            }
             None => (q.pay_to.clone(), None),
         };
         // An escrow payment is noted before it is asked for, so a restart
@@ -1831,7 +1881,7 @@ impl LogosServer {
                     from: p.from.clone(),
                     to,
                     amount_lepta: q.price_lepta.clone(),
-                    escrow: terms,
+                    call,
                 }),
             )
             .await,
