@@ -2446,6 +2446,19 @@ impl LogosServer {
             .map_err(chain_error)
     }
 
+    /// A block or transaction by id: None when the node doesn't hold it.
+    async fn chain_lookup(&self, method: &str, id: &str) -> Result<Option<Value>, String> {
+        match self.node.call(BLOCKCHAIN, method, &[Arg::str(id)]).await {
+            Ok(found) => Ok(Some(embedded_json(found))),
+            // blockchain_module 0.3.4 answers "No block found for header id [..]" and
+            // "No transaction found for hash TxHash([..])".
+            Err(LogosError::Refused(m)) if m.starts_with("No ") && m.contains(" found for ") => {
+                Ok(None)
+            }
+            Err(e) => Err(chain_error(e)),
+        }
+    }
+
     #[tool(
         description = "The Logos chain as this node's blockchain_module sees it: chain id, consensus tip and height, slot timing and network peers. Needs the chain node running."
     )]
@@ -2470,7 +2483,9 @@ impl LogosServer {
         ok(Value::Object(info))
     }
 
-    #[tool(description = "A Logos chain block, by its header id. Needs the chain node running.")]
+    #[tool(
+        description = "A Logos chain block with its transactions, by its header id. Needs the chain node running, and only finds blocks it has synced."
+    )]
     async fn chain_block(
         &self,
         Parameters(p): Parameters<HeaderParams>,
@@ -2482,14 +2497,19 @@ impl LogosServer {
         if let Err(e) = self.chain_ready().await {
             return fail(e);
         }
-        match self.chain_read("get_block", &[Arg::str(&id)]).await {
-            Ok(block) => ok(json!({ "header_id": id, "block": block })),
+        match self.chain_lookup("get_block", &id).await {
+            Ok(Some(block)) => ok(json!({ "header_id": id, "found": true, "block": block })),
+            Ok(None) => ok(json!({
+                "header_id": id,
+                "found": false,
+                "note": "this node doesn't have that block: it may not be synced that far yet, see chain_info",
+            })),
             Err(e) => fail(e),
         }
     }
 
     #[tool(
-        description = "A Logos chain transaction, by its hash. For LEZ transactions use wallet_tx_status. Needs the chain node running."
+        description = "A Logos chain transaction still waiting in the node's mempool, by its hash. Once in a block the node no longer finds it by hash: read the block with chain_block. For LEZ transactions use wallet_tx_status. Needs the chain node running."
     )]
     async fn chain_transaction(
         &self,
@@ -2502,8 +2522,13 @@ impl LogosServer {
         if let Err(e) = self.chain_ready().await {
             return fail(e);
         }
-        match self.chain_read("get_transaction", &[Arg::str(&tx)]).await {
-            Ok(found) => ok(json!({ "tx_hash": tx, "transaction": found })),
+        match self.chain_lookup("get_transaction", &tx).await {
+            Ok(Some(found)) => ok(json!({ "tx_hash": tx, "found": true, "transaction": found })),
+            Ok(None) => ok(json!({
+                "tx_hash": tx,
+                "found": false,
+                "note": "not waiting in this node's mempool. The node keeps no index of mined transactions: if it landed, it is only in its block, see chain_block",
+            })),
             Err(e) => fail(e),
         }
     }

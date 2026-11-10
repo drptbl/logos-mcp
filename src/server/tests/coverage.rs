@@ -561,3 +561,51 @@ async fn discovery_peers_needs_bootstrap_peers_like_the_other_discovery_tools() 
     assert!(text(&r).contains("--discovery-bootstrap"), "{}", text(&r));
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+/// What blockchain_module 0.3.4 answers for an id it doesn't have, as seen live.
+fn chain_refused(method: &str, error: &str) -> crate::logosctl::RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "blockchain_module",
+        "result": { "error": error, "success": false, "value": null },
+        "status": "ok",
+    })
+    .to_string())
+}
+
+#[tokio::test]
+async fn a_transaction_the_node_no_longer_holds_points_to_its_block() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain_refused(
+            "get_transaction",
+            "No transaction found for hash TxHash([31, 15, 110])",
+        ),
+    ]);
+    let r = server(fake, None)
+        .chain_transaction(Parameters(ChainTxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["found"], false, "{b}");
+    assert!(b["note"].as_str().unwrap().contains("chain_block"), "{b}");
+}
+
+#[tokio::test]
+async fn a_block_the_node_lacks_is_not_found_rather_than_failed() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain_refused("get_block", "No block found for header id [110, 130, 165]"),
+    ]);
+    let r = server(fake, None)
+        .chain_block(Parameters(HeaderParams {
+            header_id: HEADER.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["found"], false, "{b}");
+    assert!(b["note"].as_str().unwrap().contains("chain_info"), "{b}");
+}
