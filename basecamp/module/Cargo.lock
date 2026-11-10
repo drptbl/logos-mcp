@@ -686,7 +686,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logos-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "logos_mcp_module"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "axum",
  "logos-mcp",
