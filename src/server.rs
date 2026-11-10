@@ -2466,21 +2466,22 @@ impl LogosServer {
         if let Err(e) = self.chain_ready().await {
             return fail(e);
         }
-        let mut info = serde_json::Map::new();
-        for (key, method) in [
-            ("chain_id", "get_chain_id"),
-            ("consensus", "get_cryptarchia_info"),
-            ("time", "get_time_info"),
-            ("network", "get_network_info"),
-        ] {
-            match self.chain_read(method, &[]).await {
-                Ok(v) => {
-                    info.insert(key.into(), v);
-                }
-                Err(e) => return fail(e),
-            }
+        // Four independent reads, each its own logosctl call: run them together.
+        let read = tokio::try_join!(
+            self.chain_read("get_chain_id", &[]),
+            self.chain_read("get_cryptarchia_info", &[]),
+            self.chain_read("get_time_info", &[]),
+            self.chain_read("get_network_info", &[]),
+        );
+        match read {
+            Ok((chain_id, consensus, time, network)) => ok(json!({
+                "chain_id": chain_id,
+                "consensus": consensus,
+                "time": time,
+                "network": network,
+            })),
+            Err(e) => fail(e),
         }
-        ok(Value::Object(info))
     }
 
     #[tool(
