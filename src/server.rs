@@ -1863,7 +1863,7 @@ impl LogosServer {
             .await
             .map(embedded_json)
             .map_err(|e| e.to_string())?;
-        if let Some(error) = found.get("error") {
+        if let Some(error) = found.get("error").filter(|e| !e.is_null()) {
             return Err(error
                 .get("message")
                 .and_then(Value::as_str)

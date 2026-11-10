@@ -415,6 +415,21 @@ async fn rln_status_lists_the_memberships_of_the_registry() {
 }
 
 #[tokio::test]
+async fn a_null_error_beside_the_memberships_is_no_error() {
+    let with_null =
+        MEMBERSHIPS.replace(r#"{\"memberships\""#, r#"{\"error\":null,\"memberships\""#);
+    assert_ne!(with_null, MEMBERSHIPS);
+    let fake = FakeRunner::with(vec![
+        out(RLN_READY),
+        out(MEMBERSHIP_ACTIVE),
+        out(QUOTA_99),
+        out(&with_null),
+    ]);
+    let b = body(&server(fake, None).rln_status().await.unwrap());
+    assert_eq!(b["memberships"][0]["leaf_index"], 17, "{b}");
+}
+
+#[tokio::test]
 async fn an_unreadable_membership_list_leaves_rln_status_standing() {
     let bad = r#"{"method":"get_memberships","module":"liblogos_rln_module","result":"{\"error\":{\"class\":\"permanent\",\"kind\":\"invalid_argument\",\"message\":\"bad registry\"}}","status":"ok"}"#;
     let fake = FakeRunner::with(vec![
