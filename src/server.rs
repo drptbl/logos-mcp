@@ -222,6 +222,9 @@ pub struct LogosServer {
     discovery_ready: Arc<tokio::sync::Mutex<bool>>,
     /// Service ids this server has registered discovery interest in.
     interests: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    /// Faucet drops this server started: the only ones wallet_faucet checks on,
+    /// so the agent never reads or acknowledges the Faucet app's own.
+    faucet_jobs: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
@@ -687,6 +690,7 @@ impl LogosServer {
             connecting: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
+            faucet_jobs: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
@@ -2315,6 +2319,16 @@ impl LogosServer {
                 {
                     return fail("job_id must be the one wallet_faucet returned");
                 }
+                let ours = self
+                    .faucet_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(job);
+                if !ours {
+                    return fail(
+                        "job_id must be one wallet_faucet returned since this server started",
+                    );
+                }
                 let checked = async {
                     self.faucet_ready().await?;
                     self.faucet_wait(&ct, job, std::time::Duration::ZERO).await
@@ -2331,8 +2345,12 @@ impl LogosServer {
     async fn faucet_drop(&self, ct: &CancellationToken, account: &str) -> Result<Value, String> {
         let id = guard::public_account_hex(account)?;
         let w = self.ensure_wallet().await?;
-        if !w.is_agent(&id) {
-            return Err("the faucet only pays the agent's own accounts: give one wallet_accounts marks as an agent account".into());
+        let public = w.accounts.iter().any(|a| {
+            a.get("account_id").and_then(Value::as_str) == Some(id.as_str())
+                && a.get("is_public").and_then(Value::as_bool) == Some(true)
+        });
+        if !w.is_agent(&id) || !public {
+            return Err("the faucet only pays the agent's own public accounts: give one wallet_accounts marks as an agent account".into());
         }
         let address = guard::account_id_base58(&id)
             .map(|b58| format!("Public/{b58}"))
@@ -2348,7 +2366,16 @@ impl LogosServer {
             .as_str()
             .ok_or_else(|| "lez_faucet started no job".to_string())?
             .to_string();
-        self.faucet_wait(ct, &job, FAUCET_WAIT).await
+        self.faucet_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job.clone());
+        // The drop is under way: whatever goes wrong now, the agent keeps its job id.
+        self.faucet_wait(ct, &job, FAUCET_WAIT).await.map_err(|e| {
+            format!(
+                "{e} (drop {job}: check it with wallet_faucet and this job_id before asking again)"
+            )
+        })
     }
 
     /// Load lez_faucet when this server runs on its own; Basecamp loads it itself.

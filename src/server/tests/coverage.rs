@@ -962,24 +962,54 @@ async fn a_refused_drop_says_why() {
 
 #[tokio::test]
 async fn a_running_drop_is_checked_again_by_its_job_id() {
-    let fake = FakeRunner::with(vec![
-        out(FAUCET_LOADED),
+    let running = || {
         faucet(
             "jobStatus",
             json!({ "ok": true, "job_id": "job-1", "status": "running", "phase": "reconciling" }),
+        )
+    };
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
         ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
+        ),
+        running(),
+        out(FAUCET_LOADED),
+        running(),
     ]);
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    // The agent stops waiting at once: the drop goes on.
+    let gave_up = CancellationToken::new();
+    gave_up.cancel();
+    let first = body(
+        &s.wallet_faucet(
+            gave_up,
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(first["job_id"], "job-1", "{first}");
     let b = body(
-        &wallet_server(fake.clone())
-            .wallet_faucet(
-                CancellationToken::new(),
-                Parameters(FaucetParams {
-                    account: None,
-                    job_id: Some("job-1".into()),
-                }),
-            )
-            .await
-            .unwrap(),
+        &s.wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: None,
+                job_id: Some("job-1".into()),
+            }),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(b["status"], "running", "{b}");
     assert_eq!(b["job_id"], "job-1", "{b}");
@@ -1256,4 +1286,83 @@ async fn turning_transfers_off_stops_a_chain_transfer_already_waiting() {
     let r = call.await.unwrap();
     assert!(is_error(&r), "{}", text(&r));
     assert!(chain_sends(&fake).is_empty());
+}
+
+const AGENT_AND_PRIVATE: &str = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"5b1f00d5c56e0a8a4f9d8e2ab5f1e6c5d4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9","is_public":false}]"#;
+
+#[tokio::test]
+async fn the_faucet_never_funds_the_public_form_of_a_private_account() {
+    let mut replies = opened_by_server();
+    replies[4] = lez("list_accounts", AGENT_AND_PRIVATE);
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(
+                    "5b1f00d5c56e0a8a4f9d8e2ab5f1e6c5d4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9".into(),
+                ),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(2).map(String::as_str) == Some("lez_faucet"))
+    );
+}
+
+#[tokio::test]
+async fn a_drop_whose_status_cannot_be_read_still_hands_back_its_job_id() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "request_drop-7", "status": "queued" }),
+        ),
+        crate::logosctl::RawOutput {
+            code: 4,
+            stdout: r#"{"code":"RPC_FAILED","message":"call failed","status":"error"}"#.into(),
+            stderr: String::new(),
+        },
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("request_drop-7"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn the_faucet_only_checks_drops_this_server_started() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: None,
+                job_id: Some("request_drop-1".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
