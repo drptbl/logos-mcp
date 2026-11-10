@@ -352,6 +352,13 @@ pub struct SlotRangeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainWalletParams {
+    /// One of the node's chain wallet addresses, 64 hex characters, to show with
+    /// its notes. Leave out to list them all.
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChainTxParams {
     /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
     /// wallet_tx_status instead.
@@ -2522,6 +2529,60 @@ impl LogosServer {
             })),
             Err(e) => fail(e),
         }
+    }
+
+    #[tool(
+        description = "The Logos chain node's own wallet: every address it holds keys for, with its balance, or one address with its notes. Read-only. Needs the chain node running and synced."
+    )]
+    async fn chain_wallet(
+        &self,
+        Parameters(p): Parameters<ChainWalletParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let address = match p.address.as_deref().map(|a| hex64(a, "address")) {
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => return fail(e),
+            None => None,
+        };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
+        if let Some(address) = address {
+            let balance = match self
+                .chain_read("wallet_get_balance", &[Arg::str(&address)])
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => return fail(e),
+            };
+            // The empty tip reads at the node's current one.
+            let args = [Arg::str(&address), Arg::str("")];
+            return match self.chain_read("wallet_get_notes", &args).await {
+                Ok(notes) => ok(json!({ "address": address, "balance": balance, "notes": notes })),
+                Err(e) => fail(e),
+            };
+        }
+        let known = match self.chain_read("wallet_get_known_addresses", &[]).await {
+            Ok(Value::Array(list)) => list,
+            Ok(other) => {
+                return fail(format!(
+                    "unexpected wallet_get_known_addresses reply: {other}"
+                ));
+            }
+            Err(e) => return fail(e),
+        };
+        let mut accounts = Vec::with_capacity(known.len());
+        for address in known.iter().filter_map(Value::as_str) {
+            accounts.push(
+                match self
+                    .chain_read("wallet_get_balance", &[Arg::str(address)])
+                    .await
+                {
+                    Ok(balance) => json!({ "address": address, "balance": balance }),
+                    Err(e) => json!({ "address": address, "balance": null, "error": e }),
+                },
+            );
+        }
+        ok(json!({ "accounts": accounts }))
     }
 
     #[tool(

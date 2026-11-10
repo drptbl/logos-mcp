@@ -660,3 +660,61 @@ async fn chain_blocks_refuses_a_backwards_or_huge_range_without_touching_the_nod
     }
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+const CHAIN_KEY_A: &str = "3e2acc3dacb83036f111df8fa65df19d897a7022aa42fbd51dc52d8f79117e09";
+const CHAIN_KEY_B: &str = "84f956ec0d63f5f7dac2eb85171c0b64fa2191d16d96515ba6f16ec89c78c61e";
+
+#[tokio::test]
+async fn chain_wallet_lists_the_node_accounts_with_balances() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        // As blockchain_module 0.3.4 answers: a JSON string.
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
+        ),
+        chain("wallet_get_balance", json!("1500")),
+        chain_refused("wallet_get_balance", "Unknown wallet address."),
+    ]);
+    let b = body(
+        &server(fake, None)
+            .chain_wallet(Parameters(ChainWalletParams { address: None }))
+            .await
+            .unwrap(),
+    );
+    let accounts = b["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2, "{b}");
+    assert_eq!(accounts[0]["address"], CHAIN_KEY_A, "{b}");
+    assert_eq!(accounts[0]["balance"], "1500", "{b}");
+    assert!(accounts[1]["balance"].is_null(), "{b}");
+    assert!(
+        accounts[1]["error"].as_str().unwrap().contains("Unknown"),
+        "{b}"
+    );
+}
+
+#[tokio::test]
+async fn chain_wallet_shows_one_account_with_its_notes() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("wallet_get_balance", json!("1500")),
+        chain(
+            "wallet_get_notes",
+            json!("[{\"id\":\"ab\",\"value\":1500}]"),
+        ),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_wallet(Parameters(ChainWalletParams {
+                address: Some(CHAIN_KEY_A.to_uppercase()),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["address"], CHAIN_KEY_A, "{b}");
+    assert_eq!(b["notes"][0]["value"], 1500, "{b}");
+    assert_eq!(
+        last_call(&fake)[1..],
+        ["wallet_get_notes", &format!("str:{CHAIN_KEY_A}"), "str:"]
+    );
+}
