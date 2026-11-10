@@ -465,6 +465,21 @@ async fn a_null_error_beside_the_memberships_is_no_error() {
 }
 
 #[tokio::test]
+async fn an_unexpected_membership_reply_keeps_the_credential_out() {
+    let odd = MEMBERSHIPS.replace(r#"{\"memberships\":["#, r#"{\"entries\":["#);
+    assert_ne!(odd, MEMBERSHIPS);
+    let fake = FakeRunner::with(vec![
+        out(RLN_READY),
+        out(MEMBERSHIP_ACTIVE),
+        out(QUOTA_99),
+        out(&odd),
+    ]);
+    let b = body(&server(fake, None).rln_status().await.unwrap());
+    assert!(b["memberships_error"].is_string(), "{b}");
+    assert!(!b.to_string().contains("identity_commitment"), "{b}");
+}
+
+#[tokio::test]
 async fn an_unreadable_membership_list_leaves_rln_status_standing() {
     let bad = r#"{"method":"get_memberships","module":"liblogos_rln_module","result":"{\"error\":{\"class\":\"permanent\",\"kind\":\"invalid_argument\",\"message\":\"bad registry\"}}","status":"ok"}"#;
     let fake = FakeRunner::with(vec![

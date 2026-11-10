@@ -1874,7 +1874,8 @@ impl LogosServer {
         let list = found
             .get("memberships")
             .and_then(Value::as_array)
-            .ok_or_else(|| format!("unexpected get_memberships reply: {found}"))?;
+            // Not the reply itself: it may hold the membership credential.
+            .ok_or_else(|| "get_memberships answered without a membership list".to_string())?;
         Ok(list
             .iter()
             .map(|m| {
