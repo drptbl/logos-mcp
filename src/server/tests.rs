@@ -2928,3 +2928,33 @@ async fn chat_waits_for_a_new_messaging_node_to_connect_before_starting() {
         4
     );
 }
+
+#[tokio::test]
+async fn a_signed_call_goes_out_from_an_agent_account() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "send_generic_public_transaction",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"cc33\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let tx = s
+        .send_signed(AGENT_ID, &[CALL_TO.to_string()], vec![9, 9], TEST_PROGRAM)
+        .await
+        .unwrap();
+    assert_eq!(tx, "cc33");
+    let calls = fake.calls.lock().unwrap();
+    let call = &calls.last().unwrap()[2..];
+    assert_eq!(call[2], format!(r#"json:["{AGENT_ID}","{CALL_TO}"]"#));
+    assert_eq!(call[3], "json:[true,false]");
+    assert_eq!(call[5], format!("str:{TEST_PROGRAM}"));
+}
+
+#[tokio::test]
+async fn a_signed_call_never_goes_out_from_another_account() {
+    let fake = FakeRunner::with(opened_by_server());
+    let s = wallet_server(fake.clone());
+    let r = s.send_signed(CALL_TO, &[], vec![9, 9], TEST_PROGRAM).await;
+    assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
+    assert!(!sent_generic(&fake));
+}

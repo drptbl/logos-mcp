@@ -72,7 +72,7 @@ pub struct NodeSettings {
 }
 
 /// The open agent wallet, as `ensure_wallet` found or left it.
-struct WalletHandle {
+pub struct WalletHandle {
     sequencer: String,
     opened_now: bool,
     /// The agent may act on this wallet: dedicated mode, it is the wallet this
@@ -85,7 +85,13 @@ struct WalletHandle {
 }
 
 impl WalletHandle {
-    fn warning(&self) -> Option<&'static str> {
+    /// Whether the agent may sign with this account, 64 hex characters.
+    pub fn is_agent(&self, account_id: &str) -> bool {
+        self.agent_ids.contains(account_id)
+    }
+
+    /// Why the agent shouldn't act on this wallet, if it shouldn't.
+    pub fn warning(&self) -> Option<&'static str> {
         match (self.trusted, self.shared) {
             (false, false) => Some(
                 "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
@@ -370,7 +376,7 @@ enum SendMode {
 
 /// Why a transfer didn't clearly go through.
 #[derive(Debug)]
-enum SendError {
+pub enum SendError {
     /// Refused before or by the wallet: nothing was sent.
     NotSent(String),
     /// Handed to the wallet without a clear answer: it may have been sent.
@@ -378,7 +384,7 @@ enum SendError {
 }
 
 impl SendError {
-    fn message(self) -> String {
+    pub fn message(self) -> String {
         match self {
             Self::NotSent(m) | Self::MaybeSent(m) => m,
         }
@@ -668,7 +674,7 @@ impl LogosServer {
     /// The network the messaging node is really on, read from its ENR, which
     /// can differ from this server's setting when it joined an existing node.
     /// Before there is a node, the one it would be created on.
-    async fn network(&self) -> String {
+    pub async fn network(&self) -> String {
         match self
             .node
             .call(DELIVERY, "getNodeInfo", &[Arg::str("MyENR")])
@@ -700,7 +706,70 @@ impl LogosServer {
         }
     }
 
-    fn allows(&self, tool: &str) -> bool {
+    /// The node, for module calls this server has no tool for. Crates that
+    /// build on this server, such as logos-agents, use it.
+    pub fn node(&self) -> &Arc<dyn Node> {
+        &self.node
+    }
+
+    /// A file kept next to the agent wallet, for state a crate building on
+    /// this server keeps per wallet. `None` without a wallet.
+    pub fn wallet_side_file(&self, name: &str) -> Option<PathBuf> {
+        match self.settings.wallet.as_ref()? {
+            WalletMode::Dedicated(paths) => Some(paths.storage.with_file_name(name)),
+            WalletMode::Shared {
+                agent_accounts_file,
+            } => Some(agent_accounts_file.with_file_name(name)),
+        }
+    }
+
+    /// Sign and send a program call with an agent account that moves nothing
+    /// out of it but the network fee, so it needs no approval. `accounts`
+    /// follow the signer, all 64 hex characters.
+    pub async fn send_signed(
+        &self,
+        signer: &str,
+        accounts: &[String],
+        instruction: Vec<u8>,
+        program_id_hex: &str,
+    ) -> Result<String, SendError> {
+        let w = self.ensure_wallet().await?;
+        if let Some(warning) = w.warning() {
+            return Err(format!("refusing to sign: {warning}").into());
+        }
+        if !w.is_agent(signer) {
+            return Err("the signing account must be one of the agent accounts".into());
+        }
+        let mut ids = vec![signer.to_string()];
+        ids.extend(accounts.iter().cloned());
+        let signs: Vec<bool> = std::iter::once(true)
+            .chain(accounts.iter().map(|_| false))
+            .collect();
+        let args = [
+            Arg::Json(json!(ids)),
+            Arg::Json(json!(signs)),
+            Arg::Bytes(instruction),
+            Arg::str(program_id_hex),
+            Arg::str(""),
+            Arg::Json(json!([])),
+        ];
+        let reply = self
+            .node
+            .call(LEZ, "send_generic_public_transaction", &args)
+            .await;
+        match reply.map(|v| TransferOutcome::read(&embedded_json(v))) {
+            Ok(TransferOutcome::Submitted(tx)) => Ok(tx),
+            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}").into()),
+            Ok(TransferOutcome::Unknown(detail)) => Err(SendError::MaybeSent(format!(
+                "outcome unknown: it may have been sent, so check before trying again ({detail})"
+            ))),
+            Err(e) => Err(SendError::MaybeSent(format!(
+                "outcome unknown: it may have been sent, so check before trying again ({e})"
+            ))),
+        }
+    }
+
+    pub fn allows(&self, tool: &str) -> bool {
         self.tool_groups.borrow().allows(tool)
     }
 
@@ -800,7 +869,7 @@ impl LogosServer {
     /// this server opened it and its accounts still match the ones seen then,
     /// which also catches a daemon restart where another wallet was opened.
     /// Serialized so concurrent tool calls never race to open it twice.
-    async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
+    pub async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
         let mut agent_accounts = self.agent_accounts.lock().await;
         self.ensure_wallet_locked(&mut agent_accounts).await
     }
@@ -914,7 +983,7 @@ impl LogosServer {
     #[tool(
         description = "The agent wallet's own accounts with their addresses and balances in lepta."
     )]
-    async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
+    pub async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
         let w = match self.ensure_wallet().await {
             Ok(v) => v,
             Err(e) => return fail(e),
@@ -1195,7 +1264,7 @@ impl LogosServer {
 
     /// This agent's chat address, starting chat when it has none. `true` with it
     /// when this call started chat.
-    async fn ensure_chat(&self) -> Result<(String, bool), String> {
+    pub async fn ensure_chat(&self) -> Result<(String, bool), String> {
         let _starting = self.chat_starting.lock().await;
         if !self.settings.host_owns_messaging {
             self.load(CHAT).await.map_err(|e| e.to_string())?;
@@ -1271,7 +1340,7 @@ impl LogosServer {
     #[tool(
         description = "Open an end-to-end encrypted conversation with another agent's chat address. Returns once it has settled, about 8 seconds, so the first message isn't lost. Send with chat_send and read replies with chat_read."
     )]
-    async fn chat_start(
+    pub async fn chat_start(
         &self,
         Parameters(p): Parameters<ChatStartParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1309,7 +1378,7 @@ impl LogosServer {
     #[tool(
         description = "Send a message into a chat conversation. Success means it was handed to the network, not that the other agent got it: there is no delivery receipt, so ask for a reply and watch chat_read. Replies usually take 5 to 20 seconds. On logos.test, sending needs an active RLN membership."
     )]
-    async fn chat_send(
+    pub async fn chat_send(
         &self,
         Parameters(p): Parameters<ChatSendParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1532,7 +1601,7 @@ impl LogosServer {
     #[tool(
         description = "Send lepta from one of the agent wallet's public accounts to a public account. The wallet's balance is the only limit. Returns the transaction hash once submitted, not confirmed: check wallet_accounts for the new balances."
     )]
-    async fn wallet_transfer(
+    pub async fn wallet_transfer(
         &self,
         ct: CancellationToken,
         Parameters(p): Parameters<TransferParams>,
@@ -1750,7 +1819,7 @@ impl LogosServer {
     #[tool(
         description = "Create a new public account in the agent wallet, for example a fresh receive address per job so a payment can be matched to it by its balance."
     )]
-    async fn wallet_new_account(&self) -> Result<CallToolResult, McpError> {
+    pub async fn wallet_new_account(&self) -> Result<CallToolResult, McpError> {
         let mut agent_accounts = self.agent_accounts.lock().await;
         let w = match self.ensure_wallet_locked(&mut agent_accounts).await {
             Ok(w) => w,
@@ -1819,7 +1888,7 @@ impl LogosServer {
 
     /// Make sure libp2p_module runs a node with service discovery, creating one
     /// bootstrapped from the configured peers when none exists. Returns this node's peer id.
-    async fn ensure_discovery(&self) -> Result<String, String> {
+    pub async fn ensure_discovery(&self) -> Result<String, String> {
         if self.settings.discovery_bootstrap.is_empty() {
             return Err(
                 "discovery tools are disabled: start the server with --discovery-bootstrap".into(),
@@ -1873,7 +1942,7 @@ impl LogosServer {
     }
 
     /// The peer records advertising `service_id`, and this node's peer id.
-    async fn lookup(&self, service_id: &str) -> Result<(String, Vec<Value>), String> {
+    pub async fn lookup(&self, service_id: &str) -> Result<(String, Vec<Value>), String> {
         guard::validate_service_id(service_id)?;
         let own = self.ensure_discovery().await?;
         // Lookups only see a service the node has registered interest in. Once per service.

@@ -77,19 +77,6 @@ struct InFlight {
     sent_ms: u64,
 }
 
-/// A side file's map: empty when there is no file yet, refused when there is
-/// one that can't be read.
-fn read_side_map<T: serde::de::DeserializeOwned>(
-    file: Option<PathBuf>,
-) -> Result<BTreeMap<String, T>, String> {
-    match file.map(std::fs::read) {
-        None => Ok(BTreeMap::new()),
-        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Some(Err(e)) => Err(e.to_string()),
-        Some(Ok(bytes)) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
-    }
-}
-
 /// Why nothing is paid or cancelled while `PAYMENTS` can't be read.
 fn unreadable_payments(e: &str) -> String {
     format!(
@@ -608,7 +595,7 @@ impl LogosServer {
     async fn with_in_flight(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
         if !state.in_flight_loaded && state.in_flight_unreadable.is_none() {
-            match read_side_map::<InFlight>(self.wallet_side_file(IN_FLIGHT)) {
+            match guard::read_side_map::<InFlight>(self.wallet_side_file(IN_FLIGHT)) {
                 Ok(saved) => {
                     for (job, f) in saved {
                         state.in_flight.entry(job).or_insert(f);
@@ -726,39 +713,14 @@ impl LogosServer {
         accounts: &[Id],
         ix: Instruction,
     ) -> Result<String, SendError> {
-        let w = self.ensure_wallet().await?;
-        if let Some(warning) = w.warning() {
-            return Err(format!("refusing to sign: {warning}").into());
-        }
-        if !w.agent_ids.contains(&id_hex(signer)) {
-            return Err("the escrow account must be one of the agent accounts".into());
-        }
-        let mut ids = vec![id_hex(signer)];
-        ids.extend(accounts.iter().map(id_hex));
-        let mut signs = vec![true];
-        signs.extend(accounts.iter().map(|_| false));
-        let args = [
-            Arg::Json(json!(ids)),
-            Arg::Json(json!(signs)),
-            Arg::Bytes(ix.encode()),
-            Arg::str(escrow::PROGRAM_ID_HEX),
-            Arg::str(""),
-            Arg::Json(json!([])),
-        ];
-        let reply = self
-            .node
-            .call(LEZ, "send_generic_public_transaction", &args)
-            .await;
-        match reply.map(|v| TransferOutcome::read(&embedded_json(v))) {
-            Ok(TransferOutcome::Submitted(tx)) => Ok(tx),
-            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}").into()),
-            Ok(TransferOutcome::Unknown(detail)) => Err(SendError::MaybeSent(format!(
-                "outcome unknown: it may have been sent, so check service_jobs before trying again ({detail})"
-            ))),
-            Err(e) => Err(SendError::MaybeSent(format!(
-                "outcome unknown: it may have been sent, so check service_jobs before trying again ({e})"
-            ))),
-        }
+        let accounts: Vec<String> = accounts.iter().map(id_hex).collect();
+        self.send_signed(
+            &id_hex(signer),
+            &accounts,
+            ix.encode(),
+            escrow::PROGRAM_ID_HEX,
+        )
+        .await
     }
 
     /// Publish the offer with this agent's chat address in the same signed
@@ -836,15 +798,6 @@ impl LogosServer {
     }
 
     /// A file kept next to the agent wallet's own.
-    fn wallet_side_file(&self, name: &str) -> Option<PathBuf> {
-        match self.settings.wallet.as_ref()? {
-            WalletMode::Dedicated(paths) => Some(paths.storage.with_file_name(name)),
-            WalletMode::Shared {
-                agent_accounts_file,
-            } => Some(agent_accounts_file.with_file_name(name)),
-        }
-    }
-
     fn job_accounts_file(&self) -> Option<PathBuf> {
         self.wallet_side_file(JOB_ACCOUNTS)
     }
@@ -853,7 +806,7 @@ impl LogosServer {
     async fn with_payments(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
         if !state.payments_loaded && state.payments_unreadable.is_none() {
-            match read_side_map::<Payment>(self.wallet_side_file(PAYMENTS)) {
+            match guard::read_side_map::<Payment>(self.wallet_side_file(PAYMENTS)) {
                 Ok(saved) => {
                     for (job, tx) in saved {
                         state.submitted.entry(job).or_insert(tx);
@@ -905,7 +858,7 @@ impl LogosServer {
     /// Which accounts were made for which job: account id -> `{job, service}`.
     /// Refused when the file is there but can't be read.
     pub(super) fn job_accounts(&self) -> Result<BTreeMap<String, Value>, String> {
-        read_side_map(self.job_accounts_file())
+        guard::read_side_map(self.job_accounts_file())
             .map_err(|e| format!("{JOB_ACCOUNTS} next to the wallet can't be read ({e})"))
     }
 
