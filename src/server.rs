@@ -32,6 +32,7 @@ const RLN: &str = "liblogos_rln_module";
 const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
+const BLOCKCHAIN: &str = "blockchain_module";
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
 pub const MAX_CHAT_BYTES: usize = 64 * 1024;
@@ -334,6 +335,19 @@ pub struct TxParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct HeaderParams {
+    /// The block's header id, 64 hex characters.
+    pub header_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainTxParams {
+    /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
+    /// wallet_tx_status instead.
+    pub tx_hash: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AdvertiseParams {
     /// Service id, e.g. my-app/summarize/v1
     pub service_id: String,
@@ -526,6 +540,23 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
         return fail(format!("{message}: call chat_status to start chat"));
     }
     fail(message)
+}
+
+/// A blockchain_module failure, with the way out when the module or its node isn't running.
+fn chain_error(e: LogosError) -> String {
+    let message = e.to_string();
+    if matches!(e, LogosError::Module(_)) {
+        return format!(
+            "{message}: install the Blockchain app in Basecamp, or run `logosctl package install blockchain_module` and `logosctl module load blockchain_module`"
+        );
+    }
+    if message.contains("not running") {
+        return format!(
+            "{}: start the Logos chain node from the Blockchain app first",
+            message.trim_end_matches('.')
+        );
+    }
+    message
 }
 
 fn validate_conversation_id(id: &str) -> Result<(), String> {
@@ -2306,6 +2337,68 @@ impl LogosServer {
         {
             Ok(_) => ok(json!({ "stopped": p.service_id })),
             Err(e) => logos_fail(e),
+        }
+    }
+
+    /// One blockchain_module read, decoded when it comes back as a JSON string.
+    async fn chain_read(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
+        self.node
+            .call(BLOCKCHAIN, method, args)
+            .await
+            .map(embedded_json)
+            .map_err(chain_error)
+    }
+
+    #[tool(
+        description = "The Logos chain as this node's blockchain_module sees it: chain id, consensus tip and height, slot timing and network peers. Needs the chain node running."
+    )]
+    async fn chain_info(&self) -> Result<CallToolResult, McpError> {
+        let mut info = serde_json::Map::new();
+        for (key, method) in [
+            ("chain_id", "get_chain_id"),
+            ("consensus", "get_cryptarchia_info"),
+            ("time", "get_time_info"),
+            ("network", "get_network_info"),
+        ] {
+            match self.chain_read(method, &[]).await {
+                Ok(v) => {
+                    info.insert(key.into(), v);
+                }
+                Err(e) => return fail(e),
+            }
+        }
+        ok(Value::Object(info))
+    }
+
+    #[tool(description = "A Logos chain block, by its header id. Needs the chain node running.")]
+    async fn chain_block(
+        &self,
+        Parameters(p): Parameters<HeaderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match hex64(&p.header_id, "header_id") {
+            Ok(id) => id,
+            Err(e) => return fail(e),
+        };
+        match self.chain_read("get_block", &[Arg::str(&id)]).await {
+            Ok(block) => ok(json!({ "header_id": id, "block": block })),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(
+        description = "A Logos chain transaction, by its hash. For LEZ transactions use wallet_tx_status. Needs the chain node running."
+    )]
+    async fn chain_transaction(
+        &self,
+        Parameters(p): Parameters<ChainTxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let tx = match hex64(&p.tx_hash, "tx_hash") {
+            Ok(tx) => tx,
+            Err(e) => return fail(e),
+        };
+        match self.chain_read("get_transaction", &[Arg::str(&tx)]).await {
+            Ok(found) => ok(json!({ "tx_hash": tx, "transaction": found })),
+            Err(e) => fail(e),
         }
     }
 

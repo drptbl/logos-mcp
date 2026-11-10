@@ -237,3 +237,122 @@ async fn wallet_status_shows_how_far_private_state_is_synced() {
     assert_eq!(b["block_height"], 80205, "{b}");
     assert_eq!(b["private_synced_block"], 80100, "{b}");
 }
+
+/// A blockchain_module reply to `method`, wrapped as the module wraps results.
+fn chain(method: &str, value: Value) -> crate::logosctl::RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "blockchain_module",
+        "result": { "error": null, "success": true, "value": value },
+        "status": "ok",
+    })
+    .to_string())
+}
+
+/// What blockchain_module answers while its node isn't running.
+fn chain_not_running(method: &str) -> crate::logosctl::RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "blockchain_module",
+        "result": { "error": "The node is not running.", "success": false, "value": null },
+        "status": "ok",
+    })
+    .to_string())
+}
+
+#[tokio::test]
+async fn chain_info_brings_the_chain_together() {
+    let fake = FakeRunner::with(vec![
+        chain("get_chain_id", json!("logos-devnet")),
+        chain("get_cryptarchia_info", json!({ "tip": "ab", "height": 42 })),
+        chain("get_time_info", json!({ "slot": 1000 })),
+        chain("get_network_info", json!({ "peers": 7 })),
+    ]);
+    let b = body(&server(fake, None).chain_info().await.unwrap());
+    assert_eq!(b["chain_id"], "logos-devnet", "{b}");
+    assert_eq!(b["consensus"]["height"], 42, "{b}");
+    assert_eq!(b["time"]["slot"], 1000, "{b}");
+    assert_eq!(b["network"]["peers"], 7, "{b}");
+}
+
+#[tokio::test]
+async fn chain_info_says_how_to_start_the_node() {
+    let fake = FakeRunner::with(vec![chain_not_running("get_chain_id")]);
+    let r = server(fake, None).chain_info().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("start"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn chain_info_says_how_to_install_the_module() {
+    let fake = FakeRunner::with(vec![crate::logosctl::RawOutput {
+        code: 3,
+        stdout: r#"{"code":"MODULE_NOT_LOADED","message":"Module 'blockchain_module' is not loaded. Load it with: logosctl module load blockchain_module","status":"error"}"#.into(),
+        stderr: String::new(),
+    }]);
+    let r = server(fake, None).chain_info().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("package install blockchain_module"), "{}", text(&r));
+}
+
+const HEADER: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+
+#[tokio::test]
+async fn a_block_is_read_by_its_header_id() {
+    let fake = FakeRunner::with(vec![chain("get_block", json!({ "header": { "slot": 9 } }))]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_block(Parameters(HeaderParams {
+                header_id: HEADER.into(),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["block"]["header"]["slot"], 9, "{b}");
+    assert_eq!(last_call(&fake)[2], format!("str:{HEADER}"));
+}
+
+#[tokio::test]
+async fn a_chain_transaction_is_read_by_its_hash() {
+    let fake = FakeRunner::with(vec![chain("get_transaction", json!({ "ops": [] }))]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_transaction(Parameters(ChainTxParams { tx_hash: TX.into() }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["transaction"]["ops"], json!([]), "{b}");
+    assert_eq!(last_call(&fake)[2], format!("str:{TX}"));
+}
+
+#[tokio::test]
+async fn malformed_chain_ids_are_refused_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    let r = s
+        .chain_block(Parameters(HeaderParams {
+            header_id: "zz".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    let r = s
+        .chain_transaction(Parameters(ChainTxParams {
+            tx_hash: "zz".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_chain_tools_have_their_own_switch() {
+    let mut groups = ToolGroups::default();
+    assert!(groups.allows("chain_info"));
+    groups.set("chain", false).unwrap();
+    for tool in ["chain_info", "chain_block", "chain_transaction"] {
+        assert!(!groups.allows(tool), "{tool}");
+    }
+    assert!(groups.allows("wallet_status"));
+}
