@@ -27,6 +27,7 @@ pub struct ToolGroups {
     pub transfers: bool,
     pub discovery: bool,
     pub chat: bool,
+    /// Service tools added on top of this server, such as logos-agents'.
     pub services: bool,
     pub ask_before_transfer: bool,
 }
