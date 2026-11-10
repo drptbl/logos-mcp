@@ -27,6 +27,7 @@ pub struct ToolGroups {
     pub transfers: bool,
     pub discovery: bool,
     pub chat: bool,
+    pub chain: bool,
     /// Service tools added on top of this server, such as logos-agents'.
     pub services: bool,
     pub ask_before_transfer: bool,
@@ -41,6 +42,7 @@ impl Default for ToolGroups {
             transfers: true,
             discovery: true,
             chat: true,
+            chain: true,
             services: true,
             ask_before_transfer: false,
         }
@@ -58,6 +60,7 @@ impl ToolGroups {
             t if t.starts_with("wallet_") => Some("wallet"),
             t if t.starts_with("discovery_") => Some("discovery"),
             t if t.starts_with("chat_") => Some("chat"),
+            t if t.starts_with("chain_") => Some("chain"),
             t if t.starts_with("service_") => Some("services"),
             _ => None,
         }
@@ -71,6 +74,7 @@ impl ToolGroups {
             "transfers" => Some(&mut self.transfers),
             "discovery" => Some(&mut self.discovery),
             "chat" => Some(&mut self.chat),
+            "chain" => Some(&mut self.chain),
             "services" => Some(&mut self.services),
             "ask_before_transfer" => Some(&mut self.ask_before_transfer),
             _ => None,
@@ -85,6 +89,7 @@ impl ToolGroups {
             Some("transfers") => self.transfers,
             Some("discovery") => self.discovery,
             Some("chat") => self.chat,
+            Some("chain") => self.chain,
             Some("services") => self.services,
             _ => true,
         }

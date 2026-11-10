@@ -437,6 +437,7 @@ impl crate::logosctl::Runner for StatefulLez {
                     }
                 }
                 "get_current_block_height" => "78065",
+                "get_last_synced_block" => "0",
                 "list_accounts" => AGENT_ACCOUNTS,
                 other => panic!("unexpected call {other}"),
             };
@@ -492,6 +493,7 @@ async fn a_wallet_swapped_after_opening_is_flagged_in_both_tools() {
         lez("list_accounts", AGENT_ACCOUNTS),
         daemon_status(80675, 301),
         lez("get_current_block_height", "78065"),
+        lez("get_last_synced_block", "0"),
         // later the daemon restarted and someone else opened a different wallet
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", OTHER_ACCOUNTS),
@@ -517,6 +519,7 @@ async fn zero_height_and_empty_account_lists_are_not_taken_as_data() {
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", "[]"),
         lez("get_current_block_height", "0"),
+        lez("get_last_synced_block", "0"),
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", "[]"),
     ]);
@@ -1838,6 +1841,7 @@ async fn the_app_sees_the_open_wallet_and_which_accounts_are_the_agents() {
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", &user_wallet_accounts()),
         lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
         // wallet_accounts
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", &user_wallet_accounts()),
@@ -1869,6 +1873,7 @@ async fn the_app_sees_agent_accounts_the_open_wallet_lacks_so_it_can_release_the
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", OTHER_ACCOUNTS),
         lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez("list_accounts", OTHER_ACCOUNTS),
         lez("get_balance", r#""7""#),
@@ -2664,11 +2669,13 @@ async fn concurrent_first_chat_status_calls_start_chat_once() {
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
         node_enr(ENR_LOGOS_DEV),
+        chat("health", "true"),
         // The second call finds chat already running.
         out(CHAT_LOADED),
         chat("get_address", &format!(r#""{SELF_ADDR}""#)),
         chat("status", CHAT_ONLINE),
         node_enr(ENR_LOGOS_DEV),
+        chat("health", "true"),
     ]);
     let s = server(fake.clone(), None);
     let (a, b) = tokio::join!(s.chat_status(), s.chat_status());
@@ -3011,3 +3018,5 @@ async fn an_unreadable_job_accounts_file_is_reported_not_ignored() {
         "{b}"
     );
 }
+
+mod coverage;
