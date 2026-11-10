@@ -1,7 +1,7 @@
 {
   "name": "logos_mcp",
   "display_name": "logos-mcp",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "MCP server for AI agents: messaging, chat, storage, wallet and discovery through Basecamp",
   "author": "drptbl",
   "type": "core",
