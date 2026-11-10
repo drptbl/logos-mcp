@@ -364,6 +364,17 @@ pub struct ChainWalletParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainTransferParams {
+    /// The sender: one of the node's chain wallet addresses, 64 hex characters, as
+    /// chain_wallet lists them. Change goes back to it.
+    pub from: String,
+    /// The recipient's public key, 64 hex characters.
+    pub to: String,
+    /// The amount in lepta, as digits: 1 TestToken is 1000000000.
+    pub amount_lepta: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChainTxParams {
     /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
     /// wallet_tx_status instead.
@@ -753,6 +764,18 @@ impl LogosServer {
         let id = id.to_string();
         let reply = json!({ "request_id": id, "state": "approved" });
         tokio::spawn(async move {
+            if request.chain {
+                let outcome = match server
+                    .chain_send(&request.from, &request.to, &request.amount_lepta)
+                    .await
+                {
+                    Ok(tx_hash) => Decision::Sent { tx_hash },
+                    Err(SendError::NotSent(reason)) => Decision::Failed { reason },
+                    Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
+                };
+                server.approvals.finish(&id, outcome);
+                return;
+            }
             let p = TransferParams {
                 from: request.from,
                 to: request.to,
@@ -2072,7 +2095,7 @@ impl LogosServer {
         if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
             return fail(e.message());
         }
-        let (id, mut decision) =
+        let (id, decision) =
             match self
                 .approvals
                 .request(&p.from, &p.to, &p.amount_lepta, p.call.clone())
@@ -2080,6 +2103,19 @@ impl LogosServer {
                 Ok(filed) => filed,
                 Err(e) => return fail(e),
             };
+        self.await_approval(&ct, &id, decision, |tx_hash| submitted(&p, tx_hash))
+            .await
+    }
+
+    /// Wait for the user's answer to request `id`, up to APPROVAL_WAIT. A sent
+    /// transfer is reported with `sent`.
+    async fn await_approval(
+        &self,
+        ct: &CancellationToken,
+        id: &str,
+        mut decision: tokio::sync::watch::Receiver<Decision>,
+        sent: impl FnOnce(&str) -> Value,
+    ) -> Result<CallToolResult, McpError> {
         let answered = async {
             loop {
                 let now = decision.borrow_and_update().clone();
@@ -2093,7 +2129,7 @@ impl LogosServer {
         };
         tokio::select! {
             outcome = answered => match outcome {
-                Decision::Sent { tx_hash } => ok(submitted(&p, &tx_hash)),
+                Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
                 Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
                 Decision::Denied => fail("the user denied this transfer: nothing was sent"),
                 Decision::Expired => fail("the user did not answer in time: nothing was sent"),
@@ -2120,13 +2156,134 @@ impl LogosServer {
             () = ct.cancelled() => {
                 // A request still waiting is cancelled: no approval may send behind
                 // the agent's back. One the user already approved goes ahead, so say so.
-                match self.approvals.cancel(&id) {
+                match self.approvals.cancel(id) {
                     Decision::Cancelled => fail("transfer cancelled: it will not be sent"),
                     _ => fail(format!(
                         "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
                     )),
                 }
             }
+        }
+    }
+
+    #[tool(
+        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so every chain transfer waits for the user's Approve in the AI Agent app, which only Basecamp has. Irreversible once sent."
+    )]
+    pub async fn chain_transfer(
+        &self,
+        ct: CancellationToken,
+        Parameters(p): Parameters<ChainTransferParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.settings.host_owns_messaging {
+            return fail(
+                "chain transfers wait for the user's Approve in the AI Agent app, so they only work inside Basecamp",
+            );
+        }
+        let checked = (|| {
+            let from = hex64(&p.from, "from")?;
+            let to = hex64(&p.to, "to")?;
+            let amount = p.amount_lepta.trim();
+            match amount.parse::<u128>() {
+                Ok(n) if n > 0 && amount.chars().all(|c| c.is_ascii_digit()) => {}
+                _ => {
+                    return Err(
+                        "amount_lepta must be a whole number of lepta above 0, as digits"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok((from, to, amount.to_string()))
+        })();
+        let (from, to, amount) = match checked {
+            Ok(found) => found,
+            Err(e) => return fail(e),
+        };
+        // Check now, so a hopeless request never reaches the user. Approving
+        // checks again before sending.
+        if let Err(e) = self.chain_sendable(&from, &amount).await {
+            return fail(e);
+        }
+        let (id, decision) = match self.approvals.request_chain(&from, &to, &amount) {
+            Ok(filed) => filed,
+            Err(e) => return fail(e),
+        };
+        self.await_approval(&ct, &id, decision, |tx_hash| {
+            json!({
+                "submitted": true,
+                "tx_hash": tx_hash,
+                "from": from,
+                "to": to,
+                "amount_lepta": amount,
+                "note": "submitted, not yet confirmed: chain_wallet shows the new balance once it is in a block",
+            })
+        })
+        .await
+    }
+
+    /// Whether the chain node can send `amount` from `from`: it holds the key
+    /// and the balance covers it. The fee comes on top, so the node may still refuse.
+    async fn chain_sendable(&self, from: &str, amount: &str) -> Result<(), String> {
+        self.chain_ready().await?;
+        let known = self.chain_read("wallet_get_known_addresses", &[]).await?;
+        if !known
+            .as_array()
+            .is_some_and(|k| k.iter().any(|a| a.as_str() == Some(from)))
+        {
+            return Err(
+                "from must be one of the chain node's own addresses, as chain_wallet lists them"
+                    .into(),
+            );
+        }
+        let balance = self
+            .chain_read("wallet_get_balance", &[Arg::str(from)])
+            .await?;
+        let held = match &balance {
+            Value::String(b) => b.parse::<u128>().ok(),
+            Value::Number(n) => n.as_u64().map(u128::from),
+            _ => None,
+        };
+        let wanted = amount.parse::<u128>().map_err(|e| e.to_string())?;
+        match held {
+            Some(held) if held >= wanted => Ok(()),
+            Some(held) => Err(format!("{from} holds {held} lepta, less than {wanted}")),
+            None => Err(format!("unreadable balance for {from}: {balance}")),
+        }
+    }
+
+    /// Send an approved chain transfer, checking it again first.
+    async fn chain_send(&self, from: &str, to: &str, amount: &str) -> Result<String, SendError> {
+        self.chain_sendable(from, amount)
+            .await
+            .map_err(SendError::NotSent)?;
+        let args = [
+            Arg::str(from),
+            Arg::Json(json!([from])),
+            Arg::str(to),
+            Arg::str(amount),
+            Arg::str(""),
+        ];
+        match self
+            .node
+            .call(BLOCKCHAIN, "wallet_transfer_funds", &args)
+            .await
+            .map(embedded_json)
+        {
+            Ok(Value::String(hash)) if !hash.is_empty() => Ok(hash),
+            Ok(other) => match other
+                .get("tx_hash")
+                .or(other.get("hash"))
+                .and_then(Value::as_str)
+            {
+                Some(hash) => Ok(hash.to_string()),
+                None => Err(SendError::MaybeSent(format!(
+                    "the chain node gave no transaction hash ({other}): it may have been sent, check chain_wallet"
+                ))),
+            },
+            // The module turned it down before sending.
+            Err(LogosError::Refused(reason)) => Err(SendError::NotSent(reason)),
+            Err(e) => Err(SendError::MaybeSent(format!(
+                "{e}: it may have been sent, check chain_wallet before trying again"
+            ))),
         }
     }
 

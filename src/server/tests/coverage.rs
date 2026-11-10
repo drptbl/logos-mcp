@@ -1017,3 +1017,180 @@ async fn without_lez_faucet_the_faucet_says_where_to_get_it() {
     assert!(is_error(&r), "{}", text(&r));
     assert!(text(&r).contains("LEZ Faucet"), "{}", text(&r));
 }
+
+/// A server running inside Basecamp, where the AI Agent app answers approvals.
+fn hosted_server(fake: Arc<FakeRunner>) -> LogosServer {
+    let mut s = server(fake, None);
+    s.settings.host_owns_messaging = true;
+    s
+}
+
+/// The replies a chain transfer's checks read: the sender is known and holds 5000.
+fn chain_sender_ok() -> [crate::logosctl::RawOutput; 2] {
+    [
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
+        ),
+        chain("wallet_get_balance", json!("5000")),
+    ]
+}
+
+fn chain_transfer_params(amount: &str) -> Parameters<ChainTransferParams> {
+    Parameters(ChainTransferParams {
+        from: CHAIN_KEY_A.into(),
+        to: CHAIN_KEY_B.into(),
+        amount_lepta: amount.into(),
+    })
+}
+
+/// Start a chain transfer and wait until it is waiting for the user.
+async fn request_chain_transfer(
+    s: &LogosServer,
+) -> (tokio::task::JoinHandle<CallToolResult>, String) {
+    let agent = s.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .chain_transfer(CancellationToken::new(), chain_transfer_params("1500"))
+            .await
+            .unwrap()
+    });
+    for _ in 0..100 {
+        if let Some(id) = s.approvals()["waiting"][0]["id"].as_str() {
+            return (call, id.to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no request appeared");
+}
+
+fn chain_sends(fake: &FakeRunner) -> Vec<Vec<String>> {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("wallet_transfer_funds"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn chain_transfers_sit_behind_the_transfers_switch() {
+    assert_eq!(ToolGroups::group_of("chain_transfer"), Some("transfers"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_chain_transfer_sends_from_the_key_with_change_back_to_it() {
+    let mut replies = chain_sender_ok().to_vec(); // checks before asking
+    replies.extend(chain_sender_ok()); // checks again when approved
+    replies.push(chain("wallet_transfer_funds", json!(TX)));
+    let fake = FakeRunner::with(replies);
+    // Approval is asked for even with "Ask me before each transfer" off.
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    let waiting = &s.approvals()["waiting"][0];
+    assert_eq!(waiting["chain"], true, "{waiting}");
+    assert!(
+        chain_sends(&fake).is_empty(),
+        "nothing sent before the user answers"
+    );
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], TX);
+    assert_eq!(
+        chain_sends(&fake)[0][4..],
+        [
+            format!("str:{CHAIN_KEY_A}"),
+            format!("json:[\"{CHAIN_KEY_A}\"]"),
+            format!("str:{CHAIN_KEY_B}"),
+            "str:1500".to_string(),
+            "str:".to_string(),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_denied_chain_transfer_is_never_sent() {
+    let fake = FakeRunner::with(chain_sender_ok().to_vec());
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    s.deny_transfer(&id).unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(chain_sends(&fake).is_empty());
+}
+
+#[tokio::test]
+async fn chain_transfers_need_basecamp_to_approve_them() {
+    let fake = FakeRunner::with(vec![]);
+    let r = server(fake.clone(), None)
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("1"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("Basecamp"), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_chain_transfer_from_a_key_the_node_lacks_never_reaches_the_user() {
+    let fake = FakeRunner::with(vec![chain(
+        "wallet_get_known_addresses",
+        json!(format!("[\"{CHAIN_KEY_B}\"]")),
+    )]);
+    let s = hosted_server(fake.clone());
+    let r = s
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("1"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(s.approvals()["waiting"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_chain_transfer_beyond_the_balance_never_reaches_the_user() {
+    let fake = FakeRunner::with(chain_sender_ok().to_vec());
+    let s = hosted_server(fake.clone());
+    let r = s
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("5001"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(s.approvals()["waiting"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_chain_transfers_are_refused_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = hosted_server(fake.clone());
+    for p in [
+        ChainTransferParams {
+            from: "zz".into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "1".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: "zz".into(),
+            amount_lepta: "1".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "0".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "1.5".into(),
+        },
+    ] {
+        let r = s
+            .chain_transfer(CancellationToken::new(), Parameters(p))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
