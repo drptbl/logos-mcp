@@ -2985,18 +2985,26 @@ impl LogosServer {
             }
             Err(e) => return fail(e),
         };
-        let mut accounts = Vec::with_capacity(known.len());
-        for address in known.iter().filter_map(Value::as_str) {
-            accounts.push(
-                match self
-                    .chain_read("wallet_get_balance", &[Arg::str(address)])
-                    .await
-                {
-                    Ok(balance) => json!({ "address": address, "balance": balance }),
-                    Err(e) => json!({ "address": address, "balance": null, "error": e }),
-                },
-            );
+        // One logosctl call per address: read them together, then put them in order.
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, address) in known.iter().filter_map(Value::as_str).enumerate() {
+            let (server, address) = (self.clone(), address.to_string());
+            reads.spawn(async move {
+                let balance = server
+                    .chain_read("wallet_get_balance", &[Arg::str(&address)])
+                    .await;
+                (
+                    index,
+                    match balance {
+                        Ok(balance) => json!({ "address": address, "balance": balance }),
+                        Err(e) => json!({ "address": address, "balance": null, "error": e }),
+                    },
+                )
+            });
         }
+        let mut accounts = reads.join_all().await;
+        accounts.sort_by_key(|(index, _)| *index);
+        let accounts: Vec<Value> = accounts.into_iter().map(|(_, a)| a).collect();
         ok(json!({ "accounts": accounts }))
     }
 
