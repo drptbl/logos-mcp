@@ -609,3 +609,796 @@ async fn a_block_the_node_lacks_is_not_found_rather_than_failed() {
     assert_eq!(b["found"], false, "{b}");
     assert!(b["note"].as_str().unwrap().contains("chain_info"), "{b}");
 }
+
+#[tokio::test]
+async fn wallet_status_keeps_sequencer_credentials_out() {
+    let mut replies = opened_with_sequencer("https://user:hunter2@seq.example/rpc?key=k");
+    replies.push(lez("get_current_block_height", "80205"));
+    replies.push(lez("get_last_synced_block", "80100"));
+    let b = body(
+        &wallet_server(FakeRunner::with(replies))
+            .wallet_status()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["sequencer"], "https://seq.example/rpc", "{b}");
+}
+
+#[tokio::test]
+async fn chain_blocks_reads_a_slot_range() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain(
+            "get_blocks",
+            json!("[{\"header\":{\"slot\":101}},{\"header\":{\"slot\":105}}]"),
+        ),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_blocks(Parameters(SlotRangeParams {
+                from_slot: 100,
+                to_slot: 110,
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["blocks"].as_array().unwrap().len(), 2, "{b}");
+    assert_eq!(b["blocks"][1]["header"]["slot"], 105, "{b}");
+    assert_eq!(last_call(&fake)[1..], ["get_blocks", "100", "110"]);
+}
+
+#[tokio::test]
+async fn chain_blocks_refuses_a_backwards_or_huge_range_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = server(fake.clone(), None);
+    for (from_slot, to_slot) in [(10, 9), (0, MAX_SLOT_RANGE + 1), (u64::MAX - 1, u64::MAX)] {
+        let r = s
+            .chain_blocks(Parameters(SlotRangeParams { from_slot, to_slot }))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{from_slot}..{to_slot}: {}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+const CHAIN_KEY_A: &str = "3e2acc3dacb83036f111df8fa65df19d897a7022aa42fbd51dc52d8f79117e09";
+const CHAIN_KEY_B: &str = "84f956ec0d63f5f7dac2eb85171c0b64fa2191d16d96515ba6f16ec89c78c61e";
+
+#[tokio::test]
+async fn chain_wallet_lists_the_node_accounts_with_balances() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        // As blockchain_module 0.3.4 answers: a JSON string.
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
+        ),
+        chain("wallet_get_balance", json!("1500")),
+        chain_refused("wallet_get_balance", "Unknown wallet address."),
+    ]);
+    let b = body(
+        &server(fake, None)
+            .chain_wallet(Parameters(ChainWalletParams { address: None }))
+            .await
+            .unwrap(),
+    );
+    let accounts = b["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2, "{b}");
+    assert_eq!(accounts[0]["address"], CHAIN_KEY_A, "{b}");
+    assert_eq!(accounts[0]["balance"], "1500", "{b}");
+    assert!(accounts[1]["balance"].is_null(), "{b}");
+    assert!(
+        accounts[1]["error"].as_str().unwrap().contains("Unknown"),
+        "{b}"
+    );
+}
+
+#[tokio::test]
+async fn chain_wallet_shows_one_account_with_its_notes() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("wallet_get_balance", json!("1500")),
+        chain(
+            "wallet_get_notes",
+            json!("[{\"id\":\"ab\",\"value\":1500}]"),
+        ),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_wallet(Parameters(ChainWalletParams {
+                address: Some(CHAIN_KEY_A.to_uppercase()),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["address"], CHAIN_KEY_A, "{b}");
+    assert_eq!(b["notes"][0]["value"], 1500, "{b}");
+    assert_eq!(
+        last_call(&fake)[1..],
+        ["wallet_get_notes", &format!("str:{CHAIN_KEY_A}"), "str:"]
+    );
+}
+
+const OTHER_PEER: &str =
+    "/ip4/138.68.122.137/tcp/30304/p2p/16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc";
+const OTHER_PEER_ID: &str = "16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc";
+
+/// The replies ensure_discovery reads for a node that already runs.
+fn discovery_running() -> Vec<crate::logosctl::RawOutput> {
+    vec![
+        p2p("peerInfo", PEER_INFO),
+        p2p("start", "null"),
+        p2p("discoStart", "null"),
+    ]
+}
+
+#[tokio::test]
+async fn discovery_connect_dials_a_peer_by_its_multiaddr() {
+    let mut replies = discovery_running();
+    replies.push(p2p("connectPeer", "null"));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .discovery_connect(Parameters(PeerAddrParams {
+            multiaddr: OTHER_PEER.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["connected"], OTHER_PEER_ID);
+    assert_eq!(
+        last_call(&fake)[1..],
+        [
+            "connectPeer",
+            &format!("str:{OTHER_PEER_ID}"),
+            "json:[\"/ip4/138.68.122.137/tcp/30304\"]",
+            "10000"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn discovery_connect_refuses_a_malformed_multiaddr_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .discovery_connect(Parameters(PeerAddrParams {
+            multiaddr: "/ip4/1.2.3.4/tcp/1".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn discovery_ping_reports_the_round_trip() {
+    let mut replies = discovery_running();
+    replies.push(p2p(
+        "pingPeer",
+        &format!(r#"{{"peerId":"{OTHER_PEER_ID}","rttMs":36.4}}"#),
+    ));
+    let fake = FakeRunner::with(replies);
+    let b = body(
+        &wallet_server(fake.clone())
+            .discovery_ping(Parameters(PeerIdParams {
+                peer_id: OTHER_PEER_ID.into(),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["rtt_ms"], 36.4, "{b}");
+    assert_eq!(
+        last_call(&fake)[1..],
+        ["pingPeer", &format!("str:{OTHER_PEER_ID}"), "5000"]
+    );
+}
+
+#[tokio::test]
+async fn discovery_disconnect_drops_a_peer() {
+    let mut replies = discovery_running();
+    replies.push(p2p("disconnectPeer", "null"));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .discovery_disconnect(Parameters(PeerIdParams {
+            peer_id: OTHER_PEER_ID.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["disconnected"], OTHER_PEER_ID);
+}
+
+#[tokio::test]
+async fn peer_tools_refuse_a_malformed_peer_id_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = wallet_server(fake.clone());
+    let bad = || {
+        Parameters(PeerIdParams {
+            peer_id: "not a peer".into(),
+        })
+    };
+    assert!(is_error(&s.discovery_ping(bad()).await.unwrap()));
+    assert!(is_error(&s.discovery_disconnect(bad()).await.unwrap()));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f";
+const FAUCET_LOADED: &str = r#"[{"name":"lez_faucet","status":"loaded"}]"#;
+
+/// A lez_faucet reply: its methods return a JSON document as a string.
+fn faucet(method: &str, envelope: Value) -> crate::logosctl::RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "lez_faucet",
+        "result": envelope.to_string(),
+        "status": "ok",
+    })
+    .to_string())
+}
+
+fn agent_address() -> String {
+    format!("Public/{}", guard::account_id_base58(AGENT_ID).unwrap())
+}
+
+#[tokio::test]
+async fn the_faucet_pays_an_agent_account_and_waits_for_the_receipt() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
+        ),
+        faucet(
+            "jobStatus",
+            json!({
+                "ok": true, "job_id": "job-1", "status": "succeeded",
+                "result": { "amount": "100000000", "balance_before": "0",
+                            "balance_after": "100000000", "tx_hash": TX },
+            }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+    ]);
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["status"], "succeeded", "{b}");
+    assert_eq!(b["receipt"]["tx_hash"], TX, "{b}");
+    let calls = fake.calls.lock().unwrap();
+    let configure = calls
+        .iter()
+        .find(|c| c.get(3).map(String::as_str) == Some("configure"))
+        .unwrap();
+    assert_eq!(configure[4], "str:https://testnet.lez.logos.co/");
+    let drop = calls
+        .iter()
+        .find(|c| c.get(3).map(String::as_str) == Some("requestDrop"))
+        .unwrap();
+    assert_eq!(drop[4], format!("str:{}", agent_address()));
+    // A fresh lowercase UUID, so a retry can never claim twice.
+    let key = drop[5].strip_prefix("str:").unwrap();
+    assert_eq!(key.len(), 36, "{key}");
+    assert!(
+        key.chars()
+            .all(|c| c == '-' || c.is_ascii_digit() || c.is_ascii_lowercase()),
+        "{key}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("jobResultAck"))
+    );
+}
+
+#[tokio::test]
+async fn the_faucet_never_pays_an_account_outside_the_agent_wallet() {
+    let fake = FakeRunner::with(opened_by_server());
+    let other = format!(
+        "Public/{}",
+        guard::account_id_base58(
+            "846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc"
+        )
+        .unwrap()
+    );
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(other),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(2).map(String::as_str) == Some("lez_faucet"))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_drop_says_why() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet(
+            "requestDrop",
+            json!({ "ok": false, "error": { "code": "rate_limited",
+                    "message": "The faucet service is limiting claims right now. Try again later." } }),
+        ),
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("limiting claims"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_running_drop_is_checked_again_by_its_job_id() {
+    let running = || {
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "job-1", "status": "running", "phase": "reconciling" }),
+        )
+    };
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
+        ),
+        running(),
+        out(FAUCET_LOADED),
+        running(),
+    ]);
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    // The agent stops waiting at once: the drop goes on.
+    let gave_up = CancellationToken::new();
+    gave_up.cancel();
+    let first = body(
+        &s.wallet_faucet(
+            gave_up,
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(first["job_id"], "job-1", "{first}");
+    let b = body(
+        &s.wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: None,
+                job_id: Some("job-1".into()),
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(b["status"], "running", "{b}");
+    assert_eq!(b["job_id"], "job-1", "{b}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("jobResultAck"))
+    );
+}
+
+#[tokio::test]
+async fn without_lez_faucet_the_faucet_says_where_to_get_it() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(r#"[{"name":"lez_core","status":"loaded"}]"#),
+        crate::logosctl::RawOutput {
+            code: 3,
+            stdout: r#"{"code":"MODULE_LOAD_FAILED","message":"Failed to load module 'lez_faucet'.","status":"error"}"#.into(),
+            stderr: String::new(),
+        },
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("LEZ Faucet"), "{}", text(&r));
+}
+
+/// A server running inside Basecamp, where the AI Agent app answers approvals.
+fn hosted_server(fake: Arc<FakeRunner>) -> LogosServer {
+    let mut s = server(fake, None);
+    s.settings.host_owns_messaging = true;
+    s
+}
+
+/// The replies a chain transfer's checks read: the sender is known and holds 5000.
+fn chain_sender_ok() -> [crate::logosctl::RawOutput; 2] {
+    [
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
+        ),
+        chain("wallet_get_balance", json!("5000")),
+    ]
+}
+
+fn chain_transfer_params(amount: &str) -> Parameters<ChainTransferParams> {
+    Parameters(ChainTransferParams {
+        from: CHAIN_KEY_A.into(),
+        to: CHAIN_KEY_B.into(),
+        amount_lepta: amount.into(),
+    })
+}
+
+/// Start a chain transfer and wait until it is waiting for the user.
+async fn request_chain_transfer(
+    s: &LogosServer,
+) -> (tokio::task::JoinHandle<CallToolResult>, String) {
+    let agent = s.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .chain_transfer(CancellationToken::new(), chain_transfer_params("1500"))
+            .await
+            .unwrap()
+    });
+    for _ in 0..100 {
+        if let Some(id) = s.approvals()["waiting"][0]["id"].as_str() {
+            return (call, id.to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no request appeared");
+}
+
+fn chain_sends(fake: &FakeRunner) -> Vec<Vec<String>> {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("wallet_transfer_funds"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn chain_transfers_sit_behind_the_transfers_switch() {
+    assert_eq!(ToolGroups::group_of("chain_transfer"), Some("transfers"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_chain_transfer_sends_from_the_key_with_change_back_to_it() {
+    let mut replies = chain_sender_ok().to_vec(); // checks before asking
+    replies.extend(chain_sender_ok()); // checks again when approved
+    replies.push(chain("wallet_transfer_funds", json!(TX)));
+    let fake = FakeRunner::with(replies);
+    // Approval is asked for even with "Ask me before each transfer" off.
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    let waiting = &s.approvals()["waiting"][0];
+    assert_eq!(waiting["chain"], true, "{waiting}");
+    assert!(
+        chain_sends(&fake).is_empty(),
+        "nothing sent before the user answers"
+    );
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], TX);
+    assert_eq!(
+        chain_sends(&fake)[0][4..],
+        [
+            format!("str:{CHAIN_KEY_A}"),
+            format!("json:[\"{CHAIN_KEY_A}\"]"),
+            format!("str:{CHAIN_KEY_B}"),
+            "str:1500".to_string(),
+            "str:".to_string(),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_denied_chain_transfer_is_never_sent() {
+    let fake = FakeRunner::with(chain_sender_ok().to_vec());
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    s.deny_transfer(&id).unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(chain_sends(&fake).is_empty());
+}
+
+#[tokio::test]
+async fn chain_transfers_need_basecamp_to_approve_them() {
+    let fake = FakeRunner::with(vec![]);
+    let r = server(fake.clone(), None)
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("1"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("Basecamp"), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_chain_transfer_from_a_key_the_node_lacks_never_reaches_the_user() {
+    let fake = FakeRunner::with(vec![chain(
+        "wallet_get_known_addresses",
+        json!(format!("[\"{CHAIN_KEY_B}\"]")),
+    )]);
+    let s = hosted_server(fake.clone());
+    let r = s
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("1"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(s.approvals()["waiting"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_chain_transfer_beyond_the_balance_never_reaches_the_user() {
+    let fake = FakeRunner::with(chain_sender_ok().to_vec());
+    let s = hosted_server(fake.clone());
+    let r = s
+        .chain_transfer(CancellationToken::new(), chain_transfer_params("5001"))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(s.approvals()["waiting"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_chain_transfers_are_refused_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = hosted_server(fake.clone());
+    for p in [
+        ChainTransferParams {
+            from: "zz".into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "1".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: "zz".into(),
+            amount_lepta: "1".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "0".into(),
+        },
+        ChainTransferParams {
+            from: CHAIN_KEY_A.into(),
+            to: CHAIN_KEY_B.into(),
+            amount_lepta: "1.5".into(),
+        },
+    ] {
+        let r = s
+            .chain_transfer(CancellationToken::new(), Parameters(p))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{}", text(&r));
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+/// Approve a chain transfer whose send gets `reply`, and return the agent's answer.
+async fn approved_chain_send(reply: crate::logosctl::RawOutput) -> CallToolResult {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.extend(chain_sender_ok());
+    replies.push(reply);
+    let s = hosted_server(FakeRunner::with(replies));
+    let (call, id) = request_chain_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    call.await.unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_chain_send_may_still_have_gone_out() {
+    // The node may refuse after broadcasting, so a refusal is never "not sent".
+    let r = approved_chain_send(chain_refused("wallet_transfer_funds", "timed out")).await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_without_a_hash_may_have_gone_out() {
+    let r = approved_chain_send(chain("wallet_transfer_funds", Value::Null)).await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("may have been sent"), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_reporting_its_hash_in_an_object_is_sent() {
+    let r = approved_chain_send(chain("wallet_transfer_funds", json!({ "tx_hash": TX }))).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["tx_hash"], TX);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_send_whose_balance_fell_meanwhile_is_not_sent() {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.push(chain_sender_ok()[0].clone());
+    replies.push(chain("wallet_get_balance", json!("10")));
+    let fake = FakeRunner::with(replies);
+    let s = hosted_server(fake.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r));
+    assert!(chain_sends(&fake).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn turning_transfers_off_stops_a_chain_transfer_already_waiting() {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.extend(chain_sender_ok());
+    replies.push(chain("wallet_transfer_funds", json!(TX)));
+    let fake = FakeRunner::with(replies);
+    let (switches, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = hosted_server(fake.clone()).with_tool_groups(rx);
+    let (call, id) = request_chain_transfer(&s).await;
+    switches.send_modify(|g| g.set("transfers", false).unwrap());
+    s.approve_transfer(&id).await.unwrap();
+    let r = call.await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(chain_sends(&fake).is_empty());
+}
+
+const AGENT_AND_PRIVATE: &str = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"5b1f00d5c56e0a8a4f9d8e2ab5f1e6c5d4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9","is_public":false}]"#;
+
+#[tokio::test]
+async fn the_faucet_never_funds_the_public_form_of_a_private_account() {
+    let mut replies = opened_by_server();
+    replies[4] = lez("list_accounts", AGENT_AND_PRIVATE);
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(
+                    "5b1f00d5c56e0a8a4f9d8e2ab5f1e6c5d4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9".into(),
+                ),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(2).map(String::as_str) == Some("lez_faucet"))
+    );
+}
+
+#[tokio::test]
+async fn a_drop_whose_status_cannot_be_read_still_hands_back_its_job_id() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "request_drop-7", "status": "queued" }),
+        ),
+        crate::logosctl::RawOutput {
+            code: 4,
+            stdout: r#"{"code":"RPC_FAILED","message":"call failed","status":"error"}"#.into(),
+            stderr: String::new(),
+        },
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("request_drop-7"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn the_faucet_only_checks_drops_this_server_started() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: None,
+                job_id: Some("request_drop-1".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unconfirmed_drop_passes_on_the_faucets_reason() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        out(FAUCET_LOADED),
+        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet("requestDrop", json!({ "ok": true, "job_id": "job-2", "status": "queued" })),
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "job-2", "status": "outcome_unknown",
+                    "error": { "code": "unconfirmed", "message": "The claim was submitted but its outcome could not be confirmed in time." } }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+    ]);
+    let r = wallet_server(FakeRunner::with(replies))
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["status"], "outcome_unknown", "{b}");
+    assert!(
+        b["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not be confirmed"),
+        "{b}"
+    );
+}

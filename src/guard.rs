@@ -114,6 +114,20 @@ pub fn public_account_hex(input: &str) -> Result<String, String> {
     Ok(bytes.iter().rev().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A URL as it may be shown to an agent: no user info, query or fragment, where
+/// a credential could sit.
+pub fn shown_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
+}
+
 /// An account as `Public/<base58>`, `Private/<base58>` or 64 hex characters
 /// (public): its id in hex, and whether it is private.
 pub fn account_hex(input: &str) -> Result<(String, bool), String> {
@@ -142,15 +156,19 @@ pub fn amount_le16_hex(lepta: &str) -> Result<String, String> {
         .collect())
 }
 
+/// Whether `peer` looks like a libp2p peer id: a base58 multihash (12D3KooW…,
+/// 16Uiu2…, Qm…) of 40 to 60 characters.
+pub fn is_peer_id(peer: &str) -> bool {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    (40..=60).contains(&peer.len()) && peer.chars().all(|c| BASE58.contains(c))
+}
+
 /// A `/.../p2p/<peerId>` multiaddr as libp2p_module's `{peerId, addrs}` bootstrap entry.
 pub fn bootstrap_node(multiaddr: &str) -> Result<serde_json::Value, String> {
     let bad =
         || format!("bootstrap peer must be a multiaddr ending in /p2p/<peer id>: {multiaddr:?}");
     let (addr, peer) = multiaddr.rsplit_once("/p2p/").ok_or_else(bad)?;
-    // Peer ids are base58 multihashes (12D3KooW…, 16Uiu2…, Qm…): 40 to 60 characters.
-    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let peer_ok = (40..=60).contains(&peer.len()) && peer.chars().all(|c| BASE58.contains(c));
-    if !addr.starts_with('/') || addr.len() < 2 || !peer_ok {
+    if !addr.starts_with('/') || addr.len() < 2 || !is_peer_id(peer) {
         return Err(bad());
     }
     Ok(serde_json::json!({ "peerId": peer, "addrs": [addr] }))

@@ -203,3 +203,18 @@ fn splits_bootstrap_multiaddrs_into_libp2p_entries() {
         assert!(bootstrap_node(bad).is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn a_shown_url_drops_credentials_query_and_fragment() {
+    assert_eq!(
+        shown_url("https://user:secret@seq.example:8443/rpc?token=abc#x"),
+        "https://seq.example:8443/rpc"
+    );
+    assert_eq!(
+        shown_url("https://testnet.lez.logos.co/"),
+        "https://testnet.lez.logos.co/"
+    );
+    assert_eq!(shown_url("not a url"), "not a url");
+    // An @ in the path is not a credential.
+    assert_eq!(shown_url("http://host/a@b"), "http://host/a@b");
+}

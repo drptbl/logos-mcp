@@ -32,7 +32,7 @@ Item {
         { key: "messaging", title: qsTr("Messaging"), detail: qsTr("Read and send messages, RLN status") },
         { key: "storage", title: qsTr("Storage"), detail: qsTr("Upload and download files in the files folder") },
         { key: "wallet", title: qsTr("Wallet"), detail: qsTr("See accounts and balances, create agent accounts") },
-        { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts") },
+        { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts, and ask to send TestToken from your chain node") },
         { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services, see connected peers") },
         { key: "chain", title: qsTr("Chain"), detail: qsTr("Read the Logos chain: blocks, transactions and network info") },
         { key: "chat", title: qsTr("Chat"), detail: qsTr("Uses your Basecamp chat account: the agent reads and sends in every Logos Chat conversation you have") },
@@ -69,12 +69,13 @@ Item {
 
     // lepta as LEZ (1 LEZ = 10^9 lepta), from the integer string itself: no
     // floating point, so small and very large balances both show exactly.
-    function lez(lepta) {
+    // LEZ and the Logos chain's TestToken both count 10^9 lepta to the token.
+    function lez(lepta, symbol) {
         if (lepta === null || lepta === undefined || !/^[0-9]+$/.test(String(lepta))) return "?"
         const digits = String(lepta).replace(/^0+(?=.)/, "").padStart(10, "0")
         const whole = digits.slice(0, -9)
         const fraction = digits.slice(-9).replace(/0+$/, "")
-        return whole + (fraction ? "." + fraction : "") + " LEZ"
+        return whole + (fraction ? "." + fraction : "") + " " + (symbol || "LEZ")
     }
 
     // Lepta as digit strings, added exactly.
@@ -294,7 +295,12 @@ Item {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
                             // A program call, such as an escrow open, says what it does.
-                            text: modelData.call
+                            // A chain transfer spends the chain node's own wallet.
+                            text: modelData.chain
+                                ? qsTr("%1 on the Logos chain from your node's %2 to %3, asked at %4")
+                                    .arg(root.lez(modelData.amount_lepta, "TestToken")).arg(modelData.from)
+                                    .arg(modelData.to).arg(root.time(modelData.requested_at))
+                                : modelData.call
                                 ? qsTr("%1 from %2 %3, asked at %4")
                                     .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
                                     .arg(modelData.call.description)

@@ -53,7 +53,7 @@ impl ToolGroups {
     /// The group a tool belongs to, by its name.
     pub fn group_of(tool: &str) -> Option<&'static str> {
         match tool {
-            "wallet_transfer" | "wallet_transfer_status" => Some("transfers"),
+            "wallet_transfer" | "wallet_transfer_status" | "chain_transfer" => Some("transfers"),
             "rln_status" => Some("messaging"),
             t if t.starts_with("messaging_") => Some("messaging"),
             t if t.starts_with("storage_") => Some("storage"),
@@ -154,6 +154,10 @@ pub struct TransferRequest {
     /// open, instead of a plain transfer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<ProgramCall>,
+    /// A Logos chain transfer from the node's own wallet, in place of a LEZ
+    /// one: `from` and `to` are chain keys and the amount is in its lepta.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub chain: bool,
 }
 
 /// A program call that moves the amount out of `from` in place of a plain
@@ -208,6 +212,27 @@ impl Approvals {
         amount_lepta: &str,
         call: Option<ProgramCall>,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        self.file(from, to, amount_lepta, call, false)
+    }
+
+    /// File a Logos chain transfer from the node's own wallet.
+    pub fn request_chain(
+        &self,
+        from: &str,
+        to: &str,
+        amount_lepta: &str,
+    ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        self.file(from, to, amount_lepta, None, true)
+    }
+
+    fn file(
+        &self,
+        from: &str,
+        to: &str,
+        amount_lepta: &str,
+        call: Option<ProgramCall>,
+        chain: bool,
+    ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         // Unique across restarts too, so an old id never names a new request.
         let id = format!(
             "{:x}-{}",
@@ -238,6 +263,7 @@ impl Approvals {
                     amount_lepta: amount_lepta.to_string(),
                     requested_at: unix_now(),
                     call,
+                    chain,
                 },
                 expires: tokio::time::Instant::now() + APPROVAL_EXPIRES,
                 decision,

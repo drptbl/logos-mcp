@@ -33,6 +33,11 @@ const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 const BLOCKCHAIN: &str = "blockchain_module";
+const FAUCET: &str = "lez_faucet";
+/// How long wallet_faucet waits for a drop before handing back its job id.
+const FAUCET_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+/// How long a ping waits for a peer, in milliseconds. Dialing gets twice this.
+const PEER_TIMEOUT_MS: i64 = 5_000;
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
 pub const MAX_CHAT_BYTES: usize = 64 * 1024;
@@ -217,6 +222,9 @@ pub struct LogosServer {
     discovery_ready: Arc<tokio::sync::Mutex<bool>>,
     /// Service ids this server has registered discovery interest in.
     interests: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    /// Faucet drops this server started: the only ones wallet_faucet checks on,
+    /// so the agent never reads or acknowledges the Faucet app's own.
+    faucet_jobs: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
@@ -340,11 +348,60 @@ pub struct HeaderParams {
     pub header_id: String,
 }
 
+/// The most slots chain_blocks reads at once: about ten minutes of chain.
+pub const MAX_SLOT_RANGE: u64 = 600;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SlotRangeParams {
+    /// The first slot, inclusive. chain_info's consensus slot is the latest.
+    pub from_slot: u64,
+    /// The last slot, inclusive. At most 600 slots after from_slot.
+    pub to_slot: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainWalletParams {
+    /// One of the node's chain wallet addresses, 64 hex characters, to show with
+    /// its notes. Leave out to list them all.
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainTransferParams {
+    /// The sender: one of the node's chain wallet addresses, 64 hex characters, as
+    /// chain_wallet lists them. Change goes back to it.
+    pub from: String,
+    /// The recipient's public key, 64 hex characters.
+    pub to: String,
+    /// The amount in lepta, as digits: 1 TestToken is 1000000000.
+    pub amount_lepta: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChainTxParams {
     /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
     /// wallet_tx_status instead.
     pub tx_hash: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FaucetParams {
+    /// One of the agent's own public accounts, Public/<base58>, to receive the drop.
+    pub account: Option<String>,
+    /// A drop still running, as an earlier wallet_faucet call returned it, to check again.
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PeerAddrParams {
+    /// The peer's multiaddr, ending in /p2p/<peer id>, e.g. /ip4/1.2.3.4/tcp/30304/p2p/16Uiu2…
+    pub multiaddr: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PeerIdParams {
+    /// The peer id, as discovery_peers or discovery_lookup shows it.
+    pub peer_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -553,6 +610,17 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
     fail(message)
 }
 
+/// A lez_faucet failure, with where to get the module when it isn't there.
+fn faucet_error(e: LogosError) -> String {
+    let message = e.to_string();
+    if matches!(e, LogosError::Module(_)) {
+        return format!(
+            "{message}: the faucet needs Basecamp's LEZ Faucet module, from its catalog or https://github.com/logos-co/lez-faucet"
+        );
+    }
+    message
+}
+
 /// A blockchain_module failure, with the way out when the module or its node isn't running.
 fn chain_error(e: LogosError) -> String {
     let message = e.to_string();
@@ -568,6 +636,23 @@ fn chain_error(e: LogosError) -> String {
         );
     }
     message
+}
+
+/// A fresh random UUID, lowercase, as lez_faucet takes its request keys.
+fn uuid_v4() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| e.to_string())?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
 }
 
 fn validate_conversation_id(id: &str) -> Result<(), String> {
@@ -605,6 +690,7 @@ impl LogosServer {
             connecting: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
+            faucet_jobs: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
@@ -682,6 +768,18 @@ impl LogosServer {
         let id = id.to_string();
         let reply = json!({ "request_id": id, "state": "approved" });
         tokio::spawn(async move {
+            if request.chain {
+                let outcome = match server
+                    .chain_send(&request.from, &request.to, &request.amount_lepta)
+                    .await
+                {
+                    Ok(tx_hash) => Decision::Sent { tx_hash },
+                    Err(SendError::NotSent(reason)) => Decision::Failed { reason },
+                    Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
+                };
+                server.approvals.finish(&id, outcome);
+                return;
+            }
             let p = TransferParams {
                 from: request.from,
                 to: request.to,
@@ -1151,7 +1249,7 @@ impl LogosServer {
             "opened_now": w.opened_now,
             "opened_by_this_server": w.trusted && !w.shared,
             "warning": w.warning(),
-            "sequencer": w.sequencer,
+            "sequencer": guard::shown_url(&w.sequencer),
             "block_height": height,
             "private_synced_block": synced,
         }))
@@ -2001,7 +2099,7 @@ impl LogosServer {
         if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
             return fail(e.message());
         }
-        let (id, mut decision) =
+        let (id, decision) =
             match self
                 .approvals
                 .request(&p.from, &p.to, &p.amount_lepta, p.call.clone())
@@ -2009,6 +2107,19 @@ impl LogosServer {
                 Ok(filed) => filed,
                 Err(e) => return fail(e),
             };
+        self.await_approval(&ct, &id, decision, |tx_hash| submitted(&p, tx_hash))
+            .await
+    }
+
+    /// Wait for the user's answer to request `id`, up to APPROVAL_WAIT. A sent
+    /// transfer is reported with `sent`.
+    async fn await_approval(
+        &self,
+        ct: &CancellationToken,
+        id: &str,
+        mut decision: tokio::sync::watch::Receiver<Decision>,
+        sent: impl FnOnce(&str) -> Value,
+    ) -> Result<CallToolResult, McpError> {
         let answered = async {
             loop {
                 let now = decision.borrow_and_update().clone();
@@ -2022,7 +2133,7 @@ impl LogosServer {
         };
         tokio::select! {
             outcome = answered => match outcome {
-                Decision::Sent { tx_hash } => ok(submitted(&p, &tx_hash)),
+                Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
                 Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
                 Decision::Denied => fail("the user denied this transfer: nothing was sent"),
                 Decision::Expired => fail("the user did not answer in time: nothing was sent"),
@@ -2049,12 +2160,299 @@ impl LogosServer {
             () = ct.cancelled() => {
                 // A request still waiting is cancelled: no approval may send behind
                 // the agent's back. One the user already approved goes ahead, so say so.
-                match self.approvals.cancel(&id) {
+                match self.approvals.cancel(id) {
                     Decision::Cancelled => fail("transfer cancelled: it will not be sent"),
                     _ => fail(format!(
                         "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
                     )),
                 }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so every chain transfer waits for the user's Approve in the AI Agent app, which only Basecamp has. Irreversible once sent."
+    )]
+    pub async fn chain_transfer(
+        &self,
+        ct: CancellationToken,
+        Parameters(p): Parameters<ChainTransferParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.settings.host_owns_messaging {
+            return fail(
+                "chain transfers wait for the user's Approve in the AI Agent app, so they only work inside Basecamp",
+            );
+        }
+        let checked = (|| {
+            let from = hex64(&p.from, "from")?;
+            let to = hex64(&p.to, "to")?;
+            let amount = p.amount_lepta.trim();
+            match amount.parse::<u128>() {
+                Ok(n) if n > 0 && amount.chars().all(|c| c.is_ascii_digit()) => {}
+                _ => {
+                    return Err(
+                        "amount_lepta must be a whole number of lepta above 0, as digits"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok((from, to, amount.to_string()))
+        })();
+        let (from, to, amount) = match checked {
+            Ok(found) => found,
+            Err(e) => return fail(e),
+        };
+        // Check now, so a hopeless request never reaches the user. Approving
+        // checks again before sending.
+        if let Err(e) = self.chain_sendable(&from, &amount).await {
+            return fail(e);
+        }
+        let (id, decision) = match self.approvals.request_chain(&from, &to, &amount) {
+            Ok(filed) => filed,
+            Err(e) => return fail(e),
+        };
+        self.await_approval(&ct, &id, decision, |tx_hash| {
+            json!({
+                "submitted": true,
+                "tx_hash": tx_hash,
+                "from": from,
+                "to": to,
+                "amount_lepta": amount,
+                "note": "submitted, not yet confirmed: chain_wallet shows the new balance once it is in a block",
+            })
+        })
+        .await
+    }
+
+    /// Whether the chain node can send `amount` from `from`: it holds the key
+    /// and the balance covers it. The fee comes on top, so the node may still refuse.
+    async fn chain_sendable(&self, from: &str, amount: &str) -> Result<(), String> {
+        self.chain_ready().await?;
+        let known = self.chain_read("wallet_get_known_addresses", &[]).await?;
+        if !known
+            .as_array()
+            .is_some_and(|k| k.iter().any(|a| a.as_str() == Some(from)))
+        {
+            return Err(
+                "from must be one of the chain node's own addresses, as chain_wallet lists them"
+                    .into(),
+            );
+        }
+        let balance = self
+            .chain_read("wallet_get_balance", &[Arg::str(from)])
+            .await?;
+        let held = match &balance {
+            Value::String(b) => b.parse::<u128>().ok(),
+            Value::Number(n) => n.as_u64().map(u128::from),
+            _ => None,
+        };
+        let wanted = amount.parse::<u128>().map_err(|e| e.to_string())?;
+        match held {
+            Some(held) if held >= wanted => Ok(()),
+            Some(held) => Err(format!("{from} holds {held} lepta, less than {wanted}")),
+            None => Err(format!("unreadable balance for {from}: {balance}")),
+        }
+    }
+
+    /// Send an approved chain transfer, checking it again first.
+    async fn chain_send(&self, from: &str, to: &str, amount: &str) -> Result<String, SendError> {
+        self.chain_sendable(from, amount)
+            .await
+            .map_err(SendError::NotSent)?;
+        // Last look before sending: the user may have turned transfers off while it waited.
+        if !self.allows("chain_transfer") {
+            return Err(SendError::NotSent(
+                "transfer cancelled: the user turned off transfers; nothing was sent".into(),
+            ));
+        }
+        let args = [
+            Arg::str(from),
+            Arg::Json(json!([from])),
+            Arg::str(to),
+            Arg::str(amount),
+            Arg::str(""),
+        ];
+        match self
+            .node
+            .call(BLOCKCHAIN, "wallet_transfer_funds", &args)
+            .await
+            .map(embedded_json)
+        {
+            Ok(Value::String(hash)) if !hash.is_empty() => Ok(hash),
+            Ok(other) => match other
+                .get("tx_hash")
+                .or(other.get("hash"))
+                .and_then(Value::as_str)
+            {
+                Some(hash) => Ok(hash.to_string()),
+                None => Err(SendError::MaybeSent(format!(
+                    "the chain node gave no transaction hash ({other}): it may have been sent, check chain_wallet"
+                ))),
+            },
+            // Even a refusal may come after the broadcast, so never claim it wasn't sent.
+            Err(e) => Err(SendError::MaybeSent(format!(
+                "{e}: it may have been sent, check chain_wallet before trying again"
+            ))),
+        }
+    }
+
+    #[tool(
+        description = "Ask the LEZ testnet faucet for its drop, 0.1 LEZ on the v0.3 testnet, into one of the agent's own public accounts. One claim per account per day. Waits up to 90 seconds for the receipt; a drop still running comes back with a job_id to check again. Needs Basecamp's LEZ Faucet module."
+    )]
+    pub async fn wallet_faucet(
+        &self,
+        ct: CancellationToken,
+        Parameters(p): Parameters<FaucetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match (p.account, p.job_id) {
+            (Some(account), None) => match self.faucet_drop(&ct, account.trim()).await {
+                Ok(done) => ok(done),
+                Err(e) => fail(e),
+            },
+            (None, Some(job)) => {
+                let job = job.trim();
+                if job.is_empty()
+                    || job.len() > 128
+                    || !job
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return fail("job_id must be the one wallet_faucet returned");
+                }
+                let ours = self
+                    .faucet_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(job);
+                if !ours {
+                    return fail(
+                        "job_id must be one wallet_faucet returned since this server started",
+                    );
+                }
+                let checked = async {
+                    self.faucet_ready().await?;
+                    self.faucet_wait(&ct, job, std::time::Duration::ZERO).await
+                };
+                match checked.await {
+                    Ok(done) => ok(done),
+                    Err(e) => fail(e),
+                }
+            }
+            _ => fail("give an account to fund, or the job_id of a drop to check, not both"),
+        }
+    }
+
+    async fn faucet_drop(&self, ct: &CancellationToken, account: &str) -> Result<Value, String> {
+        let id = guard::public_account_hex(account)?;
+        let w = self.ensure_wallet().await?;
+        let public = w.accounts.iter().any(|a| {
+            a.get("account_id").and_then(Value::as_str) == Some(id.as_str())
+                && a.get("is_public").and_then(Value::as_bool) == Some(true)
+        });
+        if !w.is_agent(&id) || !public {
+            return Err("the faucet only pays the agent's own public accounts: give one wallet_accounts marks as an agent account".into());
+        }
+        let address = guard::account_id_base58(&id)
+            .map(|b58| format!("Public/{b58}"))
+            .ok_or("unreadable account id")?;
+        self.faucet_ready().await?;
+        // The faucet module serves one network at a time: the wallet's.
+        self.faucet_call("configure", &[Arg::str(&w.sequencer)])
+            .await?;
+        let started = self
+            .faucet_call("requestDrop", &[Arg::str(&address), Arg::str(uuid_v4()?)])
+            .await?;
+        let job = started["job_id"]
+            .as_str()
+            .ok_or_else(|| "lez_faucet started no job".to_string())?
+            .to_string();
+        self.faucet_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job.clone());
+        // The drop is under way: whatever goes wrong now, the agent keeps its job id.
+        self.faucet_wait(ct, &job, FAUCET_WAIT).await.map_err(|e| {
+            format!(
+                "{e} (drop {job}: check it with wallet_faucet and this job_id before asking again)"
+            )
+        })
+    }
+
+    /// Load lez_faucet when this server runs on its own; Basecamp loads it itself.
+    async fn faucet_ready(&self) -> Result<(), String> {
+        if !self.settings.host_owns_messaging {
+            self.load(FAUCET).await.map_err(faucet_error)?;
+        }
+        Ok(())
+    }
+
+    /// One lez_faucet call, its `{ok, error}` envelope unwrapped.
+    async fn faucet_call(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
+        let reply = self
+            .node
+            .call(FAUCET, method, args)
+            .await
+            .map(embedded_json)
+            .map_err(faucet_error)?;
+        if reply["ok"].as_bool() == Some(true) {
+            return Ok(reply);
+        }
+        let error = &reply["error"];
+        Err(error["message"]
+            .as_str()
+            .or(error["code"].as_str())
+            .map_or_else(
+                || format!("unexpected lez_faucet reply: {reply}"),
+                str::to_string,
+            ))
+    }
+
+    /// Follow a drop until it settles or `wait` runs out. A settled one is
+    /// acknowledged, so the module can forget it.
+    async fn faucet_wait(
+        &self,
+        ct: &CancellationToken,
+        job: &str,
+        wait: std::time::Duration,
+    ) -> Result<Value, String> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let now = self.faucet_call("jobStatus", &[Arg::str(job)]).await?;
+            let status = now["status"].as_str().unwrap_or_default().to_string();
+            if matches!(
+                status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+            ) {
+                let _ = self.faucet_call("jobResultAck", &[Arg::str(job)]).await;
+                return match status.as_str() {
+                    "succeeded" => {
+                        Ok(json!({ "status": status, "job_id": job, "receipt": now["result"] }))
+                    }
+                    "outcome_unknown" => Ok(json!({
+                        "status": status,
+                        "job_id": job,
+                        "reason": now["error"]["message"],
+                        "note": "the faucet can't confirm whether it paid: check the account's balance with wallet_account before asking again",
+                    })),
+                    _ => Err(now["error"]["message"].as_str().map_or_else(
+                        || format!("the drop {status}: nothing was sent"),
+                        str::to_string,
+                    )),
+                };
+            }
+            let running = json!({
+                "status": status,
+                "job_id": job,
+                "phase": now["phase"],
+                "note": "still running: call wallet_faucet with this job_id to check again",
+            });
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(running);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                // The drop goes on without us: say how to find it.
+                () = ct.cancelled() => return Ok(running),
             }
         }
     }
@@ -2437,6 +2835,75 @@ impl LogosServer {
         Ok(())
     }
 
+    #[tool(
+        description = "Connect this node's discovery network to a peer, by its multiaddr. Changes only which peers the node talks to."
+    )]
+    async fn discovery_connect(
+        &self,
+        Parameters(p): Parameters<PeerAddrParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let entry = match guard::bootstrap_node(p.multiaddr.trim()) {
+            Ok(entry) => entry,
+            Err(e) => return fail(e.replace("bootstrap peer", "multiaddr")),
+        };
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        let peer = entry["peerId"].as_str().unwrap_or_default().to_string();
+        let args = [
+            Arg::str(&peer),
+            Arg::Json(entry["addrs"].clone()),
+            Arg::Int(PEER_TIMEOUT_MS * 2),
+        ];
+        match self.node.call(P2P, "connectPeer", &args).await {
+            Ok(_) => ok(json!({ "connected": peer })),
+            Err(e) => logos_fail(e),
+        }
+    }
+
+    #[tool(description = "Disconnect this node's discovery network from a peer.")]
+    async fn discovery_disconnect(
+        &self,
+        Parameters(p): Parameters<PeerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = p.peer_id.trim();
+        if !guard::is_peer_id(peer) {
+            return fail("peer_id must be a libp2p peer id, as discovery_peers shows it");
+        }
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        match self
+            .node
+            .call(P2P, "disconnectPeer", &[Arg::str(peer)])
+            .await
+        {
+            Ok(_) => ok(json!({ "disconnected": peer })),
+            Err(e) => logos_fail(e),
+        }
+    }
+
+    #[tool(
+        description = "Ping a peer over the discovery network and report the round trip in milliseconds."
+    )]
+    async fn discovery_ping(
+        &self,
+        Parameters(p): Parameters<PeerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = p.peer_id.trim();
+        if !guard::is_peer_id(peer) {
+            return fail("peer_id must be a libp2p peer id, as discovery_peers shows it");
+        }
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        let args = [Arg::str(peer), Arg::Int(PEER_TIMEOUT_MS)];
+        match self.node.call(P2P, "pingPeer", &args).await {
+            Ok(pong) => ok(json!({ "peer_id": peer, "rtt_ms": pong["rttMs"] })),
+            Err(e) => logos_fail(e),
+        }
+    }
+
     /// One blockchain_module read, decoded when it comes back as a JSON string.
     async fn chain_read(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
         self.node
@@ -2466,21 +2933,113 @@ impl LogosServer {
         if let Err(e) = self.chain_ready().await {
             return fail(e);
         }
-        let mut info = serde_json::Map::new();
-        for (key, method) in [
-            ("chain_id", "get_chain_id"),
-            ("consensus", "get_cryptarchia_info"),
-            ("time", "get_time_info"),
-            ("network", "get_network_info"),
-        ] {
-            match self.chain_read(method, &[]).await {
-                Ok(v) => {
-                    info.insert(key.into(), v);
-                }
-                Err(e) => return fail(e),
-            }
+        // Four independent reads, each its own logosctl call: run them together.
+        let read = tokio::try_join!(
+            self.chain_read("get_chain_id", &[]),
+            self.chain_read("get_cryptarchia_info", &[]),
+            self.chain_read("get_time_info", &[]),
+            self.chain_read("get_network_info", &[]),
+        );
+        match read {
+            Ok((chain_id, consensus, time, network)) => ok(json!({
+                "chain_id": chain_id,
+                "consensus": consensus,
+                "time": time,
+                "network": network,
+            })),
+            Err(e) => fail(e),
         }
-        ok(Value::Object(info))
+    }
+
+    #[tool(
+        description = "The Logos chain blocks in a range of slots, oldest first, at most 600 slots at a time. Needs the chain node running, and only returns blocks it has synced."
+    )]
+    async fn chain_blocks(
+        &self,
+        Parameters(p): Parameters<SlotRangeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.to_slot < p.from_slot || p.to_slot - p.from_slot > MAX_SLOT_RANGE {
+            return fail(format!(
+                "give from_slot <= to_slot, at most {MAX_SLOT_RANGE} slots apart"
+            ));
+        }
+        let (Ok(from), Ok(to)) = (i64::try_from(p.from_slot), i64::try_from(p.to_slot)) else {
+            return fail("slot out of range");
+        };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
+        let range = [Arg::Int(from), Arg::Int(to)];
+        match self.chain_read("get_blocks", &range).await {
+            Ok(blocks) => ok(json!({
+                "from_slot": p.from_slot,
+                "to_slot": p.to_slot,
+                "blocks": blocks,
+            })),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(
+        description = "The Logos chain node's own wallet: every address it holds keys for, with its balance, or one address with its notes. Read-only. Needs the chain node running and synced."
+    )]
+    async fn chain_wallet(
+        &self,
+        Parameters(p): Parameters<ChainWalletParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let address = match p.address.as_deref().map(|a| hex64(a, "address")) {
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => return fail(e),
+            None => None,
+        };
+        if let Err(e) = self.chain_ready().await {
+            return fail(e);
+        }
+        if let Some(address) = address {
+            let balance = match self
+                .chain_read("wallet_get_balance", &[Arg::str(&address)])
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => return fail(e),
+            };
+            // The empty tip reads at the node's current one.
+            let args = [Arg::str(&address), Arg::str("")];
+            return match self.chain_read("wallet_get_notes", &args).await {
+                Ok(notes) => ok(json!({ "address": address, "balance": balance, "notes": notes })),
+                Err(e) => fail(e),
+            };
+        }
+        let known = match self.chain_read("wallet_get_known_addresses", &[]).await {
+            Ok(Value::Array(list)) => list,
+            Ok(other) => {
+                return fail(format!(
+                    "unexpected wallet_get_known_addresses reply: {other}"
+                ));
+            }
+            Err(e) => return fail(e),
+        };
+        // One logosctl call per address: read them together, then put them in order.
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, address) in known.iter().filter_map(Value::as_str).enumerate() {
+            let (server, address) = (self.clone(), address.to_string());
+            reads.spawn(async move {
+                let balance = server
+                    .chain_read("wallet_get_balance", &[Arg::str(&address)])
+                    .await;
+                (
+                    index,
+                    match balance {
+                        Ok(balance) => json!({ "address": address, "balance": balance }),
+                        Err(e) => json!({ "address": address, "balance": null, "error": e }),
+                    },
+                )
+            });
+        }
+        let mut accounts = reads.join_all().await;
+        accounts.sort_by_key(|(index, _)| *index);
+        let accounts: Vec<Value> = accounts.into_iter().map(|(_, a)| a).collect();
+        ok(json!({ "accounts": accounts }))
     }
 
     #[tool(
