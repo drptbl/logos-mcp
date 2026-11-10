@@ -153,6 +153,10 @@ pub struct TransferRequest {
 /// A program call that moves the amount out of `from` in place of a plain
 /// transfer, such as opening an escrow. Code builds it, never an agent: it
 /// goes through the same checks and approval as a transfer.
+///
+/// The checks can't read the instruction: the caller builds the instruction,
+/// the amount and the description from the same terms, so what the user
+/// approves is what the program does.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProgramCall {
     /// The program, 64 hex characters.

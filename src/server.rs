@@ -723,9 +723,11 @@ impl LogosServer {
         }
     }
 
-    /// Sign and send a program call with an agent account that moves nothing
-    /// out of it but the network fee, so it needs no approval. `accounts`
-    /// follow the signer, all 64 hex characters.
+    /// Sign and send a program call from an agent account, with no approval.
+    /// Only for calls that move nothing out of the signer but the network
+    /// fee: this can't tell what the instruction does, so a call that moves
+    /// money goes through `wallet_transfer` with a `ProgramCall` instead.
+    /// `accounts` follow the signer, all 64 hex characters.
     pub async fn send_signed(
         &self,
         signer: &str,
