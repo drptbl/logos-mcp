@@ -33,6 +33,8 @@ const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 const BLOCKCHAIN: &str = "blockchain_module";
+/// How long a ping waits for a peer, in milliseconds. Dialing gets twice this.
+const PEER_TIMEOUT_MS: i64 = 5_000;
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
 pub const MAX_CHAT_BYTES: usize = 64 * 1024;
@@ -363,6 +365,18 @@ pub struct ChainTxParams {
     /// The Logos chain transaction hash, 64 hex characters. LEZ transactions go to
     /// wallet_tx_status instead.
     pub tx_hash: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PeerAddrParams {
+    /// The peer's multiaddr, ending in /p2p/<peer id>, e.g. /ip4/1.2.3.4/tcp/30304/p2p/16Uiu2…
+    pub multiaddr: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PeerIdParams {
+    /// The peer id, as discovery_peers or discovery_lookup shows it.
+    pub peer_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2453,6 +2467,75 @@ impl LogosServer {
             self.load(BLOCKCHAIN).await.map_err(chain_error)?;
         }
         Ok(())
+    }
+
+    #[tool(
+        description = "Connect this node's discovery network to a peer, by its multiaddr. Changes only which peers the node talks to."
+    )]
+    async fn discovery_connect(
+        &self,
+        Parameters(p): Parameters<PeerAddrParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let entry = match guard::bootstrap_node(p.multiaddr.trim()) {
+            Ok(entry) => entry,
+            Err(e) => return fail(e.replace("bootstrap peer", "multiaddr")),
+        };
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        let peer = entry["peerId"].as_str().unwrap_or_default().to_string();
+        let args = [
+            Arg::str(&peer),
+            Arg::Json(entry["addrs"].clone()),
+            Arg::Int(PEER_TIMEOUT_MS * 2),
+        ];
+        match self.node.call(P2P, "connectPeer", &args).await {
+            Ok(_) => ok(json!({ "connected": peer })),
+            Err(e) => logos_fail(e),
+        }
+    }
+
+    #[tool(description = "Disconnect this node's discovery network from a peer.")]
+    async fn discovery_disconnect(
+        &self,
+        Parameters(p): Parameters<PeerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = p.peer_id.trim();
+        if !guard::is_peer_id(peer) {
+            return fail("peer_id must be a libp2p peer id, as discovery_peers shows it");
+        }
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        match self
+            .node
+            .call(P2P, "disconnectPeer", &[Arg::str(peer)])
+            .await
+        {
+            Ok(_) => ok(json!({ "disconnected": peer })),
+            Err(e) => logos_fail(e),
+        }
+    }
+
+    #[tool(
+        description = "Ping a peer over the discovery network and report the round trip in milliseconds."
+    )]
+    async fn discovery_ping(
+        &self,
+        Parameters(p): Parameters<PeerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = p.peer_id.trim();
+        if !guard::is_peer_id(peer) {
+            return fail("peer_id must be a libp2p peer id, as discovery_peers shows it");
+        }
+        if let Err(e) = self.ensure_discovery().await {
+            return fail(e);
+        }
+        let args = [Arg::str(peer), Arg::Int(PEER_TIMEOUT_MS)];
+        match self.node.call(P2P, "pingPeer", &args).await {
+            Ok(pong) => ok(json!({ "peer_id": peer, "rtt_ms": pong["rttMs"] })),
+            Err(e) => logos_fail(e),
+        }
     }
 
     /// One blockchain_module read, decoded when it comes back as a JSON string.

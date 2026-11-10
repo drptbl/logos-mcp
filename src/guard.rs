@@ -156,15 +156,19 @@ pub fn amount_le16_hex(lepta: &str) -> Result<String, String> {
         .collect())
 }
 
+/// Whether `peer` looks like a libp2p peer id: a base58 multihash (12D3KooW…,
+/// 16Uiu2…, Qm…) of 40 to 60 characters.
+pub fn is_peer_id(peer: &str) -> bool {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    (40..=60).contains(&peer.len()) && peer.chars().all(|c| BASE58.contains(c))
+}
+
 /// A `/.../p2p/<peerId>` multiaddr as libp2p_module's `{peerId, addrs}` bootstrap entry.
 pub fn bootstrap_node(multiaddr: &str) -> Result<serde_json::Value, String> {
     let bad =
         || format!("bootstrap peer must be a multiaddr ending in /p2p/<peer id>: {multiaddr:?}");
     let (addr, peer) = multiaddr.rsplit_once("/p2p/").ok_or_else(bad)?;
-    // Peer ids are base58 multihashes (12D3KooW…, 16Uiu2…, Qm…): 40 to 60 characters.
-    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let peer_ok = (40..=60).contains(&peer.len()) && peer.chars().all(|c| BASE58.contains(c));
-    if !addr.starts_with('/') || addr.len() < 2 || !peer_ok {
+    if !addr.starts_with('/') || addr.len() < 2 || !is_peer_id(peer) {
         return Err(bad());
     }
     Ok(serde_json::json!({ "peerId": peer, "addrs": [addr] }))

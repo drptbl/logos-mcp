@@ -718,3 +718,105 @@ async fn chain_wallet_shows_one_account_with_its_notes() {
         ["wallet_get_notes", &format!("str:{CHAIN_KEY_A}"), "str:"]
     );
 }
+
+const OTHER_PEER: &str =
+    "/ip4/138.68.122.137/tcp/30304/p2p/16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc";
+const OTHER_PEER_ID: &str = "16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc";
+
+/// The replies ensure_discovery reads for a node that already runs.
+fn discovery_running() -> Vec<crate::logosctl::RawOutput> {
+    vec![
+        p2p("peerInfo", PEER_INFO),
+        p2p("start", "null"),
+        p2p("discoStart", "null"),
+    ]
+}
+
+#[tokio::test]
+async fn discovery_connect_dials_a_peer_by_its_multiaddr() {
+    let mut replies = discovery_running();
+    replies.push(p2p("connectPeer", "null"));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .discovery_connect(Parameters(PeerAddrParams {
+            multiaddr: OTHER_PEER.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["connected"], OTHER_PEER_ID);
+    assert_eq!(
+        last_call(&fake)[1..],
+        [
+            "connectPeer",
+            &format!("str:{OTHER_PEER_ID}"),
+            "json:[\"/ip4/138.68.122.137/tcp/30304\"]",
+            "10000"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn discovery_connect_refuses_a_malformed_multiaddr_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let r = wallet_server(fake.clone())
+        .discovery_connect(Parameters(PeerAddrParams {
+            multiaddr: "/ip4/1.2.3.4/tcp/1".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn discovery_ping_reports_the_round_trip() {
+    let mut replies = discovery_running();
+    replies.push(p2p(
+        "pingPeer",
+        &format!(r#"{{"peerId":"{OTHER_PEER_ID}","rttMs":36.4}}"#),
+    ));
+    let fake = FakeRunner::with(replies);
+    let b = body(
+        &wallet_server(fake.clone())
+            .discovery_ping(Parameters(PeerIdParams {
+                peer_id: OTHER_PEER_ID.into(),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["rtt_ms"], 36.4, "{b}");
+    assert_eq!(
+        last_call(&fake)[1..],
+        ["pingPeer", &format!("str:{OTHER_PEER_ID}"), "5000"]
+    );
+}
+
+#[tokio::test]
+async fn discovery_disconnect_drops_a_peer() {
+    let mut replies = discovery_running();
+    replies.push(p2p("disconnectPeer", "null"));
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .discovery_disconnect(Parameters(PeerIdParams {
+            peer_id: OTHER_PEER_ID.into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["disconnected"], OTHER_PEER_ID);
+}
+
+#[tokio::test]
+async fn peer_tools_refuse_a_malformed_peer_id_without_touching_the_node() {
+    let fake = FakeRunner::with(vec![]);
+    let s = wallet_server(fake.clone());
+    let bad = || {
+        Parameters(PeerIdParams {
+            peer_id: "not a peer".into(),
+        })
+    };
+    assert!(is_error(&s.discovery_ping(bad()).await.unwrap()));
+    assert!(is_error(&s.discovery_disconnect(bad()).await.unwrap()));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
