@@ -77,19 +77,6 @@ struct InFlight {
     sent_ms: u64,
 }
 
-/// A side file's map: empty when there is no file yet, refused when there is
-/// one that can't be read.
-fn read_side_map<T: serde::de::DeserializeOwned>(
-    file: Option<PathBuf>,
-) -> Result<BTreeMap<String, T>, String> {
-    match file.map(std::fs::read) {
-        None => Ok(BTreeMap::new()),
-        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Some(Err(e)) => Err(e.to_string()),
-        Some(Ok(bytes)) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
-    }
-}
-
 /// Why nothing is paid or cancelled while `PAYMENTS` can't be read.
 fn unreadable_payments(e: &str) -> String {
     format!(
@@ -140,6 +127,54 @@ impl EscrowJob {
             && r.amount == self.amount
             && r.deadline == self.deadline
     }
+}
+
+impl EscrowJob {
+    /// The escrow open as a program call: the provider is paid to the account
+    /// it quoted, and the deposit goes back to the account that paid it. Not
+    /// sent once too late for the provider to deliver.
+    fn open_call(&self) -> crate::control::ProgramCall {
+        let open = Instruction::Open {
+            job_ref: self.job_ref,
+            provider: self.provider,
+            pay_to: self.provider,
+            refund_to: self.buyer,
+            amount: self.amount,
+            deadline: self.deadline,
+        };
+        crate::control::ProgramCall {
+            program_id_hex: escrow::PROGRAM_ID_HEX.to_string(),
+            accounts: vec![id_hex(&self.account)],
+            instruction: open.encode(),
+            description: format!(
+                "into escrow for {}, refunded if nothing is delivered by {}",
+                self.provider_address,
+                utc(self.deadline)
+            ),
+            send_by_ms: Some(self.deadline.saturating_sub(DEADLINE_MARGIN_MS)),
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch as a UTC date and time, to the minute.
+pub(super) fn utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = i64::try_from(days).unwrap_or(i64::MAX) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
 }
 
 fn id_hex(id: &Id) -> String {
@@ -560,7 +595,7 @@ impl LogosServer {
     async fn with_in_flight(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
         if !state.in_flight_loaded && state.in_flight_unreadable.is_none() {
-            match read_side_map::<InFlight>(self.wallet_side_file(IN_FLIGHT)) {
+            match guard::read_side_map::<InFlight>(self.wallet_side_file(IN_FLIGHT)) {
                 Ok(saved) => {
                     for (job, f) in saved {
                         state.in_flight.entry(job).or_insert(f);
@@ -678,39 +713,14 @@ impl LogosServer {
         accounts: &[Id],
         ix: Instruction,
     ) -> Result<String, SendError> {
-        let w = self.ensure_wallet().await?;
-        if let Some(warning) = w.warning() {
-            return Err(format!("refusing to sign: {warning}").into());
-        }
-        if !w.agent_ids.contains(&id_hex(signer)) {
-            return Err("the escrow account must be one of the agent accounts".into());
-        }
-        let mut ids = vec![id_hex(signer)];
-        ids.extend(accounts.iter().map(id_hex));
-        let mut signs = vec![true];
-        signs.extend(accounts.iter().map(|_| false));
-        let args = [
-            Arg::Json(json!(ids)),
-            Arg::Json(json!(signs)),
-            Arg::Bytes(ix.encode()),
-            Arg::str(escrow::PROGRAM_ID_HEX),
-            Arg::str(""),
-            Arg::Json(json!([])),
-        ];
-        let reply = self
-            .node
-            .call(LEZ, "send_generic_public_transaction", &args)
-            .await;
-        match reply.map(|v| TransferOutcome::read(&embedded_json(v))) {
-            Ok(TransferOutcome::Submitted(tx)) => Ok(tx),
-            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}").into()),
-            Ok(TransferOutcome::Unknown(detail)) => Err(SendError::MaybeSent(format!(
-                "outcome unknown: it may have been sent, so check service_jobs before trying again ({detail})"
-            ))),
-            Err(e) => Err(SendError::MaybeSent(format!(
-                "outcome unknown: it may have been sent, so check service_jobs before trying again ({e})"
-            ))),
-        }
+        let accounts: Vec<String> = accounts.iter().map(id_hex).collect();
+        self.send_signed(
+            &id_hex(signer),
+            &accounts,
+            ix.encode(),
+            escrow::PROGRAM_ID_HEX,
+        )
+        .await
     }
 
     /// Publish the offer with this agent's chat address in the same signed
@@ -788,15 +798,6 @@ impl LogosServer {
     }
 
     /// A file kept next to the agent wallet's own.
-    fn wallet_side_file(&self, name: &str) -> Option<PathBuf> {
-        match self.settings.wallet.as_ref()? {
-            WalletMode::Dedicated(paths) => Some(paths.storage.with_file_name(name)),
-            WalletMode::Shared {
-                agent_accounts_file,
-            } => Some(agent_accounts_file.with_file_name(name)),
-        }
-    }
-
     fn job_accounts_file(&self) -> Option<PathBuf> {
         self.wallet_side_file(JOB_ACCOUNTS)
     }
@@ -805,7 +806,7 @@ impl LogosServer {
     async fn with_payments(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
         if !state.payments_loaded && state.payments_unreadable.is_none() {
-            match read_side_map::<Payment>(self.wallet_side_file(PAYMENTS)) {
+            match guard::read_side_map::<Payment>(self.wallet_side_file(PAYMENTS)) {
                 Ok(saved) => {
                     for (job, tx) in saved {
                         state.submitted.entry(job).or_insert(tx);
@@ -857,7 +858,7 @@ impl LogosServer {
     /// Which accounts were made for which job: account id -> `{job, service}`.
     /// Refused when the file is there but can't be read.
     pub(super) fn job_accounts(&self) -> Result<BTreeMap<String, Value>, String> {
-        read_side_map(self.job_accounts_file())
+        guard::read_side_map(self.job_accounts_file())
             .map_err(|e| format!("{JOB_ACCOUNTS} next to the wallet can't be read ({e})"))
     }
 
@@ -1794,15 +1795,17 @@ impl LogosServer {
                 q.network
             ));
         }
-        let (to, terms) = match &escrow {
-            Some(e) => (
-                id_hex(&e.account),
-                Some(crate::control::EscrowOpen {
-                    job_ref: id_hex(&e.job_ref),
-                    provider: e.provider_address.clone(),
-                    deadline: e.deadline,
-                }),
-            ),
+        let (to, call) = match &escrow {
+            Some(e) => {
+                // The program refuses it, and a refused call still costs its whole fee.
+                if e.buyer == e.provider {
+                    return Err(
+                        "the quote names the paying account as its provider: not paying into it"
+                            .into(),
+                    );
+                }
+                (id_hex(&e.account), Some(e.open_call()))
+            }
             None => (q.pay_to.clone(), None),
         };
         // An escrow payment is noted before it is asked for, so a restart
@@ -1831,7 +1834,7 @@ impl LogosServer {
                     from: p.from.clone(),
                     to,
                     amount_lepta: q.price_lepta.clone(),
-                    escrow: terms,
+                    call,
                 }),
             )
             .await,

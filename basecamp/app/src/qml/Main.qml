@@ -293,11 +293,11 @@ Item {
                         LogosText {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: modelData.escrow
-                                ? qsTr("%1 from %2 into escrow for %3, refunded if nothing is delivered by %4, asked at %5")
+                            // A program call, such as an escrow open, says what it does.
+                            text: modelData.call
+                                ? qsTr("%1 from %2 %3, asked at %4")
                                     .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
-                                    .arg(modelData.escrow.provider)
-                                    .arg(new Date(modelData.escrow.deadline).toLocaleString(Qt.locale(), Locale.ShortFormat))
+                                    .arg(modelData.call.description)
                                     .arg(root.time(modelData.requested_at))
                                 : qsTr("%1 from %2 to %3, asked at %4")
                                     .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)

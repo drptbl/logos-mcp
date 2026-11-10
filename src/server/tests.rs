@@ -545,7 +545,7 @@ fn transfer(from: &str, to: &str, amount: &str) -> Parameters<TransferParams> {
         from: from.into(),
         to: to.into(),
         amount_lepta: amount.into(),
-        escrow: None,
+        call: None,
     })
 }
 
@@ -823,16 +823,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A payment into escrow for job ref [7; 32], from the agent account.
-fn escrow_payment(to: String) -> TransferParams {
+/// The account a test program call goes to first.
+const CALL_TO: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const TEST_PROGRAM: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A payment through a program call, from the agent account to `to`.
+fn program_payment(to: &str) -> TransferParams {
     TransferParams {
         from: AGENT_FROM.into(),
-        to,
+        to: to.into(),
         amount_lepta: "1000000".into(),
-        escrow: Some(crate::control::EscrowOpen {
-            job_ref: hex(&[7; 32]),
-            provider: RLN_PAYER.into(),
-            deadline: 9_000_000_000_000,
+        call: Some(crate::control::ProgramCall {
+            program_id_hex: TEST_PROGRAM.into(),
+            accounts: vec![CALL_TO.into()],
+            instruction: vec![1, 2, 3],
+            description: "into a test program".into(),
+            send_by_ms: None,
         }),
     }
 }
@@ -843,8 +849,16 @@ const AGENT_ID: &str = "e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f0
 /// and its lowest base fee of 8, with 8 KiB for the transaction's size.
 const DEFAULT_RESERVE: u128 = (2_000_000 + 8 * 1024) * 8;
 
+fn sent_generic(fake: &FakeRunner) -> bool {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.contains(&"send_generic_public_transaction".to_string()))
+}
+
 #[tokio::test]
-async fn an_escrow_open_needs_the_fee_reserve_on_top_of_the_price() {
+async fn a_program_call_needs_the_fee_reserve_on_top_of_the_amount() {
     // Checked as it is sent, after any approval: the balance may have moved.
     let mut replies = opened_by_server();
     replies.push(lez(
@@ -853,33 +867,21 @@ async fn an_escrow_open_needs_the_fee_reserve_on_top_of_the_price() {
     ));
     let fake = FakeRunner::with(replies);
     let s = wallet_server(fake.clone());
-    let buyer: [u8; 32] = (0..32)
-        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let job = crate::escrow::job_account(&buyer, &[7; 32]);
     let err = s
         .send_checked(
             &CancellationToken::new(),
-            &escrow_payment(hex(&job)),
+            &program_payment(CALL_TO),
             SendMode::Direct,
         )
         .await
         .unwrap_err();
     assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
-    let calls = fake.calls.lock().unwrap();
-    assert!(
-        !calls
-            .iter()
-            .any(|c| c.contains(&"send_generic_public_transaction".to_string())),
-        "{calls:?}"
-    );
+    assert!(!sent_generic(&fake));
 }
 
 #[tokio::test]
-async fn an_approved_escrow_open_past_its_time_is_not_sent() {
-    // An approval can take a while: the deadline is checked again at sending.
+async fn an_approved_program_call_past_its_time_is_not_sent() {
+    // An approval can take a while: the time is checked again at sending.
     let mut replies = opened_by_server();
     replies.push(lez("get_balance", r#""100000000""#));
     replies.push(lez(
@@ -888,76 +890,18 @@ async fn an_approved_escrow_open_past_its_time_is_not_sent() {
     ));
     let fake = FakeRunner::with(replies);
     let s = wallet_server(fake.clone());
-    let buyer: [u8; 32] = (0..32)
-        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let job = crate::escrow::job_account(&buyer, &[7; 32]);
-    let mut late = escrow_payment(hex(&job));
-    let now = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    )
-    .unwrap();
-    late.escrow.as_mut().unwrap().deadline = now + 60_000;
+    let mut late = program_payment(CALL_TO);
+    late.call.as_mut().unwrap().send_by_ms = Some(now_ms());
     let err = s
         .send_checked(&CancellationToken::new(), &late, SendMode::Approved)
         .await
         .unwrap_err();
     assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
-    let calls = fake.calls.lock().unwrap();
-    assert!(
-        !calls
-            .iter()
-            .any(|c| c.contains(&"send_generic_public_transaction".to_string())),
-        "{calls:?}"
-    );
+    assert!(!sent_generic(&fake));
 }
 
 #[tokio::test]
-async fn an_escrow_naming_the_buyer_as_provider_is_not_opened() {
-    // The program refuses it, at the cost of the whole fee.
-    let mut replies = opened_by_server();
-    replies.push(lez("get_balance", r#""100000000""#));
-    replies.push(lez(
-        "send_generic_public_transaction",
-        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"bb22\"}""#,
-    ));
-    let fake = FakeRunner::with(replies);
-    let s = wallet_server(fake.clone());
-    let buyer: [u8; 32] = (0..32)
-        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let job = crate::escrow::job_account(&buyer, &[7; 32]);
-    let mut own = escrow_payment(hex(&job));
-    own.escrow.as_mut().unwrap().provider = AGENT_FROM.into();
-    // Refused before the user is asked to approve it, too.
-    let err = s
-        .send_checked(&CancellationToken::new(), &own, SendMode::CheckOnly)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
-    let err = s
-        .send_checked(&CancellationToken::new(), &own, SendMode::Direct)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, SendError::NotSent(_)), "{err:?}");
-    let calls = fake.calls.lock().unwrap();
-    assert!(
-        !calls
-            .iter()
-            .any(|c| c.contains(&"send_generic_public_transaction".to_string())),
-        "{calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
+async fn a_program_call_is_sent_instead_of_a_transfer() {
     let mut replies = opened_by_server();
     replies.push(lez(
         "get_balance",
@@ -969,16 +913,10 @@ async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
     ));
     let fake = FakeRunner::with(replies);
     let s = wallet_server(fake.clone());
-    let buyer: [u8; 32] = (0..32)
-        .map(|i| u8::from_str_radix(&AGENT_ID[2 * i..2 * i + 2], 16).unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let job = crate::escrow::job_account(&buyer, &[7; 32]);
     let sent = s
         .send_checked(
             &CancellationToken::new(),
-            &escrow_payment(hex(&job)),
+            &program_payment(CALL_TO),
             SendMode::Direct,
         )
         .await
@@ -986,36 +924,19 @@ async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
     assert_eq!(sent["tx_hash"], "bb22");
     let calls = fake.calls.lock().unwrap();
     let call = &calls.last().unwrap()[2..];
-    let provider: [u8; 32] = crate::guard::public_account_hex(RLN_PAYER)
-        .map(|h| {
-            (0..32)
-                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap()
-        })
-        .unwrap();
-    // Paid out to the provider, refunded to the paying account.
-    let open = crate::escrow::Instruction::Open {
-        job_ref: [7; 32],
-        provider,
-        pay_to: provider,
-        refund_to: buyer,
-        amount: 1_000_000,
-        deadline: 9_000_000_000_000,
-    };
+    // The agent account signs and pays; the call's accounts follow it.
     assert_eq!(
         call,
         [
             "lez_core".to_string(),
             "send_generic_public_transaction".into(),
-            format!(r#"json:["{AGENT_ID}","{}"]"#, hex(&job)),
+            format!(r#"json:["{AGENT_ID}","{CALL_TO}"]"#),
             "json:[true,false]".into(),
             format!(
                 r#"json:{{"_bytes":"{}"}}"#,
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(open.encode())
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8, 2, 3])
             ),
-            format!("str:{}", crate::escrow::PROGRAM_ID_HEX),
+            format!("str:{TEST_PROGRAM}"),
             "str:".into(),
             "json:[]".into(),
         ]
@@ -1028,25 +949,19 @@ async fn an_escrow_payment_opens_the_job_instead_of_transferring() {
 }
 
 #[tokio::test]
-async fn an_escrow_payment_must_go_to_its_own_job_account() {
+async fn a_program_call_must_go_to_its_first_account() {
     let fake = FakeRunner::with(opened_by_server());
     let s = wallet_server(fake.clone());
+    let other = "3333333333333333333333333333333333333333333333333333333333333333";
     let r = s
         .send_checked(
             &CancellationToken::new(),
-            &escrow_payment(RLN_PAYER.into()),
+            &program_payment(other),
             SendMode::Direct,
         )
         .await;
     assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
-    assert!(
-        !fake
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c.get(3).map(String::as_str) == Some("send_generic_public_transaction"))
-    );
+    assert!(!sent_generic(&fake));
 }
 
 // One logos.dev fleet discovery node, as fleets.logos.co/data.json lists it.
@@ -3012,4 +2927,34 @@ async fn chat_waits_for_a_new_messaging_node_to_connect_before_starting() {
             .count(),
         4
     );
+}
+
+#[tokio::test]
+async fn a_signed_call_goes_out_from_an_agent_account() {
+    let mut replies = opened_by_server();
+    replies.push(lez(
+        "send_generic_public_transaction",
+        r#""{\"error\":\"\",\"success\":true,\"tx_hash\":\"cc33\"}""#,
+    ));
+    let fake = FakeRunner::with(replies);
+    let s = wallet_server(fake.clone());
+    let tx = s
+        .send_signed(AGENT_ID, &[CALL_TO.to_string()], vec![9, 9], TEST_PROGRAM)
+        .await
+        .unwrap();
+    assert_eq!(tx, "cc33");
+    let calls = fake.calls.lock().unwrap();
+    let call = &calls.last().unwrap()[2..];
+    assert_eq!(call[2], format!(r#"json:["{AGENT_ID}","{CALL_TO}"]"#));
+    assert_eq!(call[3], "json:[true,false]");
+    assert_eq!(call[5], format!("str:{TEST_PROGRAM}"));
+}
+
+#[tokio::test]
+async fn a_signed_call_never_goes_out_from_another_account() {
+    let fake = FakeRunner::with(opened_by_server());
+    let s = wallet_server(fake.clone());
+    let r = s.send_signed(CALL_TO, &[], vec![9, 9], TEST_PROGRAM).await;
+    assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
+    assert!(!sent_generic(&fake));
 }

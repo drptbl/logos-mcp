@@ -12,6 +12,8 @@ pub mod logosctl;
 pub mod node;
 pub mod server;
 pub mod services;
+#[cfg(feature = "cli")]
+pub mod standalone;
 
 #[cfg(feature = "module")]
 pub mod module;

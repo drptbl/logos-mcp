@@ -34,7 +34,7 @@ const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
-const MAX_CHAT_BYTES: usize = 64 * 1024;
+pub const MAX_CHAT_BYTES: usize = 64 * 1024;
 const CHUNK_SIZE: i64 = 65_536;
 /// How many seconds chat waits for a messaging node it just created to connect.
 const CONNECT_WAIT_TRIES: usize = 60;
@@ -72,7 +72,7 @@ pub struct NodeSettings {
 }
 
 /// The open agent wallet, as `ensure_wallet` found or left it.
-struct WalletHandle {
+pub struct WalletHandle {
     sequencer: String,
     opened_now: bool,
     /// The agent may act on this wallet: dedicated mode, it is the wallet this
@@ -85,7 +85,13 @@ struct WalletHandle {
 }
 
 impl WalletHandle {
-    fn warning(&self) -> Option<&'static str> {
+    /// Whether the agent may sign with this account, 64 hex characters.
+    pub fn is_agent(&self, account_id: &str) -> bool {
+        self.agent_ids.contains(account_id)
+    }
+
+    /// Why the agent shouldn't act on this wallet, if it shouldn't.
+    pub fn warning(&self) -> Option<&'static str> {
         match (self.trusted, self.shared) {
             (false, false) => Some(
                 "the wallet open in lez_core was not opened by this server or has different accounts; it may not be the agent wallet",
@@ -152,12 +158,12 @@ impl TransferOutcome {
 
 /// Text another peer controls, made safe to show an agent: no control characters
 /// and at most 64 characters. It is still untrusted content.
-fn sanitise_peer_text(text: &str) -> String {
+pub fn sanitise_peer_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 /// The raw data a peer record carries under service entry `id`.
-fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
+pub fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
     record
         .get("services")?
         .as_array()?
@@ -303,11 +309,11 @@ pub struct TransferParams {
     pub to: String,
     /// Amount in lepta as a decimal string (1 LEZ = 1,000,000,000 lepta).
     pub amount_lepta: String,
-    /// Locks the amount in escrow instead, `to` being the job's account. Only
-    /// service_pay sets it: agents can't.
+    /// Moves the amount through this program call instead, `to` being its
+    /// first account. Only code sets it: agents can't.
     #[serde(skip)]
     #[schemars(skip)]
-    pub escrow: Option<crate::control::EscrowOpen>,
+    pub call: Option<crate::control::ProgramCall>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -370,7 +376,7 @@ enum SendMode {
 
 /// Why a transfer didn't clearly go through.
 #[derive(Debug)]
-enum SendError {
+pub enum SendError {
     /// Refused before or by the wallet: nothing was sent.
     NotSent(String),
     /// Handed to the wallet without a clear answer: it may have been sent.
@@ -378,7 +384,7 @@ enum SendError {
 }
 
 impl SendError {
-    fn message(self) -> String {
+    pub fn message(self) -> String {
         match self {
             Self::NotSent(m) | Self::MaybeSent(m) => m,
         }
@@ -397,57 +403,12 @@ impl From<&str> for SendError {
     }
 }
 
-/// The `send_generic_public_transaction` arguments that open an escrow job:
-/// the buyer `from` signs and pays its fee, `to` must be the job's account.
-fn escrow_open(
-    from: &str,
-    to: &str,
-    amount_lepta: &str,
-    terms: &crate::control::EscrowOpen,
-) -> Result<Vec<Arg>, SendError> {
-    use crate::escrow::{Instruction, PROGRAM_ID_HEX, job_account};
-    let id = |hex: &str| -> Option<[u8; 32]> {
-        (hex.len() == 64)
-            .then(|| {
-                (0..32)
-                    .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
-                    .collect::<Option<Vec<u8>>>()?
-                    .try_into()
-                    .ok()
-            })
-            .flatten()
-    };
-    let (Some(buyer), Some(job), Some(job_ref)) = (id(from), id(to), id(&terms.job_ref)) else {
-        return Err("escrow payment: an account or the job reference is not 32 bytes".into());
-    };
-    if job_account(&buyer, &job_ref) != job {
-        return Err("escrow payment: the recipient isn't this job's escrow account".into());
-    }
-    let provider = guard::public_account_hex(&terms.provider)
-        .ok()
-        .and_then(|h| id(&h))
-        .ok_or("escrow payment: the provider account is not a public account")?;
-    let amount: u128 = amount_lepta
-        .parse()
-        .map_err(|_| "escrow payment: the amount is not a number")?;
-    // The provider is paid to the account it quoted, and the deposit goes
-    // back to the account that paid it.
-    let open = Instruction::Open {
-        job_ref,
-        provider,
-        pay_to: provider,
-        refund_to: buyer,
-        amount,
-        deadline: terms.deadline,
-    };
-    Ok(vec![
-        Arg::Json(json!([from, to])),
-        Arg::Json(json!([true, false])),
-        Arg::Bytes(open.encode()),
-        Arg::str(PROGRAM_ID_HEX),
-        Arg::str(""),
-        Arg::Json(json!([])),
-    ])
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 /// A submitted transfer, as wallet_transfer reports it.
@@ -615,7 +576,7 @@ impl LogosServer {
                 from: request.from,
                 to: request.to,
                 amount_lepta: request.amount_lepta,
-                escrow: request.escrow,
+                call: request.call,
             };
             let outcome = match server
                 .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
@@ -713,7 +674,7 @@ impl LogosServer {
     /// The network the messaging node is really on, read from its ENR, which
     /// can differ from this server's setting when it joined an existing node.
     /// Before there is a node, the one it would be created on.
-    async fn network(&self) -> String {
+    pub async fn network(&self) -> String {
         match self
             .node
             .call(DELIVERY, "getNodeInfo", &[Arg::str("MyENR")])
@@ -745,7 +706,123 @@ impl LogosServer {
         }
     }
 
-    fn allows(&self, tool: &str) -> bool {
+    /// The node, for module calls this server has no tool for. Crates that
+    /// build on this server, such as logos-agents, use it.
+    pub fn node(&self) -> &Arc<dyn Node> {
+        &self.node
+    }
+
+    /// A file kept next to the agent wallet, for state a crate building on
+    /// this server keeps per wallet. `None` without a wallet.
+    pub fn wallet_side_file(&self, name: &str) -> Option<PathBuf> {
+        match self.settings.wallet.as_ref()? {
+            WalletMode::Dedicated(paths) => Some(paths.storage.with_file_name(name)),
+            WalletMode::Shared {
+                agent_accounts_file,
+            } => Some(agent_accounts_file.with_file_name(name)),
+        }
+    }
+
+    /// Sign and send a program call from an agent account, with no approval.
+    /// Only for calls that move nothing out of the signer but the network
+    /// fee: this can't tell what the instruction does, so a call that moves
+    /// money goes through `wallet_transfer` with a `ProgramCall` instead.
+    /// `accounts` follow the signer, all 64 hex characters.
+    pub async fn send_signed(
+        &self,
+        signer: &str,
+        accounts: &[String],
+        instruction: Vec<u8>,
+        program_id_hex: &str,
+    ) -> Result<String, SendError> {
+        let w = self.ensure_wallet().await?;
+        if let Some(warning) = w.warning() {
+            return Err(format!("refusing to sign: {warning}").into());
+        }
+        if !w.is_agent(signer) {
+            return Err("the signing account must be one of the agent accounts".into());
+        }
+        let mut ids = vec![signer.to_string()];
+        ids.extend(accounts.iter().cloned());
+        let signs: Vec<bool> = std::iter::once(true)
+            .chain(accounts.iter().map(|_| false))
+            .collect();
+        let args = [
+            Arg::Json(json!(ids)),
+            Arg::Json(json!(signs)),
+            Arg::Bytes(instruction),
+            Arg::str(program_id_hex),
+            Arg::str(""),
+            Arg::Json(json!([])),
+        ];
+        let reply = self
+            .node
+            .call(LEZ, "send_generic_public_transaction", &args)
+            .await;
+        match reply.map(|v| TransferOutcome::read(&embedded_json(v))) {
+            Ok(TransferOutcome::Submitted(tx)) => Ok(tx),
+            Ok(TransferOutcome::Refused(reason)) => Err(format!("not sent: {reason}").into()),
+            Ok(TransferOutcome::Unknown(detail)) => Err(SendError::MaybeSent(format!(
+                "outcome unknown: it may have been sent, so check before trying again ({detail})"
+            ))),
+            Err(e) => Err(SendError::MaybeSent(format!(
+                "outcome unknown: it may have been sent, so check before trying again ({e})"
+            ))),
+        }
+    }
+
+    /// Call a tool from `router` on `service` as this server calls its own:
+    /// refused when the user switched its group off, and recorded in the
+    /// activity log. Crates that add tools on top of this server call theirs
+    /// this way.
+    pub async fn guarded_call<S: Send + Sync + 'static>(
+        &self,
+        router: &ToolRouter<S>,
+        service: &S,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let args = Value::Object(request.arguments.clone().unwrap_or_default());
+        let response = if self.allows(&tool) {
+            let tcc = rmcp::handler::server::tool::ToolCallContext::new(service, request, context);
+            router.call(tcc).await
+        } else {
+            let group = ToolGroups::group_of(&tool).unwrap_or("this");
+            fail(format!(
+                "the user turned off the {group} tools in the Agent app"
+            ))
+            .map(Into::into)
+        };
+        if let Some(log) = &self.activity {
+            let (ok, result) = match &response {
+                Ok(rmcp::model::CallToolResponse::Complete(r)) => (
+                    r.is_error != Some(true),
+                    r.content
+                        .first()
+                        .and_then(|c| c.as_text())
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default(),
+                ),
+                Ok(_) => (true, "waiting for input".to_string()),
+                Err(e) => (false, e.message.to_string()),
+            };
+            log.record(&tool, &args, ok, &result);
+        }
+        response
+    }
+
+    /// Whether the user approves each transfer.
+    pub fn asks_before_transfer(&self) -> bool {
+        self.tool_groups.borrow().ask_before_transfer
+    }
+
+    /// Where a transfer that waited for the user's approval stands.
+    pub fn approval_status(&self, request_id: &str) -> Option<Value> {
+        self.approvals.status(request_id)
+    }
+
+    pub fn allows(&self, tool: &str) -> bool {
         self.tool_groups.borrow().allows(tool)
     }
 
@@ -759,7 +836,8 @@ impl LogosServer {
         })
     }
 
-    fn wallet(&self) -> Result<&WalletMode, String> {
+    /// The agent wallet's setup, or why wallet tools are off.
+    pub fn wallet(&self) -> Result<&WalletMode, String> {
         self.settings.wallet.as_ref().ok_or_else(|| {
             "wallet tools are disabled: start the server with --wallet-config and --wallet-storage"
                 .to_string()
@@ -790,10 +868,10 @@ impl LogosServer {
         (u128::from(gas_limit) + TX_BYTES) * BASE_FEE_MIN
     }
 
-    /// Refuse an escrow open `from` can't pay for: the wallet only checks the
-    /// fee, so an open short of price plus fee goes out, is refused on
-    /// chain, and still costs the whole reserve.
-    async fn check_open_funds(&self, from: &str, amount: u128) -> Result<(), String> {
+    /// Refuse a program call `from` can't pay for: the wallet only checks the
+    /// fee, so a call short of amount plus fee goes out, is refused on chain,
+    /// and still costs the whole reserve.
+    async fn check_call_funds(&self, from: &str, amount: u128) -> Result<(), String> {
         let id = guard::public_account_hex(from)?;
         let held = match self
             .node
@@ -803,11 +881,11 @@ impl LogosServer {
             Ok(Value::String(b)) => b.parse::<u128>().ok(),
             _ => None,
         }
-        .ok_or_else(|| format!("can't read {from}'s balance: not opening the escrow"))?;
+        .ok_or_else(|| format!("can't read {from}'s balance: nothing was sent"))?;
         let reserve = self.fee_reserve().await;
         if held < amount.saturating_add(reserve) {
             return Err(format!(
-                "{from} holds {held} lepta, less than the {amount} lepta price plus the network's {reserve} lepta fee reserve: not opening the escrow"
+                "{from} holds {held} lepta, less than the {amount} lepta it would move plus the network's {reserve} lepta fee reserve: nothing was sent"
             ));
         }
         Ok(())
@@ -845,7 +923,7 @@ impl LogosServer {
     /// this server opened it and its accounts still match the ones seen then,
     /// which also catches a daemon restart where another wallet was opened.
     /// Serialized so concurrent tool calls never race to open it twice.
-    async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
+    pub async fn ensure_wallet(&self) -> Result<WalletHandle, String> {
         let mut agent_accounts = self.agent_accounts.lock().await;
         self.ensure_wallet_locked(&mut agent_accounts).await
     }
@@ -959,7 +1037,7 @@ impl LogosServer {
     #[tool(
         description = "The agent wallet's own accounts with their addresses and balances in lepta."
     )]
-    async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
+    pub async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
         let w = match self.ensure_wallet().await {
             Ok(v) => v,
             Err(e) => return fail(e),
@@ -1240,7 +1318,7 @@ impl LogosServer {
 
     /// This agent's chat address, starting chat when it has none. `true` with it
     /// when this call started chat.
-    async fn ensure_chat(&self) -> Result<(String, bool), String> {
+    pub async fn ensure_chat(&self) -> Result<(String, bool), String> {
         let _starting = self.chat_starting.lock().await;
         if !self.settings.host_owns_messaging {
             self.load(CHAT).await.map_err(|e| e.to_string())?;
@@ -1316,7 +1394,7 @@ impl LogosServer {
     #[tool(
         description = "Open an end-to-end encrypted conversation with another agent's chat address. Returns once it has settled, about 8 seconds, so the first message isn't lost. Send with chat_send and read replies with chat_read."
     )]
-    async fn chat_start(
+    pub async fn chat_start(
         &self,
         Parameters(p): Parameters<ChatStartParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1354,7 +1432,7 @@ impl LogosServer {
     #[tool(
         description = "Send a message into a chat conversation. Success means it was handed to the network, not that the other agent got it: there is no delivery receipt, so ask for a reply and watch chat_read. Replies usually take 5 to 20 seconds. On logos.test, sending needs an active RLN membership."
     )]
-    async fn chat_send(
+    pub async fn chat_send(
         &self,
         Parameters(p): Parameters<ChatSendParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1577,7 +1655,7 @@ impl LogosServer {
     #[tool(
         description = "Send lepta from one of the agent wallet's public accounts to a public account. The wallet's balance is the only limit. Returns the transaction hash once submitted, not confirmed: check wallet_accounts for the new balances."
     )]
-    async fn wallet_transfer(
+    pub async fn wallet_transfer(
         &self,
         ct: CancellationToken,
         Parameters(p): Parameters<TransferParams>,
@@ -1596,7 +1674,7 @@ impl LogosServer {
         let (id, mut decision) =
             match self
                 .approvals
-                .request(&p.from, &p.to, &p.amount_lepta, p.escrow.clone())
+                .request(&p.from, &p.to, &p.amount_lepta, p.call.clone())
             {
                 Ok(filed) => filed,
                 Err(e) => return fail(e),
@@ -1707,24 +1785,20 @@ impl LogosServer {
         if from == to {
             return Err("sender and recipient are the same account".into());
         }
-        // An escrow open the chain would refuse still costs its whole fee.
+        // A program call the chain would refuse still costs its whole fee.
         // Checked here, after any approval wait and before the last looks.
-        if let Some(terms) = &p.escrow {
-            if guard::public_account_hex(&terms.provider).ok().as_deref() == Some(from.as_str()) {
-                return Err(
-                    "escrow payment: the quote names the paying account as its provider".into(),
-                );
+        if let Some(call) = &p.call {
+            if call.accounts.first() != Some(&to) {
+                return Err("program call: the recipient isn't the call's first account".into());
             }
-            if jobs::too_late_for(terms.deadline) {
-                return Err(
-                    "the escrow deadline is too close for the provider to deliver in time: nothing was sent, ask for a new quote".into(),
-                );
+            if call.send_by_ms.is_some_and(|t| now_ms() >= t) {
+                return Err("too late to send this payment: nothing was sent".into());
             }
             let amount = p
                 .amount_lepta
                 .parse()
-                .map_err(|_| "escrow payment: the amount is not a number")?;
-            self.check_open_funds(&p.from, amount).await?;
+                .map_err(|_| "the amount is not a number")?;
+            self.check_call_funds(&p.from, amount).await?;
         }
         if ct.is_cancelled() {
             return Err("transfer cancelled before sending: nothing was sent".into());
@@ -1742,13 +1816,25 @@ impl LogosServer {
         if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
             return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
         }
-        let reply = match &p.escrow {
+        let reply = match &p.call {
             None => {
                 let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
                 self.node.call(LEZ, "transfer_public", &args).await
             }
-            Some(terms) => {
-                let open = escrow_open(&from, &to, &p.amount_lepta, terms)?;
+            Some(call) => {
+                let mut ids = vec![from.clone()];
+                ids.extend(call.accounts.iter().cloned());
+                let signs: Vec<bool> = std::iter::once(true)
+                    .chain(call.accounts.iter().map(|_| false))
+                    .collect();
+                let open = [
+                    Arg::Json(json!(ids)),
+                    Arg::Json(json!(signs)),
+                    Arg::Bytes(call.instruction.clone()),
+                    Arg::str(&call.program_id_hex),
+                    Arg::str(""),
+                    Arg::Json(json!([])),
+                ];
                 self.node
                     .call(LEZ, "send_generic_public_transaction", &open)
                     .await
@@ -1787,7 +1873,7 @@ impl LogosServer {
     #[tool(
         description = "Create a new public account in the agent wallet, for example a fresh receive address per job so a payment can be matched to it by its balance."
     )]
-    async fn wallet_new_account(&self) -> Result<CallToolResult, McpError> {
+    pub async fn wallet_new_account(&self) -> Result<CallToolResult, McpError> {
         let mut agent_accounts = self.agent_accounts.lock().await;
         let w = match self.ensure_wallet_locked(&mut agent_accounts).await {
             Ok(w) => w,
@@ -1856,7 +1942,7 @@ impl LogosServer {
 
     /// Make sure libp2p_module runs a node with service discovery, creating one
     /// bootstrapped from the configured peers when none exists. Returns this node's peer id.
-    async fn ensure_discovery(&self) -> Result<String, String> {
+    pub async fn ensure_discovery(&self) -> Result<String, String> {
         if self.settings.discovery_bootstrap.is_empty() {
             return Err(
                 "discovery tools are disabled: start the server with --discovery-bootstrap".into(),
@@ -1910,7 +1996,7 @@ impl LogosServer {
     }
 
     /// The peer records advertising `service_id`, and this node's peer id.
-    async fn lookup(&self, service_id: &str) -> Result<(String, Vec<Value>), String> {
+    pub async fn lookup(&self, service_id: &str) -> Result<(String, Vec<Value>), String> {
         guard::validate_service_id(service_id)?;
         let own = self.ensure_discovery().await?;
         // Lookups only see a service the node has registered interest in. Once per service.
@@ -2177,34 +2263,8 @@ impl ServerHandler for LogosServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
-        let tool = request.name.to_string();
-        let args = Value::Object(request.arguments.clone().unwrap_or_default());
-        let response = if self.allows(&tool) {
-            let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-            self.tool_router.call(tcc).await
-        } else {
-            let group = ToolGroups::group_of(&tool).unwrap_or("this");
-            fail(format!(
-                "the user turned off the {group} tools in the Agent app"
-            ))
-            .map(Into::into)
-        };
-        if let Some(log) = &self.activity {
-            let (ok, result) = match &response {
-                Ok(rmcp::model::CallToolResponse::Complete(r)) => (
-                    r.is_error != Some(true),
-                    r.content
-                        .first()
-                        .and_then(|c| c.as_text())
-                        .map(|t| t.text.clone())
-                        .unwrap_or_default(),
-                ),
-                Ok(_) => (true, "waiting for input".to_string()),
-                Err(e) => (false, e.message.to_string()),
-            };
-            log.record(&tool, &args, ok, &result);
-        }
-        response
+        self.guarded_call(&self.tool_router, self, request, context)
+            .await
     }
 
     fn get_info(&self) -> ServerConfig {

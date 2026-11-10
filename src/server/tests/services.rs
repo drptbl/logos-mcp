@@ -2978,3 +2978,63 @@ async fn a_job_accounts_file_that_cant_be_read_is_never_overwritten() {
         "{accounts}"
     );
 }
+
+#[tokio::test]
+async fn an_escrow_naming_the_buyer_as_provider_is_not_paid() {
+    // The program refuses it, at the cost of the whole fee.
+    let q = escrow_quote_text(AGENT_FROM, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let (s, _dir) = services_server(fake.clone());
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("provider"), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_escrow_payment_tells_the_user_what_it_locks() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    let (s, _dir) = services_server(fake.clone());
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    groups.send_modify(|g| g.set("ask_before_transfer", true).unwrap());
+    let s = s.with_tool_groups(rx);
+    let b = body(
+        &s.service_pay(CancellationToken::new(), pay())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["status"], "awaiting_approval", "{b}");
+    let waiting = &s.approvals()["waiting"][0];
+    assert_eq!(
+        waiting["call"]["description"],
+        format!(
+            "into escrow for {PROVIDER_ACCOUNT}, refunded if nothing is delivered by 2096-10-02 07:16 UTC"
+        ),
+        "{waiting}"
+    );
+}
+
+#[test]
+fn dates_read_as_utc() {
+    assert_eq!(utc(1_794_196_590_492), "2026-11-09 03:56 UTC");
+    assert_eq!(utc(951_782_400_000), "2000-02-29 00:00 UTC");
+}

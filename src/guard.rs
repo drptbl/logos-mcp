@@ -260,3 +260,19 @@ pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     std::fs::rename(&tmp, path)
 }
+
+/// A JSON map kept in a file next to the wallet: empty when there is no file
+/// yet, refused when there is one that can't be read, so a caller never saves
+/// over records it couldn't see.
+pub fn read_side_map<T: serde::de::DeserializeOwned>(
+    file: Option<PathBuf>,
+) -> Result<std::collections::BTreeMap<String, T>, String> {
+    match file.map(std::fs::read) {
+        None => Ok(std::collections::BTreeMap::new()),
+        Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(std::collections::BTreeMap::new())
+        }
+        Some(Err(e)) => Err(e.to_string()),
+        Some(Ok(bytes)) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+    }
+}

@@ -345,23 +345,28 @@ fn job_inputs_and_results_never_reach_the_file() {
 }
 
 #[tokio::test]
-async fn an_escrow_payment_shows_its_terms_to_the_user() {
+async fn a_program_call_says_what_it_does_to_the_user() {
     let approvals = Approvals::default();
-    let terms = EscrowOpen {
-        job_ref: "ab".repeat(32),
-        provider: "Public/p".into(),
-        deadline: 9,
+    let call = ProgramCall {
+        program_id_hex: "11".repeat(32),
+        accounts: vec!["22".repeat(32)],
+        instruction: vec![1, 2, 3],
+        description: "into escrow for Public/p".into(),
+        send_by_ms: Some(9),
     };
     approvals
-        .request("Public/a", "Public/job", "5", Some(terms.clone()))
+        .request("Public/a", "Public/job", "5", Some(call))
         .unwrap();
     let waiting = serde_json::to_value(approvals.waiting()).unwrap();
-    assert_eq!(waiting[0]["escrow"]["provider"], "Public/p", "{waiting}");
+    assert_eq!(
+        waiting[0]["call"]["description"], "into escrow for Public/p",
+        "{waiting}"
+    );
     approvals
         .request("Public/a", "Public/b", "5", None)
         .unwrap();
     let waiting = serde_json::to_value(approvals.waiting()).unwrap();
-    assert!(waiting[1].get("escrow").is_none(), "{waiting}");
+    assert!(waiting[1].get("call").is_none(), "{waiting}");
 }
 
 #[tokio::test]
