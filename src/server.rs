@@ -465,6 +465,8 @@ async fn sequencer_call(url: String, method: &'static str, params: Value) -> Res
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(15)))
+            // The answer must come from the configured sequencer, not wherever it points.
+            .max_redirects(0)
             .build()
             .into();
         let request = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });

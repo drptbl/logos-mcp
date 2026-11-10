@@ -147,6 +147,16 @@ async fn fake_sequencer(result: Value) -> (String, tokio::task::JoinHandle<Strin
 
 /// A sequencer that answers its first request with `reply`, whole.
 async fn fake_sequencer_reply(reply: Value) -> (String, tokio::task::JoinHandle<String>) {
+    let reply = reply.to_string();
+    fake_http(format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+        reply.len()
+    ))
+    .await
+}
+
+/// A server that answers its first request with the raw HTTP `response`.
+async fn fake_http(response: String) -> (String, tokio::task::JoinHandle<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -176,11 +186,6 @@ async fn fake_sequencer_reply(reply: Value) -> (String, tokio::task::JoinHandle<
                 break;
             }
         }
-        let reply = reply.to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
-            reply.len()
-        );
         socket.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8_lossy(&seen).to_string()
     });
@@ -219,6 +224,21 @@ async fn a_transaction_not_landed_is_reported_not_included() {
 #[tokio::test]
 async fn a_reply_without_a_result_is_an_error_not_a_missing_transaction() {
     let (url, _served) = fake_sequencer_reply(json!({ "status": "ok" })).await;
+    let s = wallet_server(FakeRunner::with(opened_with_sequencer(&url)));
+    let r = s
+        .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn the_sequencer_cannot_redirect_the_lookup_elsewhere() {
+    let (elsewhere, _) = fake_sequencer(json!(["AAEC"])).await;
+    let (url, _served) = fake_http(format!(
+        "HTTP/1.1 302 Found\r\nlocation: {elsewhere}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    ))
+    .await;
     let s = wallet_server(FakeRunner::with(opened_with_sequencer(&url)));
     let r = s
         .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
