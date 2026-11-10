@@ -142,6 +142,11 @@ async fn labels_take_a_label_or_an_account_not_both() {
 /// A sequencer on localhost that answers one JSON-RPC call with `result`,
 /// and hands back the request it saw.
 async fn fake_sequencer(result: Value) -> (String, tokio::task::JoinHandle<String>) {
+    fake_sequencer_reply(json!({ "jsonrpc": "2.0", "id": 1, "result": result })).await
+}
+
+/// A sequencer that answers its first request with `reply`, whole.
+async fn fake_sequencer_reply(reply: Value) -> (String, tokio::task::JoinHandle<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -171,7 +176,7 @@ async fn fake_sequencer(result: Value) -> (String, tokio::task::JoinHandle<Strin
                 break;
             }
         }
-        let reply = json!({ "jsonrpc": "2.0", "id": 1, "result": result }).to_string();
+        let reply = reply.to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
             reply.len()
@@ -209,6 +214,30 @@ async fn a_transaction_not_landed_is_reported_not_included() {
         .unwrap();
     assert!(!is_error(&r), "{}", text(&r));
     assert_eq!(body(&r)["included"], false, "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_reply_without_a_result_is_an_error_not_a_missing_transaction() {
+    let (url, _served) = fake_sequencer_reply(json!({ "status": "ok" })).await;
+    let s = wallet_server(FakeRunner::with(opened_with_sequencer(&url)));
+    let r = s
+        .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn sequencer_errors_keep_its_address_out() {
+    // Nothing listens on port 1, and the address carries a credential.
+    let url = "http://user:hunter2@127.0.0.1:1/";
+    let s = wallet_server(FakeRunner::with(opened_with_sequencer(url)));
+    let r = s
+        .wallet_tx_status(Parameters(TxParams { tx_hash: TX.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(!text(&r).contains("hunter2"), "{}", text(&r));
 }
 
 #[tokio::test]

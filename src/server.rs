@@ -472,7 +472,13 @@ async fn sequencer_call(url: String, method: &'static str, params: Value) -> Res
             .post(&url)
             .header("content-type", "application/json")
             .send(request.to_string())
-            .map_err(|e| format!("the sequencer at {url} didn't answer: {e}"))?;
+            // Not the address in the message: it may carry a credential.
+            .map_err(|e| {
+                format!(
+                    "the wallet's sequencer didn't answer: {}",
+                    e.to_string().replace(&url, "<sequencer>")
+                )
+            })?;
         let text = response
             .body_mut()
             .read_to_string()
@@ -482,7 +488,10 @@ async fn sequencer_call(url: String, method: &'static str, params: Value) -> Res
         if let Some(error) = reply.get("error").filter(|e| !e.is_null()) {
             return Err(format!("the sequencer refused {method}: {error}"));
         }
-        Ok(reply["result"].clone())
+        reply
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "the sequencer's reply has no result".to_string())
     })
     .await
     .map_err(|e| e.to_string())?
