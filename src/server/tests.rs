@@ -819,10 +819,6 @@ async fn a_restart_between_open_and_listing_is_not_trusted() {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// The account a test program call goes to first.
 const CALL_TO: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const TEST_PROGRAM: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -2871,8 +2867,6 @@ async fn node_status_shows_the_real_and_the_configured_network() {
     assert_eq!(b["messaging"]["configured_network"], "logos.dev");
 }
 
-mod services;
-
 #[tokio::test(start_paused = true)]
 async fn chat_waits_for_a_new_messaging_node_to_connect_before_starting() {
     // chat_module starts a node it joins while that node is still starting,
@@ -2957,4 +2951,63 @@ async fn a_signed_call_never_goes_out_from_another_account() {
     let r = s.send_signed(CALL_TO, &[], vec![9, 9], TEST_PROGRAM).await;
     assert!(matches!(r, Err(SendError::NotSent(_))), "{r:?}");
     assert!(!sent_generic(&fake));
+}
+
+/// A server whose agent wallet's files are in `dir`.
+fn wallet_server_in(fake: Arc<FakeRunner>, dir: &std::path::Path) -> LogosServer {
+    LogosServer::new(
+        Arc::new(Logosctl::new(fake)),
+        Arc::new(EventStore::default()),
+        None,
+        NodeSettings {
+            preset: "logos.test".into(),
+            mode: "Edge".into(),
+            config_dir: None,
+            wallet: Some(WalletMode::Dedicated(WalletPaths {
+                config: dir.join("wallet_config.json"),
+                storage: dir.join("storage.json"),
+            })),
+            discovery_bootstrap: vec![FLEET_PEER.into()],
+            host_owns_messaging: false,
+        },
+    )
+}
+
+fn one_public_account() -> Arc<FakeRunner> {
+    FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        lez("get_balance", r#""250""#),
+    ])
+}
+
+#[tokio::test]
+async fn accounts_made_for_a_job_are_marked() {
+    // logos-agents records them next to the wallet; the Wallet tab groups them.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(JOB_ACCOUNTS),
+        json!({ AGENT_ID: { "job": "j1", "service": "demo/v1" } }).to_string(),
+    )
+    .unwrap();
+    let s = wallet_server_in(one_public_account(), dir.path());
+    let b = body(&s.wallet_accounts().await.unwrap());
+    assert_eq!(b["accounts"][0]["job"]["job"], "j1", "{b}");
+    assert_eq!(b["note"], Value::Null, "{b}");
+}
+
+#[tokio::test]
+async fn an_unreadable_job_accounts_file_is_reported_not_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(JOB_ACCOUNTS), "{").unwrap();
+    let s = wallet_server_in(one_public_account(), dir.path());
+    let b = body(&s.wallet_accounts().await.unwrap());
+    assert_eq!(b["accounts"][0]["balance_lepta"], "250", "{b}");
+    assert!(
+        b["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(JOB_ACCOUNTS),
+        "{b}"
+    );
 }

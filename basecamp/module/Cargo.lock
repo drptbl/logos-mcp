@@ -675,7 +675,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logos-mcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -687,7 +687,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -707,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "logos_mcp_module"
-version = "0.9.6"
+version = "0.10.0"
 dependencies = [
  "axum",
  "logos-mcp",

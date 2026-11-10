@@ -35,6 +35,9 @@ const CHAT: &str = "chat_module";
 /// The largest chat message the agent may send, in bytes: well under the
 /// network's message limit once encrypted.
 pub const MAX_CHAT_BYTES: usize = 64 * 1024;
+/// Next to the wallet: the accounts made to be paid for one service job, as
+/// logos-agents records them, so `wallet_accounts` can mark them.
+pub const JOB_ACCOUNTS: &str = "job-accounts.json";
 const CHUNK_SIZE: i64 = 65_536;
 /// How many seconds chat waits for a messaging node it just created to connect.
 const CONNECT_WAIT_TRIES: usize = 60;
@@ -220,12 +223,6 @@ pub struct LogosServer {
     chat_starting: Arc<tokio::sync::Mutex<()>>,
     /// Held while checking and creating the messaging node, so it is created once.
     connecting: Arc<tokio::sync::Mutex<()>>,
-    /// The service tools' offers, conversations and payments in flight.
-    services: Arc<tokio::sync::Mutex<jobs::Services>>,
-    /// Held while quoting, so a job never gets two accounts.
-    quoting: Arc<tokio::sync::Mutex<()>>,
-    /// Held while offers are advertised or stopped, so they don't cross.
-    advertising: Arc<tokio::sync::Mutex<()>>,
     /// The tool groups the user allows, read on every list and call, and
     /// watched so connected agents hear when the list changes.
     tool_groups: tokio::sync::watch::Receiver<ToolGroups>,
@@ -490,16 +487,13 @@ impl LogosServer {
             agent_accounts: Arc::default(),
             chat_starting: Arc::default(),
             connecting: Arc::default(),
-            services: Arc::default(),
-            quoting: Arc::default(),
-            advertising: Arc::default(),
             discovery_ready: Arc::default(),
             interests: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
             watching: std::sync::OnceLock::new(),
-            tool_router: Self::tool_router() + Self::services_router(),
+            tool_router: Self::tool_router(),
         }
     }
 
@@ -721,6 +715,13 @@ impl LogosServer {
                 agent_accounts_file,
             } => Some(agent_accounts_file.with_file_name(name)),
         }
+    }
+
+    /// Which accounts were made for which service job: account id -> `{job, service}`.
+    /// Refused when the file is there but can't be read.
+    pub fn job_accounts(&self) -> Result<std::collections::BTreeMap<String, Value>, String> {
+        guard::read_side_map(self.wallet_side_file(JOB_ACCOUNTS))
+            .map_err(|e| format!("{JOB_ACCOUNTS} next to the wallet can't be read ({e})"))
     }
 
     /// Sign and send a program call from an agent account, with no approval.
@@ -2281,8 +2282,6 @@ impl ServerHandler for LogosServer {
         )
     }
 }
-
-mod jobs;
 
 #[cfg(test)]
 mod tests;

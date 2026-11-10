@@ -5,13 +5,11 @@
 
 pub mod control;
 pub mod enr;
-pub mod escrow;
 pub mod events;
 pub mod guard;
 pub mod logosctl;
 pub mod node;
 pub mod server;
-pub mod services;
 #[cfg(feature = "cli")]
 pub mod standalone;
 
