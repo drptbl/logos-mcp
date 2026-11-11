@@ -808,6 +808,15 @@ impl LogosServer {
         Ok(json!({ "request_id": id, "state": "denied" }))
     }
 
+    /// Record an action taken without a tool call, such as logos-agents
+    /// claiming a payment on its own, next to the agent's calls. Does nothing
+    /// without an activity log, which only the Basecamp module keeps.
+    pub fn record_activity(&self, action: &str, args: &Value, ok: bool, result: &str) {
+        if let Some(log) = &self.activity {
+            log.record(action, args, ok, result);
+        }
+    }
+
     /// The user's answers belong in the activity next to the agent's calls.
     fn record_decision(&self, decision: &str, id: &str) {
         if let Some(log) = &self.activity {
