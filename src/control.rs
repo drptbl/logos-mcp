@@ -27,6 +27,7 @@ pub struct ToolGroups {
     pub transfers: bool,
     pub discovery: bool,
     pub chat: bool,
+    pub chain: bool,
     /// Service tools added on top of this server, such as logos-agents'.
     pub services: bool,
     pub ask_before_transfer: bool,
@@ -41,6 +42,7 @@ impl Default for ToolGroups {
             transfers: true,
             discovery: true,
             chat: true,
+            chain: true,
             services: true,
             ask_before_transfer: false,
         }
@@ -51,13 +53,14 @@ impl ToolGroups {
     /// The group a tool belongs to, by its name.
     pub fn group_of(tool: &str) -> Option<&'static str> {
         match tool {
-            "wallet_transfer" | "wallet_transfer_status" => Some("transfers"),
+            "wallet_transfer" | "wallet_transfer_status" | "chain_transfer" => Some("transfers"),
             "rln_status" => Some("messaging"),
             t if t.starts_with("messaging_") => Some("messaging"),
             t if t.starts_with("storage_") => Some("storage"),
             t if t.starts_with("wallet_") => Some("wallet"),
             t if t.starts_with("discovery_") => Some("discovery"),
             t if t.starts_with("chat_") => Some("chat"),
+            t if t.starts_with("chain_") => Some("chain"),
             t if t.starts_with("service_") => Some("services"),
             _ => None,
         }
@@ -71,6 +74,7 @@ impl ToolGroups {
             "transfers" => Some(&mut self.transfers),
             "discovery" => Some(&mut self.discovery),
             "chat" => Some(&mut self.chat),
+            "chain" => Some(&mut self.chain),
             "services" => Some(&mut self.services),
             "ask_before_transfer" => Some(&mut self.ask_before_transfer),
             _ => None,
@@ -85,6 +89,7 @@ impl ToolGroups {
             Some("transfers") => self.transfers,
             Some("discovery") => self.discovery,
             Some("chat") => self.chat,
+            Some("chain") => self.chain,
             Some("services") => self.services,
             _ => true,
         }
@@ -149,6 +154,10 @@ pub struct TransferRequest {
     /// open, instead of a plain transfer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<ProgramCall>,
+    /// A Logos chain transfer from the node's own wallet, in place of a LEZ
+    /// one: `from` and `to` are chain keys and the amount is in its lepta.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub chain: bool,
 }
 
 /// A program call that moves the amount out of `from` in place of a plain
@@ -203,6 +212,27 @@ impl Approvals {
         amount_lepta: &str,
         call: Option<ProgramCall>,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        self.file(from, to, amount_lepta, call, false)
+    }
+
+    /// File a Logos chain transfer from the node's own wallet.
+    pub fn request_chain(
+        &self,
+        from: &str,
+        to: &str,
+        amount_lepta: &str,
+    ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        self.file(from, to, amount_lepta, None, true)
+    }
+
+    fn file(
+        &self,
+        from: &str,
+        to: &str,
+        amount_lepta: &str,
+        call: Option<ProgramCall>,
+        chain: bool,
+    ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         // Unique across restarts too, so an old id never names a new request.
         let id = format!(
             "{:x}-{}",
@@ -233,6 +263,7 @@ impl Approvals {
                     amount_lepta: amount_lepta.to_string(),
                     requested_at: unix_now(),
                     call,
+                    chain,
                 },
                 expires: tokio::time::Instant::now() + APPROVAL_EXPIRES,
                 decision,
