@@ -38,6 +38,8 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `discovery_connect` / `discovery_disconnect` / `discovery_ping` | dials a peer by its multiaddr, drops one, or pings one for its round trip |
 | `chain_info` | the Logos chain's id, consensus tip, slot timing and network peers |
 | `chain_blocks` | the chain blocks in a range of slots, at most 600 at a time |
+| `chain_events` | each new finalized block's height and header id as it arrives, paged by `after_seq` |
+| `chain_rewards` / `chain_claim_reward` | the leader reward vouchers and mined tickets the chain node hasn't claimed, or claims one voucher into its wallet. The claim's fee comes from the node's funding key |
 | `chain_wallet` | the chain node's own addresses with their balances, or one address with its notes |
 | `chain_transfer` | sends TestToken from one of the chain node's addresses. Always waits for your Approve in the AI Agent app, so it only works inside Basecamp |
 | `chain_block` / `chain_transaction` | a chain block and its transactions by its header id, or a transaction still waiting in the mempool by its hash. The node finds a mined transaction only through its block |
@@ -45,6 +47,8 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
 | `storage_exists` | whether a CID is in local storage |
+| `storage_manifests` | the content in local storage, marking what the agent put there |
+| `storage_remove` | removes content the agent uploaded or downloaded fresh. The rest of local storage is left alone |
 | `storage_space` | local storage quota and usage |
 
 Messaging and storage are asynchronous on Logos, so send and upload return an id and you poll the matching status tool.
@@ -221,6 +225,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - `wallet_tx_status` is the one tool that skips `logosctl`: it asks the sequencer in the wallet config directly, because `lez_core` only has a lookup that blocks for minutes
 - `chain_transfer` spends the chain node's wallet, which is yours, so each one waits for your Approve whatever the switches say. Outside Basecamp there is nobody to approve, so it refuses
 - `wallet_faucet` only pays into the agent's own public accounts
+- `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest
 - `wallet_transfer` only sends from the agent wallet: the one this server opened, or the configured wallet found already open, with exactly its accounts on its sequencer. If `lez_core` has another wallet open, it refuses
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
 - only the AI Agent app can read the token, flip the tool switches or read the activity through the module
