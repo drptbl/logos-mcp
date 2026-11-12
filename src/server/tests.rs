@@ -3246,3 +3246,35 @@ async fn an_unclear_create_in_an_empty_wallet_adopts_nothing() {
     assert_eq!(status["agent_wallet"], false, "{status}");
 }
 mod storage_code;
+
+#[test]
+fn a_transfer_answered_as_the_wait_ends_is_reported_as_answered() {
+    let sent = |tx: &str| json!({ "tx_hash": tx });
+    // The wait ran out just as the transfer was sent.
+    let r = approval_reply(
+        Decision::Sent {
+            tx_hash: "aa".into(),
+        },
+        false,
+        "r1",
+        sent,
+    )
+    .unwrap();
+    assert_eq!(body(&r)["tx_hash"], "aa");
+    // The agent gave up just as the user denied it.
+    let r = approval_reply(Decision::Denied, true, "r2", sent).unwrap();
+    assert!(text(&r).contains("denied"), "{}", text(&r));
+    let r = approval_reply(Decision::Expired, true, "r3", sent).unwrap();
+    assert!(text(&r).contains("did not answer"), "{}", text(&r));
+    // The agent gave up after the user approved: it may still go out.
+    let r = approval_reply(Decision::Approved, true, "r4", sent).unwrap();
+    assert!(
+        is_error(&r) && text(&r).contains("may be sent"),
+        "{}",
+        text(&r)
+    );
+    let r = approval_reply(Decision::Approved, false, "r5", sent).unwrap();
+    assert_eq!(body(&r)["status"], "approved_sending");
+    let r = approval_reply(Decision::Waiting, false, "r6", sent).unwrap();
+    assert_eq!(body(&r)["status"], "awaiting_approval");
+}

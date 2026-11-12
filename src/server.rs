@@ -764,6 +764,39 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
     fail(message)
 }
 
+/// The agent's answer for a transfer request standing at `now`, after its wait
+/// ended or, with `cancelled`, after the agent stopped waiting.
+fn approval_reply(
+    now: Decision,
+    cancelled: bool,
+    id: &str,
+    sent: impl FnOnce(&str) -> Value,
+) -> Result<CallToolResult, McpError> {
+    match now {
+        Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
+        Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
+        Decision::Denied => fail("the user denied this transfer: nothing was sent"),
+        Decision::Expired => fail("the user did not answer in time: nothing was sent"),
+        Decision::Cancelled => fail("this transfer was cancelled: nothing was sent"),
+        Decision::Approved if cancelled => fail(format!(
+            "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
+        )),
+        Decision::Approved => ok(json!({
+            "status": "approved_sending",
+            "request_id": id,
+            "note": "the user approved it and it is being sent: check wallet_transfer_status with this request_id for the tx_hash",
+        })),
+        Decision::Waiting => ok(json!({
+            "status": "awaiting_approval",
+            "request_id": id,
+            "note": format!(
+                "the user hasn't answered yet. Check wallet_transfer_status with this request_id. If they don't answer within {} minutes of the request, it expires and is never sent",
+                APPROVAL_EXPIRES.as_secs() / 60
+            ),
+        })),
+    }
+}
+
 /// A lez_faucet failure, with where to get the module when it isn't there.
 fn faucet_error(e: LogosError) -> String {
     let message = e.to_string();
@@ -2347,43 +2380,16 @@ impl LogosServer {
                 }
             }
         };
-        tokio::select! {
-            outcome = answered => match outcome {
-                Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
-                Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
-                Decision::Denied => fail("the user denied this transfer: nothing was sent"),
-                Decision::Expired => fail("the user did not answer in time: nothing was sent"),
-                _ => fail("this transfer was cancelled: nothing was sent"),
-            },
-            () = tokio::time::sleep(APPROVAL_WAIT) => {
-                if *decision.borrow() == Decision::Approved {
-                    ok(json!({
-                        "status": "approved_sending",
-                        "request_id": id,
-                        "note": "the user approved it and it is being sent: check wallet_transfer_status with this request_id for the tx_hash",
-                    }))
-                } else {
-                    ok(json!({
-                        "status": "awaiting_approval",
-                        "request_id": id,
-                        "note": format!(
-                            "the user hasn't answered yet. Check wallet_transfer_status with this request_id. If they don't answer within {} minutes of the request, it expires and is never sent",
-                            APPROVAL_EXPIRES.as_secs() / 60
-                        ),
-                    }))
-                }
-            }
-            () = ct.cancelled() => {
-                // A request still waiting is cancelled: no approval may send behind
-                // the agent's back. One the user already approved goes ahead, so say so.
-                match self.approvals.cancel(id) {
-                    Decision::Cancelled => fail("transfer cancelled: it will not be sent"),
-                    _ => fail(format!(
-                        "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
-                    )),
-                }
-            }
-        }
+        // Whichever way the wait ends, report where the request stands then: a
+        // transfer answered just as the wait ran out is reported as answered.
+        let (now, cancelled) = tokio::select! {
+            outcome = answered => (outcome, false),
+            () = tokio::time::sleep(APPROVAL_WAIT) => (decision.borrow().clone(), false),
+            // A request still waiting is cancelled: no approval may send behind
+            // the agent's back.
+            () = ct.cancelled() => (self.approvals.cancel(id), true),
+        };
+        approval_reply(now, cancelled, id, sent)
     }
 
     #[tool(
