@@ -12,7 +12,8 @@ fn storage_server(fake: Arc<FakeRunner>, root: &std::path::Path) -> (LogosServer
         Arc::new(Logosctl::new(fake)),
         events.clone(),
         Some(FilesRoot::new(root).unwrap()),
-        wallet_server(FakeRunner::with(vec![])).settings.clone(),
+        // No wallet: the agent's content record stays in memory.
+        server(FakeRunner::with(vec![]), None).settings.clone(),
     );
     (s, events)
 }
@@ -95,7 +96,10 @@ async fn an_upload_that_outlasts_its_timeout_is_cancelled() {
 #[tokio::test(start_paused = true)]
 async fn a_download_waits_for_the_file() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
     let (s, events) = storage_server(fake, dir.path());
     let download = tokio::spawn({
         let s = s.clone();
@@ -125,6 +129,7 @@ async fn a_download_waits_for_the_file() {
 async fn a_download_bigger_than_the_cap_is_stopped_and_removed() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
         storage("downloadCancel", "null"),
     ]);
@@ -156,7 +161,10 @@ async fn a_download_bigger_than_the_cap_is_stopped_and_removed() {
 async fn a_finished_download_over_the_cap_is_removed_too() {
     // No total was ever reported: the file's size decides.
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
     let (s, events) = storage_server(fake, dir.path());
     let download = tokio::spawn({
         let s = s.clone();
@@ -224,7 +232,10 @@ fn bytes_are_written_only_into_a_new_file_under_the_root() {
 #[tokio::test(start_paused = true)]
 async fn a_second_download_of_the_same_cid_waits_its_turn_by_failing() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
     let (s, events) = storage_server(fake.clone(), dir.path());
     let first = tokio::spawn({
         let s = s.clone();
@@ -259,7 +270,10 @@ async fn a_second_download_of_the_same_cid_waits_its_turn_by_failing() {
 #[tokio::test(start_paused = true)]
 async fn a_download_whose_cancel_fails_says_the_file_may_come_back() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
     let (s, _events) = storage_server(fake, dir.path());
     // No cancel reply: the cancel call fails.
     let err = s
@@ -274,7 +288,10 @@ const OTHER_CID: &str = "zDvZRwzkx92SbzDg5jBa1heRYvCTJGRUa9B9foVmGDMF3QtEXVyA";
 #[tokio::test(start_paused = true)]
 async fn two_downloads_never_share_a_destination() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
     let (s, events) = storage_server(fake, dir.path());
     let first = tokio::spawn({
         let s = s.clone();
@@ -306,7 +323,9 @@ async fn two_downloads_never_share_a_destination() {
 async fn the_download_tool_leaves_a_running_download_to_alone() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
+        storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
     ]);
     let (s, _events) = storage_server(fake.clone(), dir.path());
@@ -333,6 +352,7 @@ async fn the_download_tool_leaves_a_running_download_to_alone() {
 async fn a_dropped_download_is_cancelled_and_cleaned_up() {
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
         storage("downloadCancel", "null"),
     ]);
@@ -370,4 +390,114 @@ async fn an_upload_whose_cancel_fails_does_not_claim_it_was_cancelled() {
         .unwrap_err();
     assert!(!err.contains("it was cancelled"), "{err}");
     assert!(err.contains("may still"), "{err}");
+}
+
+/// A server whose agent wallet files sit in `dir`, so its side files persist there.
+fn storage_server_with_wallet(
+    fake: Arc<FakeRunner>,
+    root: &std::path::Path,
+    wallet_dir: &std::path::Path,
+) -> (LogosServer, Arc<EventStore>) {
+    let (mut s, events) = storage_server(fake, root);
+    s.settings.wallet = Some(WalletMode::Dedicated(WalletPaths {
+        config: wallet_dir.join("wallet_config.json"),
+        storage: wallet_dir.join("storage.json"),
+    }));
+    (s, events)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_is_the_agents_to_remove_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let fake = FakeRunner::with(vec![storage("uploadUrl", r#""79""#)]);
+    let (s, events) = storage_server_with_wallet(fake, dir.path(), wallet.path());
+    let upload = tokio::spawn({
+        let s = s.clone();
+        async move { s.upload_file("out.txt", Duration::from_secs(30)).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "79", "success": true, "cid": CID }),
+    );
+    upload.await.unwrap().unwrap();
+    // A fresh server on the same wallet still knows it: the record is on disk.
+    let (again, _) =
+        storage_server_with_wallet(FakeRunner::with(vec![]), dir.path(), wallet.path());
+    assert!(again.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn content_the_agent_did_not_put_there_is_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![]);
+    let (s, _events) = storage_server(fake.clone(), dir.path());
+    let r = s
+        .storage_remove(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agents_own_content_is_removed_and_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("remove", "null"), storage("exists", "false")]);
+    let (s, _events) = storage_server(fake.clone(), dir.path());
+    s.remember_cid(CID, "upload").unwrap();
+    let r = s
+        .storage_remove(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(body(&r)["removed"], CID);
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_of_content_already_held_is_not_the_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "true"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, events) = storage_server(fake, dir.path());
+    let download = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(CID, "in.bin", None, Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    std::fs::write(dir.path().join("in.bin"), b"x").unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    download.await.unwrap().unwrap();
+    assert!(!s.is_own_cid(CID).unwrap(), "the user's copy stays theirs");
+}
+
+#[tokio::test]
+async fn storage_manifests_marks_the_agents_own_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let listed = json!([
+        { "cid": CID, "datasetSize": 661, "filename": "a.txt", "mimetype": null, "blockSize": 65536, "treeCid": "zDz" },
+        { "cid": "zDvZRwzm6zBm95cPgb1gFRe7P7NHp4x8giz49SM1KvwaEXfmU7TN", "datasetSize": 549, "filename": "b.txt", "mimetype": null, "blockSize": 65536, "treeCid": "zDz" },
+    ]);
+    let fake = FakeRunner::with(vec![storage("manifests", &listed.to_string())]);
+    let (s, _events) = storage_server(fake, dir.path());
+    s.remember_cid(CID, "download").unwrap();
+    let b = body(&s.storage_manifests().await.unwrap());
+    let content = b["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{b}");
+    assert_eq!(content[0]["agent"], true, "{b}");
+    assert_eq!(content[0]["size"], 661, "{b}");
+    assert_eq!(content[1]["agent"], false, "{b}");
 }

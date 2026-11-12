@@ -45,6 +45,9 @@ pub const MAX_CHAT_BYTES: usize = 64 * 1024;
 /// Next to the wallet: the accounts made to be paid for one service job, as
 /// logos-agents records them, so `wallet_accounts` can mark them.
 pub const JOB_ACCOUNTS: &str = "job-accounts.json";
+/// Content this agent put in local storage, by upload or a fresh download: the
+/// only content storage_remove touches. Kept next to the wallet when there is one.
+pub const AGENT_CIDS: &str = "agent-cids.json";
 const CHUNK_SIZE: i64 = 65_536;
 /// How many seconds chat waits for a messaging node it just created to connect.
 const CONNECT_WAIT_TRIES: usize = 60;
@@ -379,6 +382,8 @@ pub struct LogosServer {
     /// CIDs download_to is fetching: a download's session id is its CID, so two
     /// at once would share one transfer record.
     downloads: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// The agent's own content, for when no wallet gives AGENT_CIDS a home.
+    own_cids: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<KnownWallet>>>,
@@ -885,6 +890,7 @@ impl LogosServer {
             interests: Arc::default(),
             faucet_jobs: Arc::default(),
             downloads: Arc::default(),
+            own_cids: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
@@ -3463,11 +3469,19 @@ impl LogosServer {
             // Full privacy also means not re-serving what was fetched.
             Arg::Bool(!private),
         ];
+        // Content already held stays the user's: only a fresh fetch is the agent's.
+        let held = !matches!(
+            self.node.call(STORAGE, "exists", &[Arg::str(cid)]).await,
+            Ok(Value::Bool(false))
+        );
         // The download session id is the CID: clear any earlier run first.
         self.events.reset_transfer(cid, "download");
         match self.node.call(STORAGE, "downloadToUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "download");
+                if !held && let Err(e) = self.remember_cid(cid, "download") {
+                    tracing::warn!("could not record the agent's download {cid}: {e}");
+                }
                 Ok((session, full))
             }
             Ok(other) => Err(format!("unexpected downloadToUrl result: {other}")),
@@ -3506,9 +3520,16 @@ impl LogosServer {
     pub async fn upload_file(&self, path: &str, timeout: Duration) -> Result<String, String> {
         let session = self.start_upload(path).await?;
         match self.await_transfer(&session, timeout, |_| None).await {
-            Ok(t) if t.success == Some(true) => t
-                .cid
-                .ok_or_else(|| "the upload finished without a CID".to_string()),
+            Ok(t) if t.success == Some(true) => {
+                let cid = t
+                    .cid
+                    .ok_or_else(|| "the upload finished without a CID".to_string())?;
+                // Unrecorded, it only can't be removed later: never fail the upload for it.
+                if let Err(e) = self.remember_cid(&cid, "upload") {
+                    tracing::warn!("could not record the agent's upload {cid}: {e}");
+                }
+                Ok(cid)
+            }
             Ok(t) => Err(format!(
                 "the upload failed: {}",
                 t.error.unwrap_or_else(|| "no reason given".into())
@@ -3657,9 +3678,137 @@ impl LogosServer {
         Parameters(p): Parameters<SessionParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.events.transfer(&p.session_id) {
-            Some(t) => ok(serde_json::to_value(t).unwrap_or(Value::Null)),
+            Some(t) => {
+                if t.kind == "upload"
+                    && t.success == Some(true)
+                    && let Some(cid) = &t.cid
+                    && let Err(e) = self.remember_cid(cid, "upload")
+                {
+                    tracing::warn!("could not record the agent's upload {cid}: {e}");
+                }
+                ok(serde_json::to_value(t).unwrap_or(Value::Null))
+            }
             None => fail(format!("unknown session {}", p.session_id)),
         }
+    }
+
+    #[tool(
+        description = "Content held in local storage: CID, size in bytes, file name and type, and whether this agent put it there (only that content can be removed)."
+    )]
+    async fn storage_manifests(&self) -> Result<CallToolResult, McpError> {
+        let listed = match self.node.call(STORAGE, "manifests", &[]).await {
+            Ok(v) => embedded_json(v),
+            Err(e) => return logos_fail(e),
+        };
+        let Value::Array(list) = listed else {
+            return fail(format!("unexpected manifests reply: {listed}"));
+        };
+        let mut content = Vec::with_capacity(list.len());
+        for m in &list {
+            let cid = m["cid"].as_str().unwrap_or_default();
+            content.push(json!({
+                "cid": cid,
+                "size": m["datasetSize"],
+                "filename": m["filename"],
+                "mimetype": m["mimetype"],
+                "agent": self.is_own_cid(cid).unwrap_or(false),
+            }));
+        }
+        ok(json!({ "count": content.len(), "content": content }))
+    }
+
+    #[tool(
+        description = "Remove content from local storage, by CID. Only content this agent uploaded, or downloaded when it wasn't held already, can be removed: storage_manifests marks it."
+    )]
+    async fn storage_remove(
+        &self,
+        Parameters(p): Parameters<CidParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = guard::validate_cid(&p.cid) {
+            return fail(e);
+        }
+        match self.is_own_cid(&p.cid) {
+            Ok(true) => {}
+            Ok(false) => {
+                return fail(
+                    "only content this agent uploaded or downloaded can be removed: the rest of local storage is the user's",
+                );
+            }
+            Err(e) => return fail(e),
+        }
+        if let Err(e) = self.node.call(STORAGE, "remove", &[Arg::str(&p.cid)]).await {
+            return logos_fail(e);
+        }
+        // Removal finishes in the background: wait a moment for it to be gone.
+        for _ in 0..20 {
+            if let Ok(Value::Bool(false)) =
+                self.node.call(STORAGE, "exists", &[Arg::str(&p.cid)]).await
+            {
+                if let Err(e) = self.forget_cid(&p.cid) {
+                    return fail(format!(
+                        "removed, but the record of it couldn't be updated: {e}"
+                    ));
+                }
+                return ok(json!({ "removed": p.cid }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        ok(json!({
+            "removing": p.cid,
+            "note": "still being removed: check storage_exists in a moment",
+        }))
+    }
+
+    /// Record `cid` as content the agent put in local storage.
+    fn remember_cid(&self, cid: &str, via: &str) -> Result<(), String> {
+        let mut own = self.own_cids.lock().unwrap_or_else(|e| e.into_inner());
+        own.insert(cid.to_string());
+        let Some(file) = self.wallet_side_file(AGENT_CIDS) else {
+            return Ok(());
+        };
+        let mut map: std::collections::BTreeMap<String, Value> =
+            guard::read_side_map(Some(file.clone()))
+                .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
+        map.insert(
+            cid.to_string(),
+            json!({ "via": via, "at": now_ms() / 1000 }),
+        );
+        let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+        guard::write_private(&file, &text).map_err(|e| e.to_string())
+    }
+
+    /// Forget `cid` once it is gone from local storage.
+    fn forget_cid(&self, cid: &str) -> Result<(), String> {
+        let mut own = self.own_cids.lock().unwrap_or_else(|e| e.into_inner());
+        own.remove(cid);
+        let Some(file) = self.wallet_side_file(AGENT_CIDS) else {
+            return Ok(());
+        };
+        let mut map: std::collections::BTreeMap<String, Value> =
+            guard::read_side_map(Some(file.clone()))
+                .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
+        if map.remove(cid).is_some() {
+            let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+            guard::write_private(&file, &text).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Whether the agent put `cid` in local storage, by this server's memory or
+    /// the record next to the wallet.
+    fn is_own_cid(&self, cid: &str) -> Result<bool, String> {
+        if self
+            .own_cids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(cid)
+        {
+            return Ok(true);
+        }
+        let map: std::collections::BTreeMap<String, Value> =
+            guard::read_side_map(self.wallet_side_file(AGENT_CIDS))
+                .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
+        Ok(map.contains_key(cid))
     }
 
     #[tool(description = "Check whether content is already in local storage.")]
