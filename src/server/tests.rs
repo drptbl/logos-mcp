@@ -3084,3 +3084,11 @@ fn a_delivery_config_is_not_printed_in_logs() {
     let c = DeliveryConfig::parse(r#"{"nodekey":"aa11"}"#).unwrap();
     assert!(!format!("{c:?}").contains("aa11"));
 }
+
+#[tokio::test]
+async fn with_a_delivery_config_the_network_is_not_named_after_the_preset() {
+    let uninit = r#"{"method":"getNodeInfo","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let mut s = server(FakeRunner::with(vec![out(uninit)]), None);
+    s.settings.delivery_config = Some(DeliveryConfig::parse(r#"{"clusterId":99}"#).unwrap());
+    assert_eq!(s.network().await, "custom delivery config");
+}

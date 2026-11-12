@@ -954,7 +954,7 @@ impl LogosServer {
         {
             Ok(Value::String(enr)) => crate::enr::network_name(&enr),
             Ok(_) => "unknown".to_string(),
-            Err(e) if is_uninitialized(&e) => self.settings.preset.clone(),
+            Err(e) if is_uninitialized(&e) => self.configured_network(),
             Err(_) => "unknown".to_string(),
         }
     }
@@ -1103,6 +1103,15 @@ impl LogosServer {
 
     pub fn allows(&self, tool: &str) -> bool {
         self.tool_groups.borrow().allows(tool)
+    }
+
+    /// The network the node is set up for: the preset, unless a full delivery
+    /// config replaces it.
+    fn configured_network(&self) -> String {
+        match self.settings.delivery_config {
+            Some(_) => "custom delivery config".into(),
+            None => self.settings.preset.clone(),
+        }
     }
 
     fn node_config(&self) -> String {
@@ -1594,7 +1603,7 @@ impl LogosServer {
             "modules": daemon.get("modules_summary"),
             "messaging": {
                 "network": self.network().await,
-                "configured_network": self.settings.preset,
+                "configured_network": self.configured_network(),
                 "mode": self.settings.mode,
                 "connection": connection,
                 "subscriptions": *self.subscriptions.lock().unwrap(),
