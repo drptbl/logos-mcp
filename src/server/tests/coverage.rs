@@ -674,7 +674,10 @@ async fn chain_wallet_lists_the_node_accounts_with_balances() {
             json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
         ),
         chain("wallet_get_balance", json!("1500")),
-        chain_refused("wallet_get_balance", "Unknown wallet address."),
+        chain_refused(
+            "wallet_get_balance",
+            "Failed to get balance: Ledger state corresponding to block ab not found",
+        ),
     ]);
     let b = body(
         &server(fake, None)
@@ -688,7 +691,10 @@ async fn chain_wallet_lists_the_node_accounts_with_balances() {
     assert_eq!(accounts[0]["balance"], "1500", "{b}");
     assert!(accounts[1]["balance"].is_null(), "{b}");
     assert!(
-        accounts[1]["error"].as_str().unwrap().contains("Unknown"),
+        accounts[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Ledger state"),
         "{b}"
     );
 }
@@ -697,6 +703,10 @@ async fn chain_wallet_lists_the_node_accounts_with_balances() {
 async fn chain_wallet_shows_one_account_with_its_notes() {
     let fake = FakeRunner::with(vec![
         out(BLOCKCHAIN_LOADED),
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\"]")),
+        ),
         chain("wallet_get_balance", json!("1500")),
         chain(
             "wallet_get_notes",
@@ -1475,4 +1485,73 @@ async fn the_faucet_switches_networks_only_for_the_drop() {
         "switched for the drop, then back"
     );
     assert_eq!(body(&r)["faucet_network"], "restored", "{}", text(&r));
+}
+
+#[tokio::test]
+async fn an_unfunded_node_key_reads_as_zero() {
+    // blockchain_module 0.3.4 answers NotFound, not 0, for a known key with no notes.
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\",\"{CHAIN_KEY_B}\"]")),
+        ),
+        chain_refused("wallet_get_balance", "Unknown wallet address."),
+        chain("wallet_get_balance", json!("1500")),
+    ]);
+    let b = body(
+        &server(fake, None)
+            .chain_wallet(Parameters(ChainWalletParams { address: None }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["accounts"][0]["balance"], "0", "{b}");
+    assert!(b["accounts"][0].get("error").is_none(), "{b}");
+    assert_eq!(b["accounts"][1]["balance"], "1500", "{b}");
+}
+
+#[tokio::test]
+async fn one_unfunded_node_key_shows_zero_and_no_notes() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\"]")),
+        ),
+        chain_refused("wallet_get_balance", "Unknown wallet address."),
+        chain_refused("wallet_get_notes", "Unknown wallet address."),
+    ]);
+    let b = body(
+        &server(fake, None)
+            .chain_wallet(Parameters(ChainWalletParams {
+                address: Some(CHAIN_KEY_A.into()),
+            }))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["balance"], "0", "{b}");
+    assert_eq!(b["notes"], json!([]), "{b}");
+}
+
+#[tokio::test]
+async fn an_address_the_node_has_no_key_for_is_said_so() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_KEY_A}\"]")),
+        ),
+    ]);
+    let r = server(fake, None)
+        .chain_wallet(Parameters(ChainWalletParams {
+            address: Some(CHAIN_KEY_B.into()),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        text(&r).contains("not one of the chain node's"),
+        "{}",
+        text(&r)
+    );
 }
