@@ -78,6 +78,31 @@ pub struct NodeSettings {
     pub discovery_bootstrap: Vec<String>,
     /// The host (Basecamp) runs the messaging node: never create or start it, only report on it.
     pub host_owns_messaging: bool,
+    /// delivery_module's full createNode config, in place of `mode` and `preset`,
+    /// for a network no preset names, such as a local devnet hub.
+    pub delivery_config: Option<DeliveryConfig>,
+}
+
+/// A delivery_module createNode config, kept as given. It may carry a node key,
+/// so it never shows in debug output or logs.
+#[derive(Clone)]
+pub struct DeliveryConfig(String);
+
+impl DeliveryConfig {
+    /// The config, which must be a JSON object.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match serde_json::from_str::<Value>(text) {
+            Ok(v @ Value::Object(_)) => Ok(Self(v.to_string())),
+            Ok(_) => Err("the delivery config must be a JSON object".into()),
+            Err(e) => Err(format!("the delivery config is not valid JSON: {e}")),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeliveryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveryConfig(<set>)")
+    }
 }
 
 /// The open agent wallet, as `ensure_wallet` found or left it.
@@ -1081,7 +1106,12 @@ impl LogosServer {
     }
 
     fn node_config(&self) -> String {
-        json!({ "mode": self.settings.mode, "preset": self.settings.preset }).to_string()
+        match &self.settings.delivery_config {
+            Some(config) => config.0.clone(),
+            None => {
+                json!({ "mode": self.settings.mode, "preset": self.settings.preset }).to_string()
+            }
+        }
     }
 
     fn files(&self) -> Result<&FilesRoot, String> {
