@@ -2735,16 +2735,19 @@ impl LogosServer {
             unclear => {
                 // The account may exist even though the reply doesn't say so. Still
                 // holding the wallet lock, take it on so the identity check doesn't
-                // lock the agent out: only when the wallet now lists the agent's
-                // accounts plus exactly one more, still on its sequencer, so a
-                // wallet opened meanwhile is never adopted. Never in shared mode:
+                // lock the agent out: only when the wallet now lists all the agent's
+                // accounts plus exactly one more, still on its sequencer, so a wallet
+                // without the agent's keys is never adopted. Never in shared mode:
                 // that would designate the user's own accounts as the agent's.
                 if !w.shared
                     && let Some(known) = agent_accounts.as_ref()
                     && let Ok(accounts) = self.list_accounts().await
                 {
                     let ids = account_ids(&accounts);
-                    let one_more = ids.len() == known.ids.len() + 1 && known.ids.is_subset(&ids);
+                    // With nothing known, any one-account wallet would count as one more.
+                    let one_more = !known.ids.is_empty()
+                        && ids.len() == known.ids.len() + 1
+                        && known.ids.is_subset(&ids);
                     if one_more
                         && let Ok(addr) = self.sequencer_addr().await
                         && same_sequencer(&known.sequencer, &addr)
