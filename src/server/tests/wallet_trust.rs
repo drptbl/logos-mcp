@@ -193,3 +193,33 @@ async fn an_adopted_wallet_swapped_later_is_flagged() {
         "{later}"
     );
 }
+
+#[tokio::test]
+async fn the_same_accounts_later_open_on_another_sequencer_are_not_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut replies = configured_open(SEQUENCER, AGENT_ACCOUNTS);
+    // later the same keys are open against another chain
+    replies.extend([
+        lez("get_sequencer_addr", r#""http://127.0.0.1:3040/""#),
+        lez("list_accounts", AGENT_ACCOUNTS),
+        lez("get_balance", r#""5""#),
+    ]);
+    let s = configured_server(
+        FakeRunner::with(replies),
+        dir.path(),
+        &[AGENT_HEX],
+        SEQUENCER,
+    );
+    assert_eq!(
+        body(&s.wallet_status().await.unwrap())["opened_by_this_server"],
+        true
+    );
+    let later = body(&s.wallet_accounts().await.unwrap());
+    assert!(
+        later["warning"]
+            .as_str()
+            .unwrap()
+            .contains("may not be the agent wallet"),
+        "{later}"
+    );
+}

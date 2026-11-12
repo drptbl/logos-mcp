@@ -182,6 +182,19 @@ pub fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
         .and_then(|b64| STANDARD.decode(b64).ok())
 }
 
+/// The dedicated wallet this server opened or adopted: the sequencer it was on
+/// and its accounts. A wallet open later counts as it only with both the same.
+#[derive(Debug, Clone)]
+pub(crate) struct KnownWallet {
+    sequencer: String,
+    ids: BTreeSet<String>,
+}
+
+/// Whether two sequencer addresses name the same sequencer.
+fn same_sequencer(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 /// The configured wallet's sequencer and account ids (hex), read from its
 /// files. Only the ids are taken from the key storage; None when either file
 /// can't be read as expected.
@@ -244,7 +257,7 @@ pub struct LogosServer {
     faucet_jobs: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
-    agent_accounts: Arc<tokio::sync::Mutex<Option<BTreeSet<String>>>>,
+    agent_accounts: Arc<tokio::sync::Mutex<Option<KnownWallet>>>,
     /// Held while checking and starting chat, so it starts once.
     chat_starting: Arc<tokio::sync::Mutex<()>>,
     /// Held while checking and creating the messaging node, so it is created once.
@@ -1173,7 +1186,7 @@ impl LogosServer {
     /// so a transfer's wallet check and its send happen as one step.
     async fn ensure_wallet_locked(
         &self,
-        agent_accounts: &mut Option<BTreeSet<String>>,
+        agent_accounts: &mut Option<KnownWallet>,
     ) -> Result<WalletHandle, String> {
         let paths = match self.wallet()? {
             WalletMode::Dedicated(paths) => paths,
@@ -1203,7 +1216,9 @@ impl LogosServer {
         if !addr.is_empty() {
             let accounts = self.list_accounts().await?;
             let ids = account_ids(&accounts);
-            let remembered = agent_accounts.as_ref().is_some_and(|known| *known == ids);
+            let remembered = agent_accounts
+                .as_ref()
+                .is_some_and(|known| known.ids == ids && same_sequencer(&known.sequencer, &addr));
             // The configured wallet itself, found open: this server restarted, or
             // a devnet session opened it. Exactly its accounts on its sequencer
             // means the same wallet; anything else, such as Basecamp's, stays untrusted.
@@ -1213,14 +1228,17 @@ impl LogosServer {
                 && !known.is_empty()
                 && known == ids
             {
-                // Read the sequencer again: had another wallet been opened between
-                // the first read and the listing, the two would describe different
-                // wallets. Now both describe the one that was listed.
-                let same = |a: &str| a.trim_end_matches('/') == sequencer.trim_end_matches('/');
-                is_agent = same(&addr) && same(&self.sequencer_addr().await?);
+                // Read the sequencer again, so a wallet on another sequencer opened
+                // between the first read and the listing isn't taken for this one.
+                // Sends are still checked against the accounts listed here.
+                is_agent = same_sequencer(&sequencer, &addr)
+                    && same_sequencer(&sequencer, &self.sequencer_addr().await?);
             }
             if is_agent {
-                *agent_accounts = Some(ids.clone());
+                *agent_accounts = Some(KnownWallet {
+                    sequencer: addr.clone(),
+                    ids: ids.clone(),
+                });
             }
             return Ok(WalletHandle {
                 sequencer: addr,
@@ -1259,7 +1277,10 @@ impl LogosServer {
             );
         }
         let ids = account_ids(&accounts);
-        *agent_accounts = Some(ids.clone());
+        *agent_accounts = Some(KnownWallet {
+            sequencer: addr.clone(),
+            ids: ids.clone(),
+        });
         Ok(WalletHandle {
             sequencer: addr,
             opened_now: true,
@@ -2667,7 +2688,10 @@ impl LogosServer {
                 if !w.shared
                     && let Ok(accounts) = self.list_accounts().await
                 {
-                    *agent_accounts = Some(account_ids(&accounts));
+                    *agent_accounts = Some(KnownWallet {
+                        sequencer: w.sequencer.clone(),
+                        ids: account_ids(&accounts),
+                    });
                 }
                 let detail = match unclear {
                     Ok(other) => other.to_string(),
@@ -2696,7 +2720,7 @@ impl LogosServer {
                     }
                 };
         } else if let Some(known) = agent_accounts.as_mut() {
-            known.insert(id.clone());
+            known.ids.insert(id.clone());
         }
         let address = guard::account_id_base58(&id).map(|b58| format!("Public/{b58}"));
         ok(json!({
