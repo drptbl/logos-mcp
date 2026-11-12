@@ -3289,9 +3289,14 @@ impl LogosServer {
                 "note": "submitted: chain_rewards and chain_wallet show the result once it is in a block",
             })),
             // Nothing is sent when no voucher is ready.
-            Err(LogosError::Refused(m)) if m.contains("NoClaimableVoucher") => fail(
-                "no reward voucher is ready to claim, so nothing was sent: chain_rewards shows when one is",
-            ),
+            // "No claimable voucher found" live on 0.3.4; NoClaimableVoucher in its docs.
+            Err(LogosError::Refused(m))
+                if m.contains("No claimable voucher") || m.contains("NoClaimableVoucher") =>
+            {
+                fail(
+                    "no reward voucher is ready to claim, so nothing was sent: chain_rewards shows when one is",
+                )
+            }
             Err(e) => fail(chain_error(e)),
         }
     }

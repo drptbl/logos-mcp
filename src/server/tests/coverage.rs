@@ -1685,7 +1685,8 @@ async fn a_claim_with_no_voucher_ready_says_so() {
         chain("get_cryptarchia_info", json!(ONLINE)),
         chain_refused(
             "leader_claim",
-            "Failed to claim leader rewards: Wallet(NoClaimableVoucher)",
+            // As blockchain_module 0.3.4 answered it live on Basecamp's node.
+            "Failed to claim leader rewards: Chain leader service error: Wallet API error: No claimable voucher found",
         ),
     ]);
     let r = server(fake, None).chain_claim_reward().await.unwrap();
