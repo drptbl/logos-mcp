@@ -3204,7 +3204,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Finalized Logos chain blocks as they arrive: each new last irreversible block's height and header id, oldest first, with a seq to page by. One event per change of the finalized tip, which can skip blocks. Read a block's contents with chain_block. Listens from the first call on."
+        description = "Finalized Logos chain blocks as they arrive: each new last irreversible block's height and header id, oldest first, with a seq to page by. One event per change of the finalized tip, which can skip blocks. Read a block's contents with chain_block. Listens from the first call on, and seq starts again when the server restarts."
     )]
     async fn chain_events(
         &self,
@@ -3273,7 +3273,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Claim one of the chain node's leader reward vouchers into its own wallet. The reward is minted to the node's leader key, and the transaction fee is paid from the node's funding key. Needs the chain node Online and a voucher ready: chain_rewards shows how many."
+        description = "Claim one of the chain node's leader reward vouchers into its own wallet. The reward is minted to the node's leader key, and the transaction fee is paid from the node's funding key. Needs the chain node Online and a voucher ready: chain_rewards shows how many. Just after the node comes Online it may still time out while its network finishes starting."
     )]
     async fn chain_claim_reward(&self) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.chain_online().await {
@@ -3780,6 +3780,7 @@ impl LogosServer {
                 if t.kind == "upload"
                     && t.success == Some(true)
                     && let Some(cid) = &t.cid
+                    && !self.is_own_cid(cid).unwrap_or(false)
                     && let Err(e) = self.remember_cid(cid, "upload")
                 {
                     tracing::warn!("could not record the agent's upload {cid}: {e}");
@@ -3801,22 +3802,25 @@ impl LogosServer {
         let Value::Array(list) = listed else {
             return fail(format!("unexpected manifests reply: {listed}"));
         };
-        let mut content = Vec::with_capacity(list.len());
-        for m in &list {
-            let cid = m["cid"].as_str().unwrap_or_default();
-            content.push(json!({
-                "cid": cid,
-                "size": m["datasetSize"],
-                "filename": m["filename"],
-                "mimetype": m["mimetype"],
-                "agent": self.is_own_cid(cid).unwrap_or(false),
-            }));
-        }
+        let own = self.own_cid_set();
+        let content: Vec<Value> = list
+            .iter()
+            .map(|m| {
+                let cid = m["cid"].as_str().unwrap_or_default();
+                json!({
+                    "cid": cid,
+                    "size": m["datasetSize"],
+                    "filename": m["filename"],
+                    "mimetype": m["mimetype"],
+                    "agent": own.contains(cid),
+                })
+            })
+            .collect();
         ok(json!({ "count": content.len(), "content": content }))
     }
 
     #[tool(
-        description = "Remove content from local storage, by CID. Only content this agent uploaded, or downloaded when it wasn't held already, can be removed: storage_manifests marks it."
+        description = "Remove content from local storage, by CID. Only content this agent uploaded, or downloaded when it wasn't held already, can be removed: storage_manifests marks it. Identical content shares one CID, so removing the agent's copy removes any identical copy too."
     )]
     async fn storage_remove(
         &self,
@@ -3890,6 +3894,20 @@ impl LogosServer {
             guard::write_private(&file, &text).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Every CID the agent put in local storage, read once. An unreadable record
+    /// counts as none, so nothing is marked the agent's by mistake.
+    fn own_cid_set(&self) -> BTreeSet<String> {
+        let mut own = self
+            .own_cids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Ok(map) = guard::read_side_map::<Value>(self.wallet_side_file(AGENT_CIDS)) {
+            own.extend(map.into_keys());
+        }
+        own
     }
 
     /// Whether the agent put `cid` in local storage, by this server's memory or
