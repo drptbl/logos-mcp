@@ -138,6 +138,7 @@ Every flag also has an environment variable.
 | `--wallet-config` | `LOGOS_MCP_WALLET_CONFIG` | none | the agent wallet's `lez_core` config, wallet tools are off without it |
 | `--wallet-storage` | `LOGOS_MCP_WALLET_STORAGE` | none | the agent wallet's key storage |
 | `--discovery-bootstrap` | `LOGOS_MCP_DISCOVERY_BOOTSTRAP` | none | discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them |
+| `--delivery-config` | `LOGOS_MCP_DELIVERY_CONFIG` | none | `delivery_module`'s full `createNode` config as JSON, in place of `--mode` and `--preset`, for a network no preset names, such as a local devnet hub. It never shows in logs |
 | `--timeout-secs` | | `60` | timeout for each `logosctl` call |
 
 Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
