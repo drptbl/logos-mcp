@@ -13,7 +13,7 @@ use crate::{
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
     node::Node,
-    server::{LogosServer, NodeSettings, WalletMode, WalletPaths},
+    server::{DeliveryConfig, LogosServer, NodeSettings, WalletMode, WalletPaths},
 };
 
 /// What the binary calls itself.
@@ -59,6 +59,12 @@ struct Cli {
     /// Discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them.
     #[arg(long, env = "LOGOS_MCP_DISCOVERY_BOOTSTRAP", value_delimiter = ',')]
     discovery_bootstrap: Vec<String>,
+
+    /// delivery_module's full createNode config as JSON, in place of --mode and
+    /// --preset: for a network no preset names, such as a local devnet hub.
+    // It may carry a node key: --help must not print it.
+    #[arg(long, env = "LOGOS_MCP_DELIVERY_CONFIG", hide_env_values = true)]
+    delivery_config: Option<String>,
 
     /// Timeout for each logosctl call, in seconds.
     #[arg(long, default_value_t = 60)]
@@ -135,6 +141,13 @@ where
         _ => None,
     };
 
+    let delivery_config = cli
+        .delivery_config
+        .as_deref()
+        .map(DeliveryConfig::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+
     for peer in &cli.discovery_bootstrap {
         crate::guard::bootstrap_node(peer).map_err(anyhow::Error::msg)?;
     }
@@ -153,6 +166,7 @@ where
         wallet,
         discovery_bootstrap: cli.discovery_bootstrap,
         host_owns_messaging: false,
+        delivery_config,
     };
     tracing::info!(logosctl = %bin.display(), ?settings, "starting {}", app.name);
 
@@ -168,4 +182,19 @@ where
         .context("MCP handshake failed")?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_never_prints_the_delivery_config() {
+        let cli = Cli::command();
+        let arg = cli
+            .get_arguments()
+            .find(|a| a.get_id() == "delivery_config")
+            .unwrap();
+        assert!(arg.is_hide_env_values_set());
+    }
 }

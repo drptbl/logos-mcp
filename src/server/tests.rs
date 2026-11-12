@@ -16,6 +16,7 @@ fn server(fake: Arc<FakeRunner>, files: Option<FilesRoot>) -> LogosServer {
             wallet: None,
             discovery_bootstrap: vec![],
             host_owns_messaging: false,
+            delivery_config: None,
         },
     )
 }
@@ -36,6 +37,7 @@ fn wallet_server(fake: Arc<FakeRunner>) -> LogosServer {
             })),
             discovery_bootstrap: vec![FLEET_PEER.into()],
             host_owns_messaging: false,
+            delivery_config: None,
         },
     )
 }
@@ -1270,6 +1272,7 @@ fn shared_server(fake: Arc<FakeRunner>, designated: &[&str]) -> (LogosServer, te
             }),
             discovery_bootstrap: vec![],
             host_owns_messaging: false,
+            delivery_config: None,
         },
     );
     (server, dir)
@@ -1535,6 +1538,7 @@ async fn when_the_host_owns_messaging_connect_only_reports() {
             wallet: None,
             discovery_bootstrap: vec![],
             host_owns_messaging: true,
+            delivery_config: None,
         },
     );
     let r = s.messaging_connect().await.unwrap();
@@ -2976,6 +2980,7 @@ fn wallet_server_in(fake: Arc<FakeRunner>, dir: &std::path::Path) -> LogosServer
             })),
             discovery_bootstrap: vec![FLEET_PEER.into()],
             host_owns_messaging: false,
+            delivery_config: None,
         },
     )
 }
@@ -3039,3 +3044,82 @@ async fn actions_taken_without_a_tool_call_show_in_the_activity() {
 
 mod coverage;
 mod wallet_trust;
+
+#[tokio::test]
+async fn a_delivery_config_creates_the_node_in_place_of_the_preset() {
+    let fake = FakeRunner::with(vec![
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"start","module":"delivery_module","result":{"error":null,"success":true,"value":null},"status":"ok"}"#,
+        ),
+    ]);
+    let mut s = server(fake.clone(), None);
+    s.settings.delivery_config = Some(
+        DeliveryConfig::parse(r#"{ "mode": "Core", "clusterId": 99, "staticnodes": ["/ip4/127.0.0.1/tcp/60000/p2p/16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc"] }"#)
+            .unwrap(),
+    );
+    assert!(!is_error(&s.messaging_connect().await.unwrap()));
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls[2][3], "createNode");
+    let sent: Value = serde_json::from_str(calls[2][4].strip_prefix("str:").unwrap()).unwrap();
+    assert_eq!(sent["clusterId"], 99);
+    assert!(sent.get("preset").is_none(), "{sent}");
+}
+
+#[test]
+fn a_delivery_config_must_be_a_json_object() {
+    for bad in ["", "not json", "[1,2]", "\"logos.dev\""] {
+        assert!(DeliveryConfig::parse(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_delivery_config_is_not_printed_in_logs() {
+    let c = DeliveryConfig::parse(r#"{"nodekey":"aa11"}"#).unwrap();
+    assert!(!format!("{c:?}").contains("aa11"));
+}
+
+#[tokio::test]
+async fn with_a_delivery_config_the_network_is_not_named_after_the_preset() {
+    let uninit = r#"{"method":"getNodeInfo","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#;
+    let mut s = server(FakeRunner::with(vec![out(uninit)]), None);
+    s.settings.delivery_config = Some(DeliveryConfig::parse(r#"{"clusterId":99}"#).unwrap());
+    assert_eq!(s.network().await, "custom delivery config");
+}
+
+#[tokio::test]
+async fn a_refused_delivery_config_is_not_echoed_back() {
+    // delivery_module's parser may quote the rejected value, a node key included.
+    let fake = FakeRunner::with(vec![
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":"invalid value for nodekey: aa11","success":false,"value":null},"status":"ok"}"#,
+        ),
+    ]);
+    let mut s = server(fake, None);
+    s.settings.delivery_config = Some(DeliveryConfig::parse(r#"{"nodekey":"aa11"}"#).unwrap());
+    let r = s.messaging_connect().await.unwrap();
+    assert!(is_error(&r));
+    assert!(!text(&r).contains("aa11"), "{}", text(&r));
+    assert!(
+        text(&r).contains("LOGOS_MCP_DELIVERY_CONFIG"),
+        "{}",
+        text(&r)
+    );
+}
+
+#[test]
+fn a_delivery_config_reaches_the_node_as_written() {
+    // Re-serializing would turn integers past u64 into lossy floats.
+    let text = r#"{"clusterId": 340282366920938463463374607431768211455}"#;
+    assert_eq!(DeliveryConfig::parse(text).unwrap().0, text);
+}
