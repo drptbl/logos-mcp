@@ -209,6 +209,100 @@ pub fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
         .and_then(|b64| STANDARD.decode(b64).ok())
 }
 
+/// One download_to in flight: its CID and target are reserved until it is kept
+/// or cleaned up. Dropped mid-transfer, it cancels and cleans up in the background.
+struct DownloadGuard {
+    server: LogosServer,
+    cid: String,
+    full: PathBuf,
+    keys: [String; 2],
+    done: bool,
+}
+
+impl DownloadGuard {
+    /// The file is the caller's now: release the reservation.
+    fn keep(&mut self) {
+        self.done = true;
+        self.release();
+    }
+
+    /// Stop the transfer, remove its file and release the reservation. Says what
+    /// was left behind.
+    async fn cancel_and_remove(&mut self) -> String {
+        self.done = true;
+        let left = cleanup_download(&self.server, &self.cid, &self.full).await;
+        self.release();
+        left
+    }
+
+    fn release(&self) {
+        let mut held = self
+            .server
+            .downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for k in &self.keys {
+            held.remove(k);
+        }
+    }
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // The caller stopped waiting: finish the cleanup without it, then free
+        // the CID and the path, so a retry can't share the old transfer.
+        let (server, cid, full, keys) = (
+            self.server.clone(),
+            self.cid.clone(),
+            self.full.clone(),
+            self.keys.clone(),
+        );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_download(&server, &cid, &full).await;
+                let mut held = server.downloads.lock().unwrap_or_else(|e| e.into_inner());
+                for k in &keys {
+                    held.remove(k);
+                }
+            });
+        } else {
+            self.release();
+        }
+    }
+}
+
+/// Cancel a download and remove its file, but only while the file's folder still
+/// resolves inside the files root. Says what was left behind.
+async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path) -> String {
+    let cancelled = server
+        .node
+        .call(STORAGE, "downloadCancel", &[Arg::str(cid)])
+        .await
+        .is_ok()
+        || server.events.transfer(cid).is_some_and(|t| t.done);
+    let inside = server.files.as_ref().is_some_and(|root| {
+        full.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| p.starts_with(root.path()))
+    });
+    let removed = inside
+        && match std::fs::remove_file(full) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+    match (cancelled, removed) {
+        (true, true) => "nothing was kept".into(),
+        (false, true) => format!(
+            "it could not be cancelled, so {} may still be written",
+            full.display()
+        ),
+        (_, false) => format!("{} could not be removed", full.display()),
+    }
+}
+
 /// The dedicated wallet this server opened or adopted: the sequencer it was on
 /// and its accounts. A wallet open later counts as it only with both the same.
 #[derive(Debug, Clone)]
@@ -3346,19 +3440,26 @@ impl LogosServer {
                 "the upload failed: {}",
                 t.error.unwrap_or_else(|| "no reason given".into())
             )),
-            Err(why) => {
-                let _ = self
-                    .node
-                    .call(STORAGE, "uploadCancel", &[Arg::str(&session)])
-                    .await;
-                Err(format!("upload of {path} {why}; it was cancelled"))
-            }
+            Err(why) => match self
+                .node
+                .call(STORAGE, "uploadCancel", &[Arg::str(&session)])
+                .await
+            {
+                Ok(_) => Err(format!("upload of {path} {why}; it was cancelled")),
+                Err(e) => Err(format!(
+                    "upload of {path} {why}; cancelling failed ({e}), so it may still finish"
+                )),
+            },
         }
     }
 
     /// Download `cid` into a new file at `path` under the files root and wait for
     /// it. Anything over `max_bytes` is stopped and removed, as is a download that
-    /// outlasts `timeout` or fails. Returns the file's full path.
+    /// outlasts `timeout`, fails, or whose caller stops waiting. `timeout` covers
+    /// the wait, not the calls that start and cancel it. Returns the file's path.
+    ///
+    /// Only one download of a CID, and one into a path, runs at a time. Without
+    /// progress events the size cap is checked once the file is complete.
     pub async fn download_to(
         &self,
         cid: &str,
@@ -3366,29 +3467,17 @@ impl LogosServer {
         max_bytes: Option<u64>,
         timeout: Duration,
     ) -> Result<PathBuf, String> {
-        /// Frees the CID when this download ends, however it ends.
-        struct Running(Arc<std::sync::Mutex<BTreeSet<String>>>, String);
-        impl Drop for Running {
-            fn drop(&mut self) {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.1);
-            }
-        }
         guard::validate_cid(cid)?;
-        if !self
-            .downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(cid.to_string())
-        {
-            return Err(format!(
-                "a download of {cid} is already running: wait for it"
-            ));
-        }
-        let _running = Running(self.downloads.clone(), cid.to_string());
-        let (session, full) = self.start_download(cid, path, false).await?;
+        let full = self.files()?.new_file(path)?;
+        let mut running = self.reserve_download(cid, &full)?;
+        let session = match self.start_download(cid, path, false).await {
+            Ok((session, _)) => session,
+            // The module may have started it all the same: stop it and clean up.
+            Err(e) => {
+                running.cancel_and_remove().await;
+                return Err(e);
+            }
+        };
         let too_big = |size: u64| max_bytes.is_some_and(|cap| size > cap);
         let over_cap = |t: &crate::events::Transfer| {
             let size = t.total.into_iter().chain(t.bytes).max()?;
@@ -3399,43 +3488,46 @@ impl LogosServer {
                 )
             })
         };
-        let mut still_writing = false;
-        let outcome = match self.await_transfer(&session, timeout, over_cap).await {
+        let why = match self.await_transfer(&session, timeout, over_cap).await {
             Ok(t) if t.success == Some(true) => match std::fs::metadata(&full) {
-                Ok(m) if too_big(m.len()) => Err(format!(
+                Ok(m) if too_big(m.len()) => format!(
                     "is {} bytes, over the {} byte cap",
                     m.len(),
                     max_bytes.unwrap_or_default()
-                )),
-                Ok(_) => return Ok(full),
-                Err(e) => Err(format!("finished but its file can't be read: {e}")),
+                ),
+                Ok(_) => {
+                    running.keep();
+                    return Ok(full);
+                }
+                Err(e) => format!("finished but its file can't be read: {e}"),
             },
-            Ok(t) => Err(format!(
+            Ok(t) => format!(
                 "failed: {}",
                 t.error.unwrap_or_else(|| "no reason given".into())
-            )),
-            Err(why) => {
-                if !self.events.transfer(&session).is_some_and(|t| t.done) {
-                    still_writing = self
-                        .node
-                        .call(STORAGE, "downloadCancel", &[Arg::str(&session)])
-                        .await
-                        .is_err();
-                }
-                Err(why)
-            }
+            ),
+            Err(why) => why,
         };
-        // Never leave a partial or refused file behind.
-        let _ = std::fs::remove_file(&full);
-        outcome.map_err(|why| {
-            if still_writing {
-                format!(
-                    "download of {cid} {why}; it could not be cancelled, so {} may still be written",
-                    full.display()
-                )
-            } else {
-                format!("download of {cid} {why}; nothing was kept")
-            }
+        let left = running.cancel_and_remove().await;
+        Err(format!("download of {cid} {why}; {left}"))
+    }
+
+    /// Claim `cid` and the file at `full` for one download_to. Released when the
+    /// returned guard is kept, cleaned up, or dropped.
+    fn reserve_download(&self, cid: &str, full: &Path) -> Result<DownloadGuard, String> {
+        let keys = [format!("cid:{cid}"), format!("path:{}", full.display())];
+        let mut held = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.iter().any(|k| held.contains(k)) {
+            return Err(format!(
+                "a download of {cid}, or into that file, is already running: wait for it"
+            ));
+        }
+        held.extend(keys.iter().cloned());
+        Ok(DownloadGuard {
+            server: self.clone(),
+            cid: cid.to_string(),
+            full: full.to_path_buf(),
+            keys,
+            done: false,
         })
     }
 
@@ -3464,6 +3556,17 @@ impl LogosServer {
         &self,
         Parameters(p): Parameters<DownloadParams>,
     ) -> Result<CallToolResult, McpError> {
+        let busy = self
+            .downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&format!("cid:{}", p.cid));
+        if busy {
+            return fail(format!(
+                "{} is being downloaded already: wait for it to finish",
+                p.cid
+            ));
+        }
         match self
             .start_download(&p.cid, &p.path, p.private.unwrap_or(false))
             .await

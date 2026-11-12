@@ -271,8 +271,11 @@ impl FilesRoot {
             .create_new(true)
             .open(&path)
             .map_err(|e| format!("cannot create {user}: {e}"))?;
-        file.write_all(bytes)
-            .map_err(|e| format!("cannot write {user}: {e}"))?;
+        if let Err(e) = file.write_all(bytes) {
+            // Never leave a half-written file behind.
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("cannot write {user}: {e}"));
+        }
         Ok(path)
     }
 }

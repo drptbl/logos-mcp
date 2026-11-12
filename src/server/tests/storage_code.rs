@@ -268,3 +268,106 @@ async fn a_download_whose_cancel_fails_says_the_file_may_come_back() {
         .unwrap_err();
     assert!(err.contains("may still"), "{err}");
 }
+
+const OTHER_CID: &str = "zDvZRwzkx92SbzDg5jBa1heRYvCTJGRUa9B9foVmGDMF3QtEXVyA";
+
+#[tokio::test(start_paused = true)]
+async fn two_downloads_never_share_a_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let (s, events) = storage_server(fake, dir.path());
+    let first = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(CID, "in.bin", None, Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let err = s
+        .download_to(OTHER_CID, "in.bin", None, Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert!(err.contains("already"), "{err}");
+    std::fs::write(dir.path().join("in.bin"), b"x").unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    assert!(first.await.unwrap().is_ok());
+    assert!(
+        dir.path().join("in.bin").exists(),
+        "the first download's file stays"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_download_tool_leaves_a_running_download_to_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, _events) = storage_server(fake.clone(), dir.path());
+    let _first = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(CID, "in.bin", None, Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let r = s
+        .storage_download(Parameters(DownloadParams {
+            cid: CID.into(),
+            path: "other.bin".into(),
+            private: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_download_is_cancelled_and_cleaned_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+    ]);
+    let (s, _events) = storage_server(fake.clone(), dir.path());
+    let download = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(CID, "in.bin", None, Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    std::fs::write(dir.path().join("in.bin"), b"partial").unwrap();
+    download.abort();
+    let _ = download.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(called(&fake, "downloadCancel"));
+    assert!(!dir.path().join("in.bin").exists());
+    // and the CID is free again
+    let fake2_free = s
+        .download_to(CID, "again.bin", None, Duration::from_secs(1))
+        .await;
+    assert!(!fake2_free.unwrap_err().contains("already"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_whose_cancel_fails_does_not_claim_it_was_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let fake = FakeRunner::with(vec![storage("uploadUrl", r#""82""#)]);
+    let (s, _events) = storage_server(fake, dir.path());
+    let err = s
+        .upload_file("out.txt", Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(!err.contains("it was cancelled"), "{err}");
+    assert!(err.contains("may still"), "{err}");
+}
