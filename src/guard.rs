@@ -260,6 +260,24 @@ impl FilesRoot {
         }
         Ok(full)
     }
+
+    /// Write `bytes` into a new file under the root, as `new_file` places it.
+    /// Created exclusively, so it never overwrites or writes through a link.
+    pub fn write_new(&self, user: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+        use std::io::Write as _;
+        let path = self.new_file(user)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("cannot create {user}: {e}"))?;
+        if let Err(e) = file.write_all(bytes) {
+            // Never leave a half-written file behind.
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("cannot write {user}: {e}"));
+        }
+        Ok(path)
+    }
 }
 
 #[cfg(test)]

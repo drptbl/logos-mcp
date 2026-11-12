@@ -3245,3 +3245,4 @@ async fn an_unclear_create_in_an_empty_wallet_adopts_nothing() {
     let status = body(&s.wallet_status().await.unwrap());
     assert_eq!(status["agent_wallet"], false, "{status}");
 }
+mod storage_code;
