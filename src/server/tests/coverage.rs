@@ -1555,3 +1555,169 @@ async fn an_address_the_node_has_no_key_for_is_said_so() {
         text(&r)
     );
 }
+
+/// A libBlock event as blockchain_module emits it: the finalized tip, once per change.
+fn lib_block(events: &EventStore, height: u64, header_id: &str) {
+    events.apply_event(
+        "libBlock",
+        &json!({ "arg0": json!({ "height": height, "header_id": header_id }).to_string() }),
+    );
+}
+
+#[tokio::test]
+async fn chain_events_pages_finalized_blocks_by_seq() {
+    let events = Arc::new(EventStore::default());
+    let s = LogosServer::new(
+        Arc::new(Logosctl::new(FakeRunner::with(vec![]))),
+        events.clone(),
+        None,
+        server(FakeRunner::with(vec![]), None).settings.clone(),
+    );
+    lib_block(&events, 100, &"aa".repeat(32));
+    lib_block(&events, 105, &"bb".repeat(32));
+    events.apply_event("libBlock", &json!({ "arg0": "null" }));
+    let b = body(
+        &s.chain_events(Parameters(ChainEventsParams { after_seq: None }))
+            .await
+            .unwrap(),
+    );
+    let list = b["events"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{b}");
+    assert_eq!(list[1]["height"], 105, "{b}");
+    assert_eq!(list[1]["header_id"], "bb".repeat(32), "{b}");
+    let first = list[0]["seq"].as_u64().unwrap();
+    let b = body(
+        &s.chain_events(Parameters(ChainEventsParams {
+            after_seq: Some(first),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(b["events"].as_array().unwrap().len(), 1, "{b}");
+}
+
+#[test]
+fn only_the_newest_finalized_blocks_are_kept() {
+    let events = EventStore::default();
+    for h in 0..(crate::events::MAX_CHAIN_EVENTS as u64 + 10) {
+        lib_block(&events, h, &format!("{h:064x}"));
+    }
+    let kept = events.lib_blocks(0, usize::MAX);
+    assert_eq!(kept.len(), crate::events::MAX_CHAIN_EVENTS);
+    assert_eq!(
+        kept.last().unwrap().height,
+        crate::events::MAX_CHAIN_EVENTS as u64 + 9
+    );
+}
+
+const ONLINE: &str = "{\"height\":84895,\"lib\":\"aa\",\"lib_slot\":2909742,\"mode\":\"Online\",\"slot\":2951727,\"tip\":\"bb\"}";
+
+#[tokio::test]
+async fn chain_rewards_lists_vouchers_and_mining_tickets() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain(
+            "wallet_get_claimable_vouchers",
+            json!(
+                "{\"tip\":\"c4\",\"vouchers\":[{\"commitment\":\"5e\",\"nullifier\":\"1d\"}],\"reward_amount\":\"4200\",\"total_claimable\":\"4200\"}"
+            ),
+        ),
+        chain(
+            "pow_claimable_rewards",
+            json!("{\"claimable_tickets\":2,\"slots_until_expiry\":[271,12]}"),
+        ),
+    ]);
+    let b = body(&server(fake, None).chain_rewards().await.unwrap());
+    assert_eq!(b["leader"]["vouchers"], 1, "{b}");
+    assert_eq!(b["leader"]["total_claimable"], "4200", "{b}");
+    assert_eq!(b["mining"]["claimable_tickets"], 2, "{b}");
+}
+
+#[tokio::test]
+async fn chain_rewards_waits_for_the_node_to_be_online() {
+    // These reads block without a timeout while the node bootstraps.
+    let bootstrapping = ONLINE.replace("Online", "Bootstrapping");
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(bootstrapping)),
+    ]);
+    let r = server(fake.clone(), None).chain_rewards().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("Online"), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("wallet_get_claimable_vouchers"))
+    );
+}
+
+#[tokio::test]
+async fn a_reward_claim_returns_its_transaction() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain("leader_claim", json!(TX)),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_claim_reward()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["tx_hash"], TX, "{b}");
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("leader_claim"))
+    );
+}
+
+#[tokio::test]
+async fn a_claim_with_no_voucher_ready_says_so() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain_refused(
+            "leader_claim",
+            // As blockchain_module 0.3.4 answered it live on Basecamp's node.
+            "Failed to claim leader rewards: Chain leader service error: Wallet API error: No claimable voucher found",
+        ),
+    ]);
+    let r = server(fake, None).chain_claim_reward().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("no reward voucher"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_claim_waits_for_the_node_to_be_online() {
+    // leader_claim blocks without a timeout while the node bootstraps.
+    let bootstrapping = ONLINE.replace("Online", "Bootstrapping");
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(bootstrapping)),
+    ]);
+    let r = server(fake.clone(), None)
+        .chain_claim_reward()
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("leader_claim"))
+    );
+}
+
+#[test]
+fn reward_claims_sit_behind_the_chain_switch() {
+    assert_eq!(ToolGroups::group_of("chain_claim_reward"), Some("chain"));
+}

@@ -40,6 +40,9 @@ const WATCHED: &[(&str, &[&str])] = &[
             "storageDownloadDone",
         ],
     ),
+    // Each new finalized tip, for chain_events. Subscribed again until the
+    // Blockchain app has loaded it.
+    ("blockchain_module", &["libBlock"]),
 ];
 
 /// Per-call bound, the same as the standalone binary's logosctl default.
