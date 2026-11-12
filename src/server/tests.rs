@@ -3123,3 +3123,19 @@ fn a_delivery_config_reaches_the_node_as_written() {
     let text = r#"{"clusterId": 340282366920938463463374607431768211455}"#;
     assert_eq!(DeliveryConfig::parse(text).unwrap().0, text);
 }
+
+#[tokio::test]
+async fn wallet_status_says_whether_the_agent_may_use_the_wallet() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let b = body(
+        &wallet_server(FakeRunner::with(replies))
+            .wallet_status()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["agent_wallet"], true, "{b}");
+}

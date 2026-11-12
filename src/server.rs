@@ -1353,6 +1353,9 @@ impl LogosServer {
             "open": true,
             "opened_now": w.opened_now,
             "opened_by_this_server": w.trusted && !w.shared,
+            // Whether the agent may act on this wallet: the one it opened or
+            // adopted, or Basecamp's holding all its accounts.
+            "agent_wallet": w.trusted,
             "warning": w.warning(),
             "sequencer": guard::shown_url(&w.sequencer),
             "block_height": height,
