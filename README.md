@@ -220,7 +220,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - `wallet_tx_status` is the one tool that skips `logosctl`: it asks the sequencer in the wallet config directly, because `lez_core` only has a lookup that blocks for minutes
 - `chain_transfer` spends the chain node's wallet, which is yours, so each one waits for your Approve whatever the switches say. Outside Basecamp there is nobody to approve, so it refuses
 - `wallet_faucet` only pays into the agent's own public accounts
-- `wallet_transfer` only sends from the agent wallet this server opened. If `lez_core` has another wallet open, it refuses
+- `wallet_transfer` only sends from the agent wallet: the one this server opened, or the configured wallet found already open, with exactly its accounts on its sequencer. If `lez_core` has another wallet open, it refuses
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
 - only the AI Agent app can read the token, flip the tool switches or read the activity through the module
 - `lez_core` `0.5.1` can only open unencrypted key storage, so lock the wallet folder down (`chmod 700`)
