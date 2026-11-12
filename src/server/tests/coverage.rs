@@ -844,10 +844,9 @@ async fn the_faucet_pays_an_agent_account_and_waits_for_the_receipt() {
     let mut replies = opened_by_server();
     replies.extend([
         out(FAUCET_LOADED),
-        faucet(
-            "configure",
-            json!({ "ok": true, "result": { "configured": true } }),
-        ),
+        faucet_info_on(SEQUENCER_V03)[0].clone(),
+        faucet_info_on(SEQUENCER_V03)[1].clone(),
+        faucet_info_on(SEQUENCER_V03)[2].clone(),
         faucet(
             "requestDrop",
             json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
@@ -878,11 +877,12 @@ async fn the_faucet_pays_an_agent_account_and_waits_for_the_receipt() {
     assert_eq!(b["status"], "succeeded", "{b}");
     assert_eq!(b["receipt"]["tx_hash"], TX, "{b}");
     let calls = fake.calls.lock().unwrap();
-    let configure = calls
-        .iter()
-        .find(|c| c.get(3).map(String::as_str) == Some("configure"))
-        .unwrap();
-    assert_eq!(configure[4], "str:https://testnet.lez.logos.co/");
+    // It already serves the wallet's network: the Faucet app's choice is kept.
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("configure"))
+    );
     let drop = calls
         .iter()
         .find(|c| c.get(3).map(String::as_str) == Some("requestDrop"))
@@ -939,7 +939,9 @@ async fn a_refused_drop_says_why() {
     let mut replies = opened_by_server();
     replies.extend([
         out(FAUCET_LOADED),
-        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet_info_on(SEQUENCER_V03)[0].clone(),
+        faucet_info_on(SEQUENCER_V03)[1].clone(),
+        faucet_info_on(SEQUENCER_V03)[2].clone(),
         faucet(
             "requestDrop",
             json!({ "ok": false, "error": { "code": "rate_limited",
@@ -971,10 +973,9 @@ async fn a_running_drop_is_checked_again_by_its_job_id() {
     let mut replies = opened_by_server();
     replies.extend([
         out(FAUCET_LOADED),
-        faucet(
-            "configure",
-            json!({ "ok": true, "result": { "configured": true } }),
-        ),
+        faucet_info_on(SEQUENCER_V03)[0].clone(),
+        faucet_info_on(SEQUENCER_V03)[1].clone(),
+        faucet_info_on(SEQUENCER_V03)[2].clone(),
         faucet(
             "requestDrop",
             json!({ "ok": true, "job_id": "job-1", "status": "queued" }),
@@ -1013,14 +1014,11 @@ async fn a_running_drop_is_checked_again_by_its_job_id() {
     );
     assert_eq!(b["status"], "running", "{b}");
     assert_eq!(b["job_id"], "job-1", "{b}");
-    assert!(
-        !fake
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c.get(3).map(String::as_str) == Some("jobResultAck"))
-    );
+    // A drop still running is never acknowledged.
+    assert!(!fake.calls.lock().unwrap().iter().any(|c| {
+        c.get(3).map(String::as_str) == Some("jobResultAck")
+            && c.get(4).map(String::as_str) == Some("str:job-1")
+    }));
 }
 
 #[tokio::test]
@@ -1323,10 +1321,9 @@ async fn a_drop_whose_status_cannot_be_read_still_hands_back_its_job_id() {
     let mut replies = opened_by_server();
     replies.extend([
         out(FAUCET_LOADED),
-        faucet(
-            "configure",
-            json!({ "ok": true, "result": { "configured": true } }),
-        ),
+        faucet_info_on(SEQUENCER_V03)[0].clone(),
+        faucet_info_on(SEQUENCER_V03)[1].clone(),
+        faucet_info_on(SEQUENCER_V03)[2].clone(),
         faucet(
             "requestDrop",
             json!({ "ok": true, "job_id": "request_drop-7", "status": "queued" }),
@@ -1372,7 +1369,9 @@ async fn an_unconfirmed_drop_passes_on_the_faucets_reason() {
     let mut replies = opened_by_server();
     replies.extend([
         out(FAUCET_LOADED),
-        faucet("configure", json!({ "ok": true, "result": { "configured": true } })),
+        faucet_info_on(SEQUENCER_V03)[0].clone(),
+        faucet_info_on(SEQUENCER_V03)[1].clone(),
+        faucet_info_on(SEQUENCER_V03)[2].clone(),
         faucet("requestDrop", json!({ "ok": true, "job_id": "job-2", "status": "queued" })),
         faucet(
             "jobStatus",
@@ -1401,4 +1400,79 @@ async fn an_unconfirmed_drop_passes_on_the_faucets_reason() {
             .contains("could not be confirmed"),
         "{b}"
     );
+}
+
+const SEQUENCER_V03: &str = "https://testnet.lez.logos.co";
+
+/// The faucet module reporting, through a getFaucetInfo job, that it serves `sequencer`.
+fn faucet_info_on(sequencer: &str) -> [crate::logosctl::RawOutput; 3] {
+    [
+        faucet(
+            "getFaucetInfo",
+            json!({ "ok": true, "job_id": "faucet_info-1", "status": "queued" }),
+        ),
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "faucet_info-1", "status": "succeeded",
+                    "result": { "network": "lez-v03-testnet", "sequencer_url": sequencer } }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+    ]
+}
+
+#[tokio::test]
+async fn the_faucet_switches_networks_only_for_the_drop() {
+    let legacy = "https://testnet-legacy.lez.logos.co";
+    let mut replies = opened_by_server();
+    replies.push(out(FAUCET_LOADED));
+    replies.extend(faucet_info_on(legacy));
+    replies.extend([
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+        faucet(
+            "requestDrop",
+            json!({ "ok": true, "job_id": "job-9", "status": "queued" }),
+        ),
+        faucet(
+            "jobStatus",
+            json!({ "ok": true, "job_id": "job-9", "status": "succeeded",
+                    "result": { "amount": "100000000", "tx_hash": TX } }),
+        ),
+        faucet("jobResultAck", json!({ "ok": true })),
+        faucet(
+            "configure",
+            json!({ "ok": true, "result": { "configured": true } }),
+        ),
+    ]);
+    let fake = FakeRunner::with(replies);
+    let r = wallet_server(fake.clone())
+        .wallet_faucet(
+            CancellationToken::new(),
+            Parameters(FaucetParams {
+                account: Some(agent_address()),
+                job_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let configures: Vec<String> = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("configure"))
+        .map(|c| c[4].clone())
+        .collect();
+    assert_eq!(
+        configures,
+        [
+            "str:https://testnet.lez.logos.co/".to_string(),
+            format!("str:{legacy}")
+        ],
+        "switched for the drop, then back"
+    );
+    assert_eq!(body(&r)["faucet_network"], "restored", "{}", text(&r));
 }

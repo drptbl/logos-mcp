@@ -218,3 +218,14 @@ fn a_shown_url_drops_credentials_query_and_fragment() {
     // An @ in the path is not a credential.
     assert_eq!(shown_url("http://host/a@b"), "http://host/a@b");
 }
+
+#[test]
+fn a_url_whose_credentials_hold_a_slash_is_hidden_whole() {
+    // A password with an unencoded '/' would otherwise read as the start of the path.
+    let shown = shown_url("https://user:pa/ss@seq.example/rpc");
+    assert!(
+        !shown.contains("pa/ss") && !shown.contains("ss@"),
+        "{shown}"
+    );
+    assert!(shown.starts_with("https://"), "{shown}");
+}

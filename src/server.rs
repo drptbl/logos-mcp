@@ -764,6 +764,39 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
     fail(message)
 }
 
+/// The agent's answer for a transfer request standing at `now`, after its wait
+/// ended or, with `cancelled`, after the agent stopped waiting.
+fn approval_reply(
+    now: Decision,
+    cancelled: bool,
+    id: &str,
+    sent: impl FnOnce(&str) -> Value,
+) -> Result<CallToolResult, McpError> {
+    match now {
+        Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
+        Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
+        Decision::Denied => fail("the user denied this transfer: nothing was sent"),
+        Decision::Expired => fail("the user did not answer in time: nothing was sent"),
+        Decision::Cancelled => fail("this transfer was cancelled: nothing was sent"),
+        Decision::Approved if cancelled => fail(format!(
+            "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
+        )),
+        Decision::Approved => ok(json!({
+            "status": "approved_sending",
+            "request_id": id,
+            "note": "the user approved it and it is being sent: check wallet_transfer_status with this request_id for the tx_hash",
+        })),
+        Decision::Waiting => ok(json!({
+            "status": "awaiting_approval",
+            "request_id": id,
+            "note": format!(
+                "the user hasn't answered yet. Check wallet_transfer_status with this request_id. If they don't answer within {} minutes of the request, it expires and is never sent",
+                APPROVAL_EXPIRES.as_secs() / 60
+            ),
+        })),
+    }
+}
+
 /// A lez_faucet failure, with where to get the module when it isn't there.
 fn faucet_error(e: LogosError) -> String {
     let message = e.to_string();
@@ -2347,43 +2380,16 @@ impl LogosServer {
                 }
             }
         };
-        tokio::select! {
-            outcome = answered => match outcome {
-                Decision::Sent { tx_hash } => ok(sent(&tx_hash)),
-                Decision::Failed { reason } | Decision::Unknown { reason } => fail(reason),
-                Decision::Denied => fail("the user denied this transfer: nothing was sent"),
-                Decision::Expired => fail("the user did not answer in time: nothing was sent"),
-                _ => fail("this transfer was cancelled: nothing was sent"),
-            },
-            () = tokio::time::sleep(APPROVAL_WAIT) => {
-                if *decision.borrow() == Decision::Approved {
-                    ok(json!({
-                        "status": "approved_sending",
-                        "request_id": id,
-                        "note": "the user approved it and it is being sent: check wallet_transfer_status with this request_id for the tx_hash",
-                    }))
-                } else {
-                    ok(json!({
-                        "status": "awaiting_approval",
-                        "request_id": id,
-                        "note": format!(
-                            "the user hasn't answered yet. Check wallet_transfer_status with this request_id. If they don't answer within {} minutes of the request, it expires and is never sent",
-                            APPROVAL_EXPIRES.as_secs() / 60
-                        ),
-                    }))
-                }
-            }
-            () = ct.cancelled() => {
-                // A request still waiting is cancelled: no approval may send behind
-                // the agent's back. One the user already approved goes ahead, so say so.
-                match self.approvals.cancel(id) {
-                    Decision::Cancelled => fail("transfer cancelled: it will not be sent"),
-                    _ => fail(format!(
-                        "the user already approved this transfer, so it may be sent: check wallet_transfer_status with request_id {id}"
-                    )),
-                }
-            }
-        }
+        // Whichever way the wait ends, report where the request stands then: a
+        // transfer answered just as the wait ran out is reported as answered.
+        let (now, cancelled) = tokio::select! {
+            outcome = answered => (outcome, false),
+            () = tokio::time::sleep(APPROVAL_WAIT) => (decision.borrow().clone(), false),
+            // A request still waiting is cancelled: no approval may send behind
+            // the agent's back.
+            () = ct.cancelled() => (self.approvals.cancel(id), true),
+        };
+        approval_reply(now, cancelled, id, sent)
     }
 
     #[tool(
@@ -2572,9 +2578,16 @@ impl LogosServer {
             .map(|b58| format!("Public/{b58}"))
             .ok_or("unreadable account id")?;
         self.faucet_ready().await?;
-        // The faucet module serves one network at a time: the wallet's.
-        self.faucet_call("configure", &[Arg::str(&w.sequencer)])
-            .await?;
+        // The faucet module serves one network at a time, the one the LEZ Faucet
+        // app chose. Switch it to the wallet's only when it differs, and back after.
+        let current = self.faucet_network(ct).await;
+        let switched = !current
+            .as_deref()
+            .is_some_and(|c| same_sequencer(c, &w.sequencer));
+        if switched {
+            self.faucet_call("configure", &[Arg::str(&w.sequencer)])
+                .await?;
+        }
         let started = self
             .faucet_call("requestDrop", &[Arg::str(&address), Arg::str(uuid_v4()?)])
             .await?;
@@ -2587,11 +2600,46 @@ impl LogosServer {
             .unwrap_or_else(|e| e.into_inner())
             .insert(job.clone());
         // The drop is under way: whatever goes wrong now, the agent keeps its job id.
-        self.faucet_wait(ct, &job, FAUCET_WAIT).await.map_err(|e| {
+        let outcome = self.faucet_wait(ct, &job, FAUCET_WAIT).await;
+        let settled = outcome
+            .as_ref()
+            .map_or(true, |done| done["status"] != "running");
+        let network = match (&current, switched, settled) {
+            (_, false, _) => "kept",
+            (Some(previous), true, true) => {
+                match self.faucet_call("configure", &[Arg::str(previous)]).await {
+                    Ok(_) => "restored",
+                    Err(_) => "switched to the wallet's network; switching back failed",
+                }
+            }
+            (Some(_), true, false) => {
+                "switched to the wallet's network while this drop runs; the LEZ Faucet app may need switching back"
+            }
+            (None, true, _) => "set to the wallet's network",
+        };
+        let outcome = outcome.map(|mut done| {
+            done["faucet_network"] = json!(network);
+            done
+        });
+        outcome.map_err(|e| {
             format!(
                 "{e} (drop {job}: check it with wallet_faucet and this job_id before asking again)"
             )
         })
+    }
+
+    /// The sequencer the faucet module serves now, from a getFaucetInfo job. None
+    /// when it isn't configured or can't say within a few seconds.
+    async fn faucet_network(&self, ct: &CancellationToken) -> Option<String> {
+        let started = self.faucet_call("getFaucetInfo", &[]).await.ok()?;
+        let job = started["job_id"].as_str()?.to_string();
+        let done = self
+            .faucet_wait(ct, &job, std::time::Duration::from_secs(20))
+            .await
+            .ok()?;
+        done["receipt"]["sequencer_url"]
+            .as_str()
+            .map(str::to_string)
     }
 
     /// Load lez_faucet when this server runs on its own; Basecamp loads it itself.

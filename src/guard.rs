@@ -122,6 +122,11 @@ pub fn shown_url(url: &str) -> String {
     };
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    // An '@' after a ':' but past the first '/' may be credentials whose password
+    // holds an unencoded '/': show nothing of the address then.
+    if path.contains('@') && rest.rfind('@').is_some_and(|at| rest[..at].contains(':')) {
+        return format!("{scheme}://<address hidden>");
+    }
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
