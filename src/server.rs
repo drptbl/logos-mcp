@@ -2734,16 +2734,26 @@ impl LogosServer {
             Ok(Value::String(id)) if guard::account_id_base58(&id).is_some() => id,
             unclear => {
                 // The account may exist even though the reply doesn't say so. Still
-                // holding the wallet lock, adopt the wallet's current accounts so the
-                // identity check doesn't lock the agent out. Never in shared mode:
+                // holding the wallet lock, take it on so the identity check doesn't
+                // lock the agent out: only when the wallet now lists the agent's
+                // accounts plus exactly one more, still on its sequencer, so a
+                // wallet opened meanwhile is never adopted. Never in shared mode:
                 // that would designate the user's own accounts as the agent's.
                 if !w.shared
+                    && let Some(known) = agent_accounts.as_ref()
                     && let Ok(accounts) = self.list_accounts().await
                 {
-                    *agent_accounts = Some(KnownWallet {
-                        sequencer: w.sequencer.clone(),
-                        ids: account_ids(&accounts),
-                    });
+                    let ids = account_ids(&accounts);
+                    let one_more = ids.len() == known.ids.len() + 1 && known.ids.is_subset(&ids);
+                    if one_more
+                        && let Ok(addr) = self.sequencer_addr().await
+                        && same_sequencer(&known.sequencer, &addr)
+                    {
+                        *agent_accounts = Some(KnownWallet {
+                            sequencer: addr,
+                            ids,
+                        });
+                    }
                 }
                 let detail = match unclear {
                     Ok(other) => other.to_string(),
