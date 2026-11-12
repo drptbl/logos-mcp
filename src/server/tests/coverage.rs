@@ -1555,3 +1555,57 @@ async fn an_address_the_node_has_no_key_for_is_said_so() {
         text(&r)
     );
 }
+
+/// A libBlock event as blockchain_module emits it: the finalized tip, once per change.
+fn lib_block(events: &EventStore, height: u64, header_id: &str) {
+    events.apply_event(
+        "libBlock",
+        &json!({ "arg0": json!({ "height": height, "header_id": header_id }).to_string() }),
+    );
+}
+
+#[tokio::test]
+async fn chain_events_pages_finalized_blocks_by_seq() {
+    let events = Arc::new(EventStore::default());
+    let s = LogosServer::new(
+        Arc::new(Logosctl::new(FakeRunner::with(vec![]))),
+        events.clone(),
+        None,
+        server(FakeRunner::with(vec![]), None).settings.clone(),
+    );
+    lib_block(&events, 100, &"aa".repeat(32));
+    lib_block(&events, 105, &"bb".repeat(32));
+    events.apply_event("libBlock", &json!({ "arg0": "null" }));
+    let b = body(
+        &s.chain_events(Parameters(ChainEventsParams { after_seq: None }))
+            .await
+            .unwrap(),
+    );
+    let list = b["events"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{b}");
+    assert_eq!(list[1]["height"], 105, "{b}");
+    assert_eq!(list[1]["header_id"], "bb".repeat(32), "{b}");
+    let first = list[0]["seq"].as_u64().unwrap();
+    let b = body(
+        &s.chain_events(Parameters(ChainEventsParams {
+            after_seq: Some(first),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(b["events"].as_array().unwrap().len(), 1, "{b}");
+}
+
+#[test]
+fn only_the_newest_finalized_blocks_are_kept() {
+    let events = EventStore::default();
+    for h in 0..(crate::events::MAX_CHAIN_EVENTS as u64 + 10) {
+        lib_block(&events, h, &format!("{h:064x}"));
+    }
+    let kept = events.lib_blocks(0, usize::MAX);
+    assert_eq!(kept.len(), crate::events::MAX_CHAIN_EVENTS);
+    assert_eq!(
+        kept.last().unwrap().height,
+        crate::events::MAX_CHAIN_EVENTS as u64 + 9
+    );
+}

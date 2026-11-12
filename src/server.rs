@@ -384,6 +384,8 @@ pub struct LogosServer {
     downloads: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// The agent's own content, for when no wallet gives AGENT_CIDS a home.
     own_cids: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Whether this server listens to blockchain_module's events yet.
+    chain_watching: Arc<std::sync::atomic::AtomicBool>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<KnownWallet>>>,
@@ -516,6 +518,12 @@ pub struct SlotRangeParams {
     pub from_slot: u64,
     /// The last slot, inclusive. At most 600 slots after from_slot.
     pub to_slot: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainEventsParams {
+    /// Only events after this seq, as the last chain_events call returned it.
+    pub after_seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -891,6 +899,7 @@ impl LogosServer {
             faucet_jobs: Arc::default(),
             downloads: Arc::default(),
             own_cids: Arc::default(),
+            chain_watching: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
@@ -3192,6 +3201,33 @@ impl LogosServer {
             Ok(pong) => ok(json!({ "peer_id": peer, "rtt_ms": pong["rttMs"] })),
             Err(e) => logos_fail(e),
         }
+    }
+
+    #[tool(
+        description = "Finalized Logos chain blocks as they arrive: each new last irreversible block's height and header id, oldest first, with a seq to page by. One event per change of the finalized tip, which can skip blocks. Read a block's contents with chain_block. Listens from the first call on."
+    )]
+    async fn chain_events(
+        &self,
+        Parameters(p): Parameters<ChainEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Basecamp's module subscribes at start; on its own, start listening now.
+        let started = !self.settings.host_owns_messaging
+            && !self
+                .chain_watching
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if started {
+            self.node.watch(BLOCKCHAIN, self.events.clone());
+        }
+        let events = self.events.lib_blocks(p.after_seq.unwrap_or(0), 100);
+        let next = events.last().map(|e| e.seq).or(p.after_seq);
+        let note = match (events.is_empty(), started) {
+            (true, true) => {
+                Some("listening from now on: call again once the chain finalizes a block")
+            }
+            (true, false) => Some("nothing new yet"),
+            _ => None,
+        };
+        ok(json!({ "events": events, "next_after_seq": next, "note": note }))
     }
 
     /// The balance of one of the node's own keys, in lepta. A key with no notes

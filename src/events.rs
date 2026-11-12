@@ -21,6 +21,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 pub const MAX_MESSAGES_PER_TOPIC: usize = 256;
 pub const MAX_TRACKED_SENDS: usize = 1024;
 pub const MAX_TRACKED_TRANSFERS: usize = 256;
+/// Finalized chain blocks kept for chain_events, newest last.
+pub const MAX_CHAIN_EVENTS: usize = 256;
+
+/// A new finalized tip, as blockchain_module's libBlock reports it: once per
+/// change of the last irreversible block, not once per block.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChainBlock {
+    pub seq: u64,
+    pub height: u64,
+    pub header_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ReceivedMessage {
@@ -62,6 +73,8 @@ struct Inner {
     send_order: VecDeque<String>,
     transfers: HashMap<String, Transfer>,
     transfer_order: VecDeque<String>,
+    next_chain_seq: u64,
+    lib_blocks: VecDeque<ChainBlock>,
 }
 
 #[derive(Default)]
@@ -178,6 +191,28 @@ impl EventStore {
                     }
                 }
             }
+            "libBlock" => {
+                // One JSON document in arg0; "null" when its stream ended.
+                let Some(v) = arg_str(data, 0).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                else {
+                    return;
+                };
+                let (Some(height), Some(header_id)) =
+                    (v["height"].as_u64(), v["header_id"].as_str())
+                else {
+                    return;
+                };
+                s.next_chain_seq += 1;
+                let block = ChainBlock {
+                    seq: s.next_chain_seq,
+                    height,
+                    header_id: header_id.to_string(),
+                };
+                s.lib_blocks.push_back(block);
+                while s.lib_blocks.len() > MAX_CHAIN_EVENTS {
+                    s.lib_blocks.pop_front();
+                }
+            }
             "storageUploadProgress"
             | "storageUploadDone"
             | "storageDownloadProgress"
@@ -272,6 +307,17 @@ impl EventStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Finalized chain tips with `seq > after`, oldest first, at most `limit`.
+    pub fn lib_blocks(&self, after: u64, limit: usize) -> Vec<ChainBlock> {
+        let s = self.inner.lock().unwrap();
+        s.lib_blocks
+            .iter()
+            .filter(|b| b.seq > after)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     pub fn send_status(&self, request_id: &str) -> Option<SendStatus> {
