@@ -1,6 +1,6 @@
 [package]
 name = "logos-mcp"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server that lets AI agents use a running Logos node: messaging, storage and node status"
