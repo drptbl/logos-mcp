@@ -3272,6 +3272,26 @@ impl LogosServer {
         }))
     }
 
+    #[tool(
+        description = "Claim one of the chain node's leader reward vouchers into its own wallet. The reward is minted to the node's leader key, and the transaction fee is paid from the node's funding key. Needs the chain node Online and a voucher ready: chain_rewards shows how many."
+    )]
+    async fn chain_claim_reward(&self) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.chain_online().await {
+            return fail(e);
+        }
+        match self.node.call(BLOCKCHAIN, "leader_claim", &[]).await {
+            Ok(hash) => ok(json!({
+                "tx_hash": embedded_json(hash),
+                "note": "submitted: chain_rewards and chain_wallet show the result once it is in a block",
+            })),
+            // Nothing is sent when no voucher is ready.
+            Err(LogosError::Refused(m)) if m.contains("NoClaimableVoucher") => fail(
+                "no reward voucher is ready to claim, so nothing was sent: chain_rewards shows when one is",
+            ),
+            Err(e) => fail(chain_error(e)),
+        }
+    }
+
     /// The balance of one of the node's own keys, in lepta. A key with no notes
     /// reads as 0: blockchain_module calls it unknown instead.
     async fn chain_balance(&self, address: &str) -> Result<Value, String> {

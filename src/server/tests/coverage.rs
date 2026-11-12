@@ -1654,3 +1654,69 @@ async fn chain_rewards_waits_for_the_node_to_be_online() {
             .any(|c| c.get(3).map(String::as_str) == Some("wallet_get_claimable_vouchers"))
     );
 }
+
+#[tokio::test]
+async fn a_reward_claim_returns_its_transaction() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain("leader_claim", json!(TX)),
+    ]);
+    let b = body(
+        &server(fake.clone(), None)
+            .chain_claim_reward()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["tx_hash"], TX, "{b}");
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("leader_claim"))
+    );
+}
+
+#[tokio::test]
+async fn a_claim_with_no_voucher_ready_says_so() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain_refused(
+            "leader_claim",
+            "Failed to claim leader rewards: Wallet(NoClaimableVoucher)",
+        ),
+    ]);
+    let r = server(fake, None).chain_claim_reward().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("no reward voucher"), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_claim_waits_for_the_node_to_be_online() {
+    // leader_claim blocks without a timeout while the node bootstraps.
+    let bootstrapping = ONLINE.replace("Online", "Bootstrapping");
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(bootstrapping)),
+    ]);
+    let r = server(fake.clone(), None)
+        .chain_claim_reward()
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("leader_claim"))
+    );
+}
+
+#[test]
+fn reward_claims_sit_behind_the_chain_switch() {
+    assert_eq!(ToolGroups::group_of("chain_claim_reward"), Some("chain"));
+}
