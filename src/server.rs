@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -3254,17 +3255,9 @@ impl LogosServer {
         ok(json!({ "service_id": p.service_id, "providers": providers, "note": note }))
     }
 
-    #[tool(
-        description = "Upload a file from the files root to Logos Storage. Returns a session_id; the CID appears in storage_transfer_status when done."
-    )]
-    async fn storage_upload(
-        &self,
-        Parameters(p): Parameters<UploadParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let path = match self.files().and_then(|f| f.existing_file(&p.path)) {
-            Ok(path) => path,
-            Err(e) => return fail(e),
-        };
+    /// Start uploading `path`, relative to the files root. Returns the session id.
+    async fn start_upload(&self, path: &str) -> Result<String, String> {
+        let path = self.files()?.existing_file(path)?;
         let args = [
             Arg::str(path.display().to_string()),
             Arg::Int(CHUNK_SIZE),
@@ -3273,10 +3266,157 @@ impl LogosServer {
         match self.node.call(STORAGE, "uploadUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "upload");
-                ok(json!({ "session_id": session }))
+                Ok(session)
             }
-            Ok(other) => fail(format!("unexpected uploadUrl result: {other}")),
-            Err(e) => logos_fail(e),
+            Ok(other) => Err(format!("unexpected uploadUrl result: {other}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Start downloading `cid` into a new file at `path` under the files root.
+    /// Returns the session id and the file's full path.
+    async fn start_download(
+        &self,
+        cid: &str,
+        path: &str,
+        private: bool,
+    ) -> Result<(String, PathBuf), String> {
+        guard::validate_cid(cid)?;
+        let full = self.files()?.new_file(path)?;
+        let args = [
+            Arg::str(cid),
+            Arg::str(full.display().to_string()),
+            Arg::Bool(false),
+            Arg::Int(CHUNK_SIZE),
+            Arg::Bool(private),
+            // Full privacy also means not re-serving what was fetched.
+            Arg::Bool(!private),
+        ];
+        // The download session id is the CID: clear any earlier run first.
+        self.events.reset_transfer(cid, "download");
+        match self.node.call(STORAGE, "downloadToUrl", &args).await {
+            Ok(Value::String(session)) => {
+                self.events.expect_transfer(&session, "download");
+                Ok((session, full))
+            }
+            Ok(other) => Err(format!("unexpected downloadToUrl result: {other}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Follow a transfer until it is done, `stop` says to give up, or `timeout`
+    /// passes. Returns its last state, or why it was given up.
+    async fn await_transfer(
+        &self,
+        session: &str,
+        timeout: Duration,
+        stop: impl Fn(&crate::events::Transfer) -> Option<String>,
+    ) -> Result<crate::events::Transfer, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(t) = self.events.transfer(session) {
+                if let Some(why) = stop(&t) {
+                    return Err(why);
+                }
+                if t.done {
+                    return Ok(t);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("still running after {} s", timeout.as_secs()));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Upload `path`, relative to the files root, and wait for its CID. An
+    /// upload that outlasts `timeout` is cancelled. Needs the storage events,
+    /// which the standalone server and Basecamp's module both watch.
+    pub async fn upload_file(&self, path: &str, timeout: Duration) -> Result<String, String> {
+        let session = self.start_upload(path).await?;
+        match self.await_transfer(&session, timeout, |_| None).await {
+            Ok(t) if t.success == Some(true) => t
+                .cid
+                .ok_or_else(|| "the upload finished without a CID".to_string()),
+            Ok(t) => Err(format!(
+                "the upload failed: {}",
+                t.error.unwrap_or_else(|| "no reason given".into())
+            )),
+            Err(why) => {
+                let _ = self
+                    .node
+                    .call(STORAGE, "uploadCancel", &[Arg::str(&session)])
+                    .await;
+                Err(format!("upload of {path} {why}; it was cancelled"))
+            }
+        }
+    }
+
+    /// Download `cid` into a new file at `path` under the files root and wait for
+    /// it. Anything over `max_bytes` is stopped and removed, as is a download that
+    /// outlasts `timeout` or fails. Returns the file's full path.
+    pub async fn download_to(
+        &self,
+        cid: &str,
+        path: &str,
+        max_bytes: Option<u64>,
+        timeout: Duration,
+    ) -> Result<PathBuf, String> {
+        let (session, full) = self.start_download(cid, path, false).await?;
+        let too_big = |size: u64| max_bytes.is_some_and(|cap| size > cap);
+        let over_cap = |t: &crate::events::Transfer| {
+            let size = t.total.into_iter().chain(t.bytes).max()?;
+            too_big(size).then(|| {
+                format!(
+                    "is {size} bytes, over the {} byte cap",
+                    max_bytes.unwrap_or_default()
+                )
+            })
+        };
+        let outcome = match self.await_transfer(&session, timeout, over_cap).await {
+            Ok(t) if t.success == Some(true) => match std::fs::metadata(&full) {
+                Ok(m) if too_big(m.len()) => Err(format!(
+                    "is {} bytes, over the {} byte cap",
+                    m.len(),
+                    max_bytes.unwrap_or_default()
+                )),
+                Ok(_) => return Ok(full),
+                Err(e) => Err(format!("finished but its file can't be read: {e}")),
+            },
+            Ok(t) => Err(format!(
+                "failed: {}",
+                t.error.unwrap_or_else(|| "no reason given".into())
+            )),
+            Err(why) => {
+                if !self.events.transfer(&session).is_some_and(|t| t.done) {
+                    let _ = self
+                        .node
+                        .call(STORAGE, "downloadCancel", &[Arg::str(&session)])
+                        .await;
+                }
+                Err(why)
+            }
+        };
+        // Never leave a partial or refused file behind.
+        let _ = std::fs::remove_file(&full);
+        outcome.map_err(|why| format!("download of {cid} {why}; nothing was kept"))
+    }
+
+    /// The files root, for callers that write inputs or read outputs themselves.
+    pub fn files_root(&self) -> Result<&FilesRoot, String> {
+        self.files()
+    }
+
+    #[tool(
+        description = "Upload a file from the files root to Logos Storage. Returns a session_id; the CID appears in storage_transfer_status when done."
+    )]
+    async fn storage_upload(
+        &self,
+        Parameters(p): Parameters<UploadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.start_upload(&p.path).await {
+            Ok(session) => ok(json!({ "session_id": session })),
+            Err(e) => fail(e),
         }
     }
 
@@ -3287,32 +3427,12 @@ impl LogosServer {
         &self,
         Parameters(p): Parameters<DownloadParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = guard::validate_cid(&p.cid) {
-            return fail(e);
-        }
-        let path = match self.files().and_then(|f| f.new_file(&p.path)) {
-            Ok(path) => path,
-            Err(e) => return fail(e),
-        };
-        let private = p.private.unwrap_or(false);
-        let args = [
-            Arg::str(&p.cid),
-            Arg::str(path.display().to_string()),
-            Arg::Bool(false),
-            Arg::Int(CHUNK_SIZE),
-            Arg::Bool(private),
-            // Full privacy also means not re-serving what was fetched.
-            Arg::Bool(!private),
-        ];
-        // The download session id is the CID: clear any earlier run first.
-        self.events.reset_transfer(&p.cid, "download");
-        match self.node.call(STORAGE, "downloadToUrl", &args).await {
-            Ok(Value::String(session)) => {
-                self.events.expect_transfer(&session, "download");
-                ok(json!({ "session_id": session, "path": p.path }))
-            }
-            Ok(other) => fail(format!("unexpected downloadToUrl result: {other}")),
-            Err(e) => logos_fail(e),
+        match self
+            .start_download(&p.cid, &p.path, p.private.unwrap_or(false))
+            .await
+        {
+            Ok((session, _)) => ok(json!({ "session_id": session, "path": p.path })),
+            Err(e) => fail(e),
         }
     }
 
