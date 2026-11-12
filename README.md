@@ -238,6 +238,10 @@ Some modules in the official catalogue are unsigned today, `lez_core` and `libp2
 - not tested on Linux yet, CI only builds and unit tests there
 - with `libp2p_module` `1.1.0` a node is only found for the first service it advertises, even after that one stops, so advertise one service per node. Restarting the libp2p module clears it
 
+## Use it as a library
+
+logos-agents builds on this crate. `standalone::server(app, args)` builds the server the binary runs without serving it. `LogosServer::upload_file` and `download_to` run a storage transfer to the end, under the same files-root rules as the tools, and `download_to` takes a size cap. `files_root().write_new` writes bytes into a new file there.
+
 ## Development
 
 ```bash
