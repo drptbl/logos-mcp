@@ -797,6 +797,12 @@ fn approval_reply(
     }
 }
 
+/// blockchain_module 0.3.4's answer for a key with no notes, never funded or
+/// emptied: its wallet drops the key from its note index rather than keep a 0.
+fn is_unfunded(e: &LogosError) -> bool {
+    matches!(e, LogosError::Refused(m) if m.starts_with("Unknown wallet address"))
+}
+
 /// A lez_faucet failure, with where to get the module when it isn't there.
 fn faucet_error(e: LogosError) -> String {
     let message = e.to_string();
@@ -2460,9 +2466,7 @@ impl LogosServer {
                     .into(),
             );
         }
-        let balance = self
-            .chain_read("wallet_get_balance", &[Arg::str(from)])
-            .await?;
+        let balance = self.chain_balance(from).await?;
         let held = match &balance {
             Value::String(b) => b.parse::<u128>().ok(),
             Value::Number(n) => n.as_u64().map(u128::from),
@@ -3184,6 +3188,20 @@ impl LogosServer {
         }
     }
 
+    /// The balance of one of the node's own keys, in lepta. A key with no notes
+    /// reads as 0: blockchain_module calls it unknown instead.
+    async fn chain_balance(&self, address: &str) -> Result<Value, String> {
+        match self
+            .node
+            .call(BLOCKCHAIN, "wallet_get_balance", &[Arg::str(address)])
+            .await
+        {
+            Ok(balance) => Ok(embedded_json(balance)),
+            Err(e) if is_unfunded(&e) => Ok(json!("0")),
+            Err(e) => Err(chain_error(e)),
+        }
+    }
+
     /// One blockchain_module read, decoded when it comes back as a JSON string.
     async fn chain_read(&self, method: &str, args: &[Arg]) -> Result<Value, String> {
         self.node
@@ -3276,19 +3294,28 @@ impl LogosServer {
             return fail(e);
         }
         if let Some(address) = address {
-            let balance = match self
-                .chain_read("wallet_get_balance", &[Arg::str(&address)])
-                .await
-            {
+            // Only for one of its own keys does "unknown" mean an empty account.
+            match self.chain_read("wallet_get_known_addresses", &[]).await {
+                Ok(Value::Array(known)) if known.iter().any(|a| a.as_str() == Some(&address)) => {}
+                Ok(_) => {
+                    return fail(
+                        "address is not one of the chain node's own addresses: chain_wallet lists them",
+                    );
+                }
+                Err(e) => return fail(e),
+            }
+            let balance = match self.chain_balance(&address).await {
                 Ok(b) => b,
                 Err(e) => return fail(e),
             };
             // The empty tip reads at the node's current one.
             let args = [Arg::str(&address), Arg::str("")];
-            return match self.chain_read("wallet_get_notes", &args).await {
-                Ok(notes) => ok(json!({ "address": address, "balance": balance, "notes": notes })),
-                Err(e) => fail(e),
+            let notes = match self.node.call(BLOCKCHAIN, "wallet_get_notes", &args).await {
+                Ok(notes) => embedded_json(notes),
+                Err(e) if is_unfunded(&e) => json!([]),
+                Err(e) => return fail(chain_error(e)),
             };
+            return ok(json!({ "address": address, "balance": balance, "notes": notes }));
         }
         let known = match self.chain_read("wallet_get_known_addresses", &[]).await {
             Ok(Value::Array(list)) => list,
@@ -3304,9 +3331,7 @@ impl LogosServer {
         for (index, address) in known.iter().filter_map(Value::as_str).enumerate() {
             let (server, address) = (self.clone(), address.to_string());
             reads.spawn(async move {
-                let balance = server
-                    .chain_read("wallet_get_balance", &[Arg::str(&address)])
-                    .await;
+                let balance = server.chain_balance(&address).await;
                 (
                     index,
                     match balance {
