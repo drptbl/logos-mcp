@@ -3116,3 +3116,10 @@ async fn a_refused_delivery_config_is_not_echoed_back() {
         text(&r)
     );
 }
+
+#[test]
+fn a_delivery_config_reaches_the_node_as_written() {
+    // Re-serializing would turn integers past u64 into lossy floats.
+    let text = r#"{"clusterId": 340282366920938463463374607431768211455}"#;
+    assert_eq!(DeliveryConfig::parse(text).unwrap().0, text);
+}

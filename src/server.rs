@@ -92,7 +92,8 @@ impl DeliveryConfig {
     /// The config, which must be a JSON object.
     pub fn parse(text: &str) -> Result<Self, String> {
         match serde_json::from_str::<Value>(text) {
-            Ok(v @ Value::Object(_)) => Ok(Self(v.to_string())),
+            // Passed on as written: re-serializing could change large numbers.
+            Ok(Value::Object(_)) => Ok(Self(text.trim().to_string())),
             Ok(_) => Err("the delivery config must be a JSON object".into()),
             Err(e) => Err(format!("the delivery config is not valid JSON: {e}")),
         }
