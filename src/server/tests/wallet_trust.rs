@@ -47,10 +47,18 @@ fn open_wallet(sequencer: &str, accounts: &str) -> Vec<crate::logosctl::RawOutpu
     ]
 }
 
+/// The configured wallet already open: its accounts match, so the server reads
+/// the sequencer once more to be sure both answers came from the same wallet.
+fn configured_open(sequencer: &str, accounts: &str) -> Vec<crate::logosctl::RawOutput> {
+    let mut replies = open_wallet(sequencer, accounts);
+    replies.insert(2, lez("get_sequencer_addr", &format!("{sequencer:?}")));
+    replies
+}
+
 #[tokio::test]
 async fn the_configured_wallet_found_open_is_adopted() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(open_wallet(SEQUENCER, AGENT_ACCOUNTS));
+    let fake = FakeRunner::with(configured_open(SEQUENCER, AGENT_ACCOUNTS));
     let s = configured_server(fake.clone(), dir.path(), &[AGENT_HEX], SEQUENCER);
     let b = body(&s.wallet_status().await.unwrap());
     assert_eq!(b["opened_by_this_server"], true, "{b}");
@@ -69,7 +77,7 @@ async fn the_configured_wallet_found_open_is_adopted() {
 #[tokio::test]
 async fn a_trailing_slash_does_not_make_it_another_sequencer() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = FakeRunner::with(open_wallet(SEQUENCER, AGENT_ACCOUNTS));
+    let fake = FakeRunner::with(configured_open(SEQUENCER, AGENT_ACCOUNTS));
     let s = configured_server(
         fake,
         dir.path(),
@@ -133,8 +141,55 @@ async fn private_accounts_in_the_configured_wallet_count_too() {
     let listed = format!(
         r#"[{{"account_id":"{AGENT_HEX}","is_public":true}},{{"account_id":"{private}","is_public":false}}]"#
     );
-    let mut s = wallet_server(FakeRunner::with(open_wallet(SEQUENCER, &listed)));
+    let mut s = wallet_server(FakeRunner::with(configured_open(SEQUENCER, &listed)));
     s.settings.wallet = Some(WalletMode::Dedicated(WalletPaths { config, storage }));
     let b = body(&s.wallet_status().await.unwrap());
     assert_eq!(b["opened_by_this_server"], true, "{b}");
+}
+
+#[tokio::test]
+async fn a_wallet_swapped_while_it_was_being_checked_is_not_adopted() {
+    // The first sequencer read came from the configured wallet's chain; by the
+    // second, another wallet with the same accounts on another chain is open.
+    let dir = tempfile::tempdir().unwrap();
+    let mut replies = open_wallet(SEQUENCER, AGENT_ACCOUNTS);
+    replies.insert(2, lez("get_sequencer_addr", r#""http://127.0.0.1:3040/""#));
+    let s = configured_server(
+        FakeRunner::with(replies),
+        dir.path(),
+        &[AGENT_HEX],
+        SEQUENCER,
+    );
+    let b = body(&s.wallet_status().await.unwrap());
+    assert_eq!(b["opened_by_this_server"], false, "{b}");
+}
+
+#[tokio::test]
+async fn an_adopted_wallet_swapped_later_is_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut replies = configured_open(SEQUENCER, AGENT_ACCOUNTS);
+    // later someone else's wallet is open instead
+    replies.extend([
+        lez("get_sequencer_addr", &format!("{SEQUENCER:?}")),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_balance", r#""5""#),
+    ]);
+    let s = configured_server(
+        FakeRunner::with(replies),
+        dir.path(),
+        &[AGENT_HEX],
+        SEQUENCER,
+    );
+    assert_eq!(
+        body(&s.wallet_status().await.unwrap())["opened_by_this_server"],
+        true
+    );
+    let later = body(&s.wallet_accounts().await.unwrap());
+    assert!(
+        later["warning"]
+            .as_str()
+            .unwrap()
+            .contains("may not be the agent wallet"),
+        "{later}"
+    );
 }

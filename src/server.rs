@@ -1207,14 +1207,18 @@ impl LogosServer {
             // The configured wallet itself, found open: this server restarted, or
             // a devnet session opened it. Exactly its accounts on its sequencer
             // means the same wallet; anything else, such as Basecamp's, stays untrusted.
-            let is_agent = remembered
-                || configured_wallet(paths)
-                    .await
-                    .is_some_and(|(sequencer, known)| {
-                        !known.is_empty()
-                            && known == ids
-                            && sequencer.trim_end_matches('/') == addr.trim_end_matches('/')
-                    });
+            let mut is_agent = remembered;
+            if !remembered
+                && let Some((sequencer, known)) = configured_wallet(paths).await
+                && !known.is_empty()
+                && known == ids
+            {
+                // Read the sequencer again: had another wallet been opened between
+                // the first read and the listing, the two would describe different
+                // wallets. Now both describe the one that was listed.
+                let same = |a: &str| a.trim_end_matches('/') == sequencer.trim_end_matches('/');
+                is_agent = same(&addr) && same(&self.sequencer_addr().await?);
+            }
             if is_agent {
                 *agent_accounts = Some(ids.clone());
             }
