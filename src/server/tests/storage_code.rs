@@ -220,3 +220,51 @@ fn bytes_are_written_only_into_a_new_file_under_the_root() {
     );
     assert!(root.write_new("../escape.txt", b"x").is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_second_download_of_the_same_cid_waits_its_turn_by_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let (s, events) = storage_server(fake.clone(), dir.path());
+    let first = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(CID, "a.bin", None, Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let err = s
+        .download_to(CID, "b.bin", None, Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert!(err.contains("already"), "{err}");
+    std::fs::write(dir.path().join("a.bin"), b"x").unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    assert!(first.await.unwrap().is_ok());
+    let starts = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("downloadToUrl"))
+        .count();
+    assert_eq!(starts, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_whose_cancel_fails_says_the_file_may_come_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("downloadToUrl", &format!("{CID:?}"))]);
+    let (s, _events) = storage_server(fake, dir.path());
+    // No cancel reply: the cancel call fails.
+    let err = s
+        .download_to(CID, "in.bin", None, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(err.contains("may still"), "{err}");
+}

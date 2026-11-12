@@ -282,6 +282,9 @@ pub struct LogosServer {
     /// Faucet drops this server started: the only ones wallet_faucet checks on,
     /// so the agent never reads or acknowledges the Faucet app's own.
     faucet_jobs: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// CIDs download_to is fetching: a download's session id is its CID, so two
+    /// at once would share one transfer record.
+    downloads: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
     /// once this server has opened it.
     agent_accounts: Arc<tokio::sync::Mutex<Option<KnownWallet>>>,
@@ -748,6 +751,7 @@ impl LogosServer {
             discovery_ready: Arc::default(),
             interests: Arc::default(),
             faucet_jobs: Arc::default(),
+            downloads: Arc::default(),
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
@@ -3362,6 +3366,28 @@ impl LogosServer {
         max_bytes: Option<u64>,
         timeout: Duration,
     ) -> Result<PathBuf, String> {
+        /// Frees the CID when this download ends, however it ends.
+        struct Running(Arc<std::sync::Mutex<BTreeSet<String>>>, String);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.1);
+            }
+        }
+        guard::validate_cid(cid)?;
+        if !self
+            .downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cid.to_string())
+        {
+            return Err(format!(
+                "a download of {cid} is already running: wait for it"
+            ));
+        }
+        let _running = Running(self.downloads.clone(), cid.to_string());
         let (session, full) = self.start_download(cid, path, false).await?;
         let too_big = |size: u64| max_bytes.is_some_and(|cap| size > cap);
         let over_cap = |t: &crate::events::Transfer| {
@@ -3373,6 +3399,7 @@ impl LogosServer {
                 )
             })
         };
+        let mut still_writing = false;
         let outcome = match self.await_transfer(&session, timeout, over_cap).await {
             Ok(t) if t.success == Some(true) => match std::fs::metadata(&full) {
                 Ok(m) if too_big(m.len()) => Err(format!(
@@ -3389,17 +3416,27 @@ impl LogosServer {
             )),
             Err(why) => {
                 if !self.events.transfer(&session).is_some_and(|t| t.done) {
-                    let _ = self
+                    still_writing = self
                         .node
                         .call(STORAGE, "downloadCancel", &[Arg::str(&session)])
-                        .await;
+                        .await
+                        .is_err();
                 }
                 Err(why)
             }
         };
         // Never leave a partial or refused file behind.
         let _ = std::fs::remove_file(&full);
-        outcome.map_err(|why| format!("download of {cid} {why}; nothing was kept"))
+        outcome.map_err(|why| {
+            if still_writing {
+                format!(
+                    "download of {cid} {why}; it could not be cancelled, so {} may still be written",
+                    full.display()
+                )
+            } else {
+                format!("download of {cid} {why}; nothing was kept")
+            }
+        })
     }
 
     /// The files root, for callers that write inputs or read outputs themselves.
