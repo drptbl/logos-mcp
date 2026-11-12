@@ -1609,3 +1609,48 @@ fn only_the_newest_finalized_blocks_are_kept() {
         crate::events::MAX_CHAIN_EVENTS as u64 + 9
     );
 }
+
+const ONLINE: &str = "{\"height\":84895,\"lib\":\"aa\",\"lib_slot\":2909742,\"mode\":\"Online\",\"slot\":2951727,\"tip\":\"bb\"}";
+
+#[tokio::test]
+async fn chain_rewards_lists_vouchers_and_mining_tickets() {
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(ONLINE)),
+        chain(
+            "wallet_get_claimable_vouchers",
+            json!(
+                "{\"tip\":\"c4\",\"vouchers\":[{\"commitment\":\"5e\",\"nullifier\":\"1d\"}],\"reward_amount\":\"4200\",\"total_claimable\":\"4200\"}"
+            ),
+        ),
+        chain(
+            "pow_claimable_rewards",
+            json!("{\"claimable_tickets\":2,\"slots_until_expiry\":[271,12]}"),
+        ),
+    ]);
+    let b = body(&server(fake, None).chain_rewards().await.unwrap());
+    assert_eq!(b["leader"]["vouchers"], 1, "{b}");
+    assert_eq!(b["leader"]["total_claimable"], "4200", "{b}");
+    assert_eq!(b["mining"]["claimable_tickets"], 2, "{b}");
+}
+
+#[tokio::test]
+async fn chain_rewards_waits_for_the_node_to_be_online() {
+    // These reads block without a timeout while the node bootstraps.
+    let bootstrapping = ONLINE.replace("Online", "Bootstrapping");
+    let fake = FakeRunner::with(vec![
+        out(BLOCKCHAIN_LOADED),
+        chain("get_cryptarchia_info", json!(bootstrapping)),
+    ]);
+    let r = server(fake.clone(), None).chain_rewards().await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("Online"), "{}", text(&r));
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("wallet_get_claimable_vouchers"))
+    );
+}

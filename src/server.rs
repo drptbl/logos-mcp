@@ -3230,6 +3230,48 @@ impl LogosServer {
         ok(json!({ "events": events, "next_after_seq": next, "note": note }))
     }
 
+    /// Fail unless the chain node is Online: some of its calls wait without a
+    /// timeout until it is.
+    async fn chain_online(&self) -> Result<(), String> {
+        self.chain_ready().await?;
+        let info = self.chain_read("get_cryptarchia_info", &[]).await?;
+        match info["mode"].as_str() {
+            Some("Online") => Ok(()),
+            mode => Err(format!(
+                "the chain node is {}, not Online yet: rewards can be read and claimed once it is",
+                mode.unwrap_or("in an unknown state")
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Rewards the chain node has earned and not yet claimed: leader reward vouchers from blocks it led, with their total in lepta, and mined proof-of-work tickets. Needs the chain node Online."
+    )]
+    async fn chain_rewards(&self) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.chain_online().await {
+            return fail(e);
+        }
+        let vouchers = match self.chain_read("wallet_get_claimable_vouchers", &[]).await {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        let mining = match self.chain_read("pow_claimable_rewards", &[]).await {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        ok(json!({
+            "leader": {
+                "vouchers": vouchers["vouchers"].as_array().map_or(0, Vec::len),
+                "reward_amount": vouchers["reward_amount"],
+                "total_claimable": vouchers["total_claimable"],
+            },
+            "mining": {
+                "claimable_tickets": mining["claimable_tickets"],
+                "slots_until_expiry": mining["slots_until_expiry"],
+            },
+        }))
+    }
+
     /// The balance of one of the node's own keys, in lepta. A key with no notes
     /// reads as 0: blockchain_module calls it unknown instead.
     async fn chain_balance(&self, address: &str) -> Result<Value, String> {
