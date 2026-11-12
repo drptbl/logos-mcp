@@ -1605,7 +1605,10 @@ impl LogosServer {
             "messaging": {
                 "network": self.network().await,
                 "configured_network": self.configured_network(),
-                "mode": self.settings.mode,
+                "mode": match self.settings.delivery_config {
+                    Some(_) => "set by the delivery config",
+                    None => self.settings.mode.as_str(),
+                },
                 "connection": connection,
                 "subscriptions": *self.subscriptions.lock().unwrap(),
             },
