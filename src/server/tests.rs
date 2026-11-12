@@ -3092,3 +3092,27 @@ async fn with_a_delivery_config_the_network_is_not_named_after_the_preset() {
     s.settings.delivery_config = Some(DeliveryConfig::parse(r#"{"clusterId":99}"#).unwrap());
     assert_eq!(s.network().await, "custom delivery config");
 }
+
+#[tokio::test]
+async fn a_refused_delivery_config_is_not_echoed_back() {
+    // delivery_module's parser may quote the rejected value, a node key included.
+    let fake = FakeRunner::with(vec![
+        out(r#"[{"name":"delivery_module","status":"loaded"}]"#),
+        out(
+            r#"{"method":"getConnectionStatus","module":"delivery_module","result":{"error":"Context not initialized","success":false,"value":null},"status":"ok"}"#,
+        ),
+        out(
+            r#"{"method":"createNode","module":"delivery_module","result":{"error":"invalid value for nodekey: aa11","success":false,"value":null},"status":"ok"}"#,
+        ),
+    ]);
+    let mut s = server(fake, None);
+    s.settings.delivery_config = Some(DeliveryConfig::parse(r#"{"nodekey":"aa11"}"#).unwrap());
+    let r = s.messaging_connect().await.unwrap();
+    assert!(is_error(&r));
+    assert!(!text(&r).contains("aa11"), "{}", text(&r));
+    assert!(
+        text(&r).contains("LOGOS_MCP_DELIVERY_CONFIG"),
+        "{}",
+        text(&r)
+    );
+}

@@ -1652,6 +1652,12 @@ impl LogosServer {
                     .call(DELIVERY, "createNode", &[Arg::str(self.node_config())])
                     .await
                 {
+                    // Its reply may quote the config, node key and all.
+                    if self.settings.delivery_config.is_some() {
+                        return fail(
+                            "delivery_module refused the node config from LOGOS_MCP_DELIVERY_CONFIG; its reply isn't shown, since it may quote the config",
+                        );
+                    }
                     return logos_fail(e);
                 }
                 if let Err(e) = self.node.call(DELIVERY, "start", &[]).await {
