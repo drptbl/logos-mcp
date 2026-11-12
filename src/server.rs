@@ -3549,13 +3549,14 @@ impl LogosServer {
     }
 
     /// Start downloading `cid` into a new file at `path` under the files root.
-    /// Returns the session id and the file's full path.
+    /// Returns the session id, the file's full path, and whether local storage
+    /// held the content already.
     async fn start_download(
         &self,
         cid: &str,
         path: &str,
         private: bool,
-    ) -> Result<(String, PathBuf), String> {
+    ) -> Result<(String, PathBuf, bool), String> {
         guard::validate_cid(cid)?;
         let full = self.files()?.new_file(path)?;
         let args = [
@@ -3577,10 +3578,7 @@ impl LogosServer {
         match self.node.call(STORAGE, "downloadToUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "download");
-                if !held && let Err(e) = self.remember_cid(cid, "download") {
-                    tracing::warn!("could not record the agent's download {cid}: {e}");
-                }
-                Ok((session, full))
+                Ok((session, full, held))
             }
             Ok(other) => Err(format!("unexpected downloadToUrl result: {other}")),
             Err(e) => Err(e.to_string()),
@@ -3662,8 +3660,8 @@ impl LogosServer {
         guard::validate_cid(cid)?;
         let full = self.files()?.new_file(path)?;
         let mut running = self.reserve_download(cid, &full)?;
-        let session = match self.start_download(cid, path, false).await {
-            Ok((session, _)) => session,
+        let (session, held) = match self.start_download(cid, path, false).await {
+            Ok((session, _, held)) => (session, held),
             // The module may have started it all the same: stop it and clean up.
             Err(e) => {
                 running.cancel_and_remove().await;
@@ -3689,6 +3687,9 @@ impl LogosServer {
                 ),
                 Ok(_) => {
                     running.keep();
+                    if !held && let Err(e) = self.remember_cid(cid, "download") {
+                        tracing::warn!("could not record the agent's download {cid}: {e}");
+                    }
                     return Ok(full);
                 }
                 Err(e) => format!("finished but its file can't be read: {e}"),
@@ -3736,7 +3737,10 @@ impl LogosServer {
         Parameters(p): Parameters<UploadParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.start_upload(&p.path).await {
-            Ok(session) => ok(json!({ "session_id": session })),
+            Ok(session) => {
+                self.record_when_done(session.clone(), None);
+                ok(json!({ "session_id": session }))
+            }
             Err(e) => fail(e),
         }
     }
@@ -3763,7 +3767,12 @@ impl LogosServer {
             .start_download(&p.cid, &p.path, p.private.unwrap_or(false))
             .await
         {
-            Ok((session, _)) => ok(json!({ "session_id": session, "path": p.path })),
+            Ok((session, _, held)) => {
+                if !held {
+                    self.record_when_done(session.clone(), Some(p.cid.clone()));
+                }
+                ok(json!({ "session_id": session, "path": p.path }))
+            }
             Err(e) => fail(e),
         }
     }
@@ -3776,17 +3785,9 @@ impl LogosServer {
         Parameters(p): Parameters<SessionParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.events.transfer(&p.session_id) {
-            Some(t) => {
-                if t.kind == "upload"
-                    && t.success == Some(true)
-                    && let Some(cid) = &t.cid
-                    && !self.is_own_cid(cid).unwrap_or(false)
-                    && let Err(e) = self.remember_cid(cid, "upload")
-                {
-                    tracing::warn!("could not record the agent's upload {cid}: {e}");
-                }
-                ok(serde_json::to_value(t).unwrap_or(Value::Null))
-            }
+            // Recording happens where the agent started the transfer: the store
+            // also sees uploads the agent didn't start.
+            Some(t) => ok(serde_json::to_value(t).unwrap_or(Value::Null)),
             None => fail(format!("unknown session {}", p.session_id)),
         }
     }
@@ -3841,16 +3842,20 @@ impl LogosServer {
         if let Err(e) = self.node.call(STORAGE, "remove", &[Arg::str(&p.cid)]).await {
             return logos_fail(e);
         }
-        // Removal finishes in the background: wait a moment for it to be gone.
-        for _ in 0..20 {
-            if let Ok(Value::Bool(false)) =
-                self.node.call(STORAGE, "exists", &[Arg::str(&p.cid)]).await
-            {
-                if let Err(e) = self.forget_cid(&p.cid) {
-                    return fail(format!(
-                        "removed, but the record of it couldn't be updated: {e}"
-                    ));
-                }
+        // Asked for: the agent's claim ends now, so content stored again later,
+        // by the user, never inherits it.
+        if let Err(e) = self.forget_cid(&p.cid) {
+            return fail(format!(
+                "removal asked for, but the record of the agent's content couldn't be updated: {e}"
+            ));
+        }
+        // Removal finishes in the background: wait up to 10 s for it to be gone.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(left) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            let gone =
+                tokio::time::timeout(left, self.node.call(STORAGE, "exists", &[Arg::str(&p.cid)]))
+                    .await;
+            if let Ok(Ok(Value::Bool(false))) = gone {
                 return ok(json!({ "removed": p.cid }));
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3882,18 +3887,44 @@ impl LogosServer {
     /// Forget `cid` once it is gone from local storage.
     fn forget_cid(&self, cid: &str) -> Result<(), String> {
         let mut own = self.own_cids.lock().unwrap_or_else(|e| e.into_inner());
-        own.remove(cid);
-        let Some(file) = self.wallet_side_file(AGENT_CIDS) else {
-            return Ok(());
-        };
-        let mut map: std::collections::BTreeMap<String, Value> =
-            guard::read_side_map(Some(file.clone()))
-                .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
-        if map.remove(cid).is_some() {
-            let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
-            guard::write_private(&file, &text).map_err(|e| e.to_string())?;
+        // The record on disk first: if it can't be updated, nothing is forgotten.
+        if let Some(file) = self.wallet_side_file(AGENT_CIDS) {
+            let mut map: std::collections::BTreeMap<String, Value> =
+                guard::read_side_map(Some(file.clone()))
+                    .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
+            if map.remove(cid).is_some() {
+                let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+                guard::write_private(&file, &text).map_err(|e| e.to_string())?;
+            }
         }
+        own.remove(cid);
         Ok(())
+    }
+
+    /// Once a transfer this server started succeeds, record its content as the
+    /// agent's: an upload's CID from the transfer, a download's given. Waits up
+    /// to an hour in the background.
+    fn record_when_done(&self, session: String, download_cid: Option<String>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let done = server
+                .await_transfer(&session, std::time::Duration::from_secs(3600), |_| None)
+                .await;
+            let Ok(t) = done else { return };
+            if t.success != Some(true) {
+                return;
+            }
+            let (cid, via) = match download_cid {
+                Some(cid) => (cid, "download"),
+                None => match t.cid {
+                    Some(cid) => (cid, "upload"),
+                    None => return,
+                },
+            };
+            if let Err(e) = server.remember_cid(&cid, via) {
+                tracing::warn!("could not record the agent's {via} {cid}: {e}");
+            }
+        });
     }
 
     /// Every CID the agent put in local storage, read once. An unreadable record

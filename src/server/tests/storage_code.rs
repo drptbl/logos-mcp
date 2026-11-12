@@ -501,3 +501,87 @@ async fn storage_manifests_marks_the_agents_own_content() {
     assert_eq!(content[0]["size"], 661, "{b}");
     assert_eq!(content[1]["agent"], false, "{b}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn polling_someone_elses_upload_never_makes_it_the_agents() {
+    // In Basecamp the event store sees every upload, the user's too.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, events) = storage_server(FakeRunner::with(vec![]), dir.path());
+    events.expect_transfer("users-session", "upload");
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "users-session", "success": true, "cid": CID }),
+    );
+    let r = s
+        .storage_transfer_status(Parameters(SessionParams {
+            session_id: "users-session".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_through_the_tool_is_the_agents_without_being_polled() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let fake = FakeRunner::with(vec![storage("uploadUrl", r#""90""#)]);
+    let (s, events) = storage_server(fake, dir.path());
+    let r = s
+        .storage_upload(Parameters(UploadParams {
+            path: "out.txt".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "90", "success": true, "cid": CID }),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_download_never_becomes_the_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, events) = storage_server(fake, dir.path());
+    let r = s
+        .storage_download(Parameters(DownloadParams {
+            cid: CID.into(),
+            path: "in.bin".into(),
+            private: None,
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": false, "error": "not found" }),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_removal_is_forgotten_as_soon_as_it_is_asked_for() {
+    // Even when storage is slow to confirm, the agent's claim on it ends.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("remove", "null")]);
+    let (s, _events) = storage_server(fake, dir.path());
+    s.remember_cid(CID, "upload").unwrap();
+    let r = s
+        .storage_remove(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert!(!s.is_own_cid(CID).unwrap());
+}
