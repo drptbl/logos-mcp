@@ -3279,6 +3279,10 @@ impl LogosServer {
         if let Err(e) = self.chain_online().await {
             return fail(e);
         }
+        // Last look before sending: the user may have turned the chain tools off meanwhile.
+        if !self.allows("chain_claim_reward") {
+            return fail("the user turned the chain tools off: nothing was claimed");
+        }
         match self.node.call(BLOCKCHAIN, "leader_claim", &[]).await {
             Ok(hash) => ok(json!({
                 "tx_hash": embedded_json(hash),
