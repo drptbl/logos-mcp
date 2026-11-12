@@ -1193,6 +1193,11 @@ async fn an_unclear_create_reply_resyncs_the_wallet_fingerprint() {
         stderr: String::new(),
     });
     replies.push(lez("list_accounts", both));
+    // read again to be sure the listing came from the same chain
+    replies.push(lez(
+        "get_sequencer_addr",
+        r#""https://testnet.lez.logos.co/""#,
+    ));
     replies.push(lez(
         "get_sequencer_addr",
         r#""https://testnet.lez.logos.co/""#,
@@ -3122,4 +3127,121 @@ fn a_delivery_config_reaches_the_node_as_written() {
     // Re-serializing would turn integers past u64 into lossy floats.
     let text = r#"{"clusterId": 340282366920938463463374607431768211455}"#;
     assert_eq!(DeliveryConfig::parse(text).unwrap().0, text);
+}
+
+/// A create that timed out, then lez_core listing `accounts`.
+fn unclear_create_then(accounts: &str) -> Vec<crate::logosctl::RawOutput> {
+    let mut replies = opened_by_server();
+    replies.push(crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"METHOD_FAILED","error":{"code":"timeout","message":"timed out"},"message":"timeout","status":"error"}"#.into(),
+        stderr: String::new(),
+    });
+    replies.push(lez("list_accounts", accounts));
+    replies
+}
+
+#[tokio::test]
+async fn an_unclear_create_never_adopts_another_wallets_accounts() {
+    // Between the create and the listing, someone else's wallet was opened.
+    let mut replies = unclear_create_then(OTHER_ACCOUNTS);
+    replies.extend([
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let s = wallet_server(FakeRunner::with(replies));
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(status["agent_wallet"], false, "{status}");
+}
+
+#[tokio::test]
+async fn an_unclear_create_adopts_at_most_one_new_account() {
+    let three = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1","is_public":true},{"account_id":"846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc","is_public":true}]"#;
+    let mut replies = unclear_create_then(three);
+    replies.extend([
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", three),
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let s = wallet_server(FakeRunner::with(replies));
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(status["agent_wallet"], false, "{status}");
+}
+
+#[tokio::test]
+async fn wallet_status_says_whether_the_agent_may_use_the_wallet() {
+    let mut replies = opened_by_server();
+    replies.extend([
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let b = body(
+        &wallet_server(FakeRunner::with(replies))
+            .wallet_status()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["agent_wallet"], true, "{b}");
+}
+
+#[tokio::test]
+async fn an_unclear_create_on_another_sequencer_is_not_adopted() {
+    let both = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1","is_public":true}]"#;
+    let mut replies = unclear_create_then(both);
+    replies.push(lez("get_sequencer_addr", r#""http://127.0.0.1:3040/""#));
+    replies.extend([
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", both),
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let s = wallet_server(FakeRunner::with(replies));
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(status["agent_wallet"], false, "{status}");
+}
+
+#[tokio::test]
+async fn an_unclear_create_missing_a_known_account_is_not_adopted() {
+    // Two accounts, as expected after one more, but not the agent's.
+    let swapped = r#"[{"account_id":"846d9a7014dbd1fd26ffc40e870df5af08f23ee2bf0c151bc2aa17a58b4481bc","is_public":true},{"account_id":"8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1","is_public":true}]"#;
+    let mut replies = unclear_create_then(swapped);
+    replies.extend([
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", swapped),
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let s = wallet_server(FakeRunner::with(replies));
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(status["agent_wallet"], false, "{status}");
+}
+
+#[tokio::test]
+async fn an_unclear_create_in_an_empty_wallet_adopts_nothing() {
+    // With nothing known, any one-account wallet would pass "one more".
+    let mut replies = opened_by_server();
+    replies[4] = lez("list_accounts", "[]");
+    replies.push(crate::logosctl::RawOutput {
+        code: 4,
+        stdout: r#"{"code":"METHOD_FAILED","error":{"code":"timeout","message":"timed out"},"message":"timeout","status":"error"}"#.into(),
+        stderr: String::new(),
+    });
+    replies.push(lez("list_accounts", OTHER_ACCOUNTS));
+    replies.extend([
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+        lez("get_current_block_height", "78120"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    let s = wallet_server(FakeRunner::with(replies));
+    assert!(is_error(&s.wallet_new_account().await.unwrap()));
+    let status = body(&s.wallet_status().await.unwrap());
+    assert_eq!(status["agent_wallet"], false, "{status}");
 }

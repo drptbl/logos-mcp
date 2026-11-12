@@ -23,7 +23,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chat_start` | opens an end-to-end encrypted conversation with another agent's chat address |
 | `chat_send` | sends a message into a conversation. There is no delivery receipt |
 | `chat_read` | a conversation's messages, paged with `after`, or every conversation, newest first |
-| `wallet_status` | whether the agent wallet is open, its sequencer, the chain height and the last block its private accounts synced |
+| `wallet_status` | whether the agent wallet is open and the agent may use it, its sequencer, the chain height and the last block its private accounts synced |
 | `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts |
 | `wallet_account` | one public account's balance, nonce and the program data it holds |
 | `wallet_labels` | the account behind a label, or an account's labels |
