@@ -2578,9 +2578,16 @@ impl LogosServer {
             .map(|b58| format!("Public/{b58}"))
             .ok_or("unreadable account id")?;
         self.faucet_ready().await?;
-        // The faucet module serves one network at a time: the wallet's.
-        self.faucet_call("configure", &[Arg::str(&w.sequencer)])
-            .await?;
+        // The faucet module serves one network at a time, the one the LEZ Faucet
+        // app chose. Switch it to the wallet's only when it differs, and back after.
+        let current = self.faucet_network(ct).await;
+        let switched = !current
+            .as_deref()
+            .is_some_and(|c| same_sequencer(c, &w.sequencer));
+        if switched {
+            self.faucet_call("configure", &[Arg::str(&w.sequencer)])
+                .await?;
+        }
         let started = self
             .faucet_call("requestDrop", &[Arg::str(&address), Arg::str(uuid_v4()?)])
             .await?;
@@ -2593,11 +2600,46 @@ impl LogosServer {
             .unwrap_or_else(|e| e.into_inner())
             .insert(job.clone());
         // The drop is under way: whatever goes wrong now, the agent keeps its job id.
-        self.faucet_wait(ct, &job, FAUCET_WAIT).await.map_err(|e| {
+        let outcome = self.faucet_wait(ct, &job, FAUCET_WAIT).await;
+        let settled = outcome
+            .as_ref()
+            .map_or(true, |done| done["status"] != "running");
+        let network = match (&current, switched, settled) {
+            (_, false, _) => "kept",
+            (Some(previous), true, true) => {
+                match self.faucet_call("configure", &[Arg::str(previous)]).await {
+                    Ok(_) => "restored",
+                    Err(_) => "switched to the wallet's network; switching back failed",
+                }
+            }
+            (Some(_), true, false) => {
+                "switched to the wallet's network while this drop runs; the LEZ Faucet app may need switching back"
+            }
+            (None, true, _) => "set to the wallet's network",
+        };
+        let outcome = outcome.map(|mut done| {
+            done["faucet_network"] = json!(network);
+            done
+        });
+        outcome.map_err(|e| {
             format!(
                 "{e} (drop {job}: check it with wallet_faucet and this job_id before asking again)"
             )
         })
+    }
+
+    /// The sequencer the faucet module serves now, from a getFaucetInfo job. None
+    /// when it isn't configured or can't say within a few seconds.
+    async fn faucet_network(&self, ct: &CancellationToken) -> Option<String> {
+        let started = self.faucet_call("getFaucetInfo", &[]).await.ok()?;
+        let job = started["job_id"].as_str()?.to_string();
+        let done = self
+            .faucet_wait(ct, &job, std::time::Duration::from_secs(20))
+            .await
+            .ok()?;
+        done["receipt"]["sequencer_url"]
+            .as_str()
+            .map(str::to_string)
     }
 
     /// Load lez_faucet when this server runs on its own; Basecamp loads it itself.
