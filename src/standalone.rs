@@ -2,7 +2,7 @@
 //! on its server, such as logos-agents: the same options, wallet checks and
 //! logosctl wiring, serving whatever handler wraps the server.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -84,28 +84,32 @@ fn find_logosctl() -> Option<PathBuf> {
     })
 }
 
-/// Parse the options, connect to the node through logosctl and serve
-/// `wrap(server)` over stdio until the client leaves.
-pub async fn run<H, F>(app: App, wrap: F) -> anyhow::Result<()>
+/// Parse `args` (the program name first, as `std::env::args_os` gives them),
+/// set up logging to stderr and connect to the node through logosctl: the
+/// server `run` serves, for callers that drive it themselves, such as a
+/// provider loop with no MCP client. Call it inside a Tokio runtime, since it
+/// starts the node's event watchers. `--help` and bad options print and exit.
+pub fn server<I, T>(app: &App, args: I) -> anyhow::Result<LogosServer>
 where
-    H: ServerHandler,
-    F: FnOnce(LogosServer) -> H,
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
 {
-    // stdout is the MCP channel: logs must go to stderr.
-    tracing_subscriber::fmt()
+    // stdout is the MCP channel: logs must go to stderr. A second call keeps
+    // the logging the first set up.
+    let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| app.log_filter.into()),
         )
         .with_ansi(false)
-        .init();
+        .try_init();
 
     let matches = Cli::command()
         .name(app.name)
         .version(app.version)
         .about(app.about)
-        .get_matches();
+        .get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches)?;
     let bin = match cli.logosctl.or_else(find_logosctl) {
         Some(b) if b.is_file() => b,
@@ -175,7 +179,17 @@ where
     node.watch("delivery_module", events.clone());
     node.watch("storage_module", events.clone());
 
-    let server = LogosServer::new(node, events, files, settings);
+    Ok(LogosServer::new(node, events, files, settings))
+}
+
+/// Parse the process's options, connect to the node through logosctl and serve
+/// `wrap(server)` over stdio until the client leaves.
+pub async fn run<H, F>(app: App, wrap: F) -> anyhow::Result<()>
+where
+    H: ServerHandler,
+    F: FnOnce(LogosServer) -> H,
+{
+    let server = server(&app, std::env::args_os())?;
     let service = wrap(server)
         .serve(stdio())
         .await
@@ -196,5 +210,41 @@ mod tests {
             .find(|a| a.get_id() == "delivery_config")
             .unwrap();
         assert!(arg.is_hide_env_values_set());
+    }
+
+    const APP: App = App {
+        name: "logos-mcp-test",
+        version: "0",
+        about: "test",
+        log_filter: "off",
+    };
+
+    #[tokio::test]
+    async fn the_server_is_built_from_the_given_arguments() {
+        let err = server(
+            &APP,
+            ["logos-mcp-test", "--logosctl", "/nonexistent/logosctl"],
+        )
+        .err()
+        .expect("a missing logosctl is refused");
+        assert!(err.to_string().contains("/nonexistent/logosctl"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_comes_up_without_serving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let logosctl = dir.path().join("logosctl");
+        std::fs::write(&logosctl, "").unwrap();
+        let built = server(
+            &APP,
+            [
+                "logos-mcp-test".into(),
+                "--logosctl".into(),
+                logosctl.into_os_string(),
+                "--preset".into(),
+                "logos.dev".into(),
+            ],
+        );
+        assert!(built.is_ok(), "{:?}", built.err());
     }
 }
