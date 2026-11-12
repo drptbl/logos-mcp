@@ -83,8 +83,8 @@ pub struct NodeSettings {
     pub delivery_config: Option<DeliveryConfig>,
 }
 
-/// A delivery_module createNode config, kept as given. It may carry a node key,
-/// so it never shows in debug output or logs.
+/// A delivery_module createNode config, checked to be a JSON object. It may
+/// carry a node key, so it never shows in debug output or logs.
 #[derive(Clone)]
 pub struct DeliveryConfig(String);
 

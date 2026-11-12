@@ -62,7 +62,8 @@ struct Cli {
 
     /// delivery_module's full createNode config as JSON, in place of --mode and
     /// --preset: for a network no preset names, such as a local devnet hub.
-    #[arg(long, env = "LOGOS_MCP_DELIVERY_CONFIG")]
+    // It may carry a node key: --help must not print it.
+    #[arg(long, env = "LOGOS_MCP_DELIVERY_CONFIG", hide_env_values = true)]
     delivery_config: Option<String>,
 
     /// Timeout for each logosctl call, in seconds.
@@ -181,4 +182,19 @@ where
         .context("MCP handshake failed")?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_never_prints_the_delivery_config() {
+        let cli = Cli::command();
+        let arg = cli
+            .get_arguments()
+            .find(|a| a.get_id() == "delivery_config")
+            .unwrap();
+        assert!(arg.is_hide_env_values_set());
+    }
 }
