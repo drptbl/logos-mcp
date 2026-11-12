@@ -3038,3 +3038,4 @@ async fn actions_taken_without_a_tool_call_show_in_the_activity() {
 }
 
 mod coverage;
+mod wallet_trust;

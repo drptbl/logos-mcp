@@ -182,6 +182,23 @@ pub fn service_entry(record: &Value, id: &str) -> Option<Vec<u8>> {
         .and_then(|b64| STANDARD.decode(b64).ok())
 }
 
+/// The configured wallet's sequencer and account ids (hex), read from its
+/// files. Only the ids are taken from the key storage; None when either file
+/// can't be read as expected.
+async fn configured_wallet(paths: &WalletPaths) -> Option<(String, BTreeSet<String>)> {
+    let config: Value = serde_json::from_slice(&tokio::fs::read(&paths.config).await.ok()?).ok()?;
+    let sequencer = config.get("sequencer_addr")?.as_str()?.to_string();
+    let storage: Value =
+        serde_json::from_slice(&tokio::fs::read(&paths.storage).await.ok()?).ok()?;
+    let mut ids = BTreeSet::new();
+    for account in storage.pointer("/key_chain/accounts")?.as_array()? {
+        let entry = account.get("Public").or_else(|| account.get("Private"))?;
+        let b58 = entry.get("account_id")?.as_str()?;
+        ids.insert(guard::public_account_hex(&format!("Public/{b58}")).ok()?);
+    }
+    Some((sequencer, ids))
+}
+
 /// The account ids in a `list_accounts` reply, for telling wallets apart.
 fn account_ids(accounts: &[Value]) -> BTreeSet<String> {
     accounts
@@ -1186,7 +1203,21 @@ impl LogosServer {
         if !addr.is_empty() {
             let accounts = self.list_accounts().await?;
             let ids = account_ids(&accounts);
-            let is_agent = agent_accounts.as_ref().is_some_and(|known| *known == ids);
+            let remembered = agent_accounts.as_ref().is_some_and(|known| *known == ids);
+            // The configured wallet itself, found open: this server restarted, or
+            // a devnet session opened it. Exactly its accounts on its sequencer
+            // means the same wallet; anything else, such as Basecamp's, stays untrusted.
+            let is_agent = remembered
+                || configured_wallet(paths)
+                    .await
+                    .is_some_and(|(sequencer, known)| {
+                        !known.is_empty()
+                            && known == ids
+                            && sequencer.trim_end_matches('/') == addr.trim_end_matches('/')
+                    });
+            if is_agent {
+                *agent_accounts = Some(ids.clone());
+            }
             return Ok(WalletHandle {
                 sequencer: addr,
                 opened_now: false,
