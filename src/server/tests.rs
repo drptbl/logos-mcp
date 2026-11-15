@@ -166,6 +166,7 @@ async fn storage_tools_refuse_without_files_root_or_outside_it() {
             cid: "zAbc".into(),
             path: "/tmp/x".into(),
             private: None,
+            max_bytes: None,
         }))
         .await
         .unwrap();
@@ -346,11 +347,15 @@ async fn wallet_status_opens_the_configured_wallet_when_none_is_open() {
 #[tokio::test]
 async fn wallet_accounts_lists_addresses_and_balances() {
     let fake = FakeRunner::with(vec![
+        lez("get_sequencer_addr", r#""""#),
+        daemon_status(80675, 300),
+        lez("open", "0"),
         lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
         lez(
             "list_accounts",
             r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f","is_public":true},{"account_id":"8126abb4eb9f0a26919bf51a57244a6b7d3a39811e6393c1885f9e07aa32fec1","is_public":false}]"#,
         ),
+        daemon_status(80675, 301),
         lez("get_balance", r#""250""#),
         // lez_core reports a failed balance read as an empty string.
         lez("get_balance", r#""""#),
@@ -376,20 +381,14 @@ async fn wallet_accounts_lists_addresses_and_balances() {
     );
     let calls = fake.calls.lock().unwrap();
     assert_eq!(
-        calls[2][4..],
+        calls[6][4..],
         [
             "str:e9ce8b81376428e3fb1a8192026027ac25dc68bfafb100c82e6107f068c8213f",
             "true"
         ]
     );
-    assert_eq!(calls[3][5], "false", "private balances are read as private");
-    assert_eq!(calls.len(), 4, "addresses are encoded locally");
-    assert!(
-        calls
-            .iter()
-            .all(|c| c.get(3).map(String::as_str) != Some("open")),
-        "an already open wallet is not reopened"
-    );
+    assert_eq!(calls[7][5], "false", "private balances are read as private");
+    assert_eq!(calls.len(), 8, "addresses are encoded locally");
 }
 
 #[tokio::test]
@@ -2991,11 +2990,9 @@ fn wallet_server_in(fake: Arc<FakeRunner>, dir: &std::path::Path) -> LogosServer
 }
 
 fn one_public_account() -> Arc<FakeRunner> {
-    FakeRunner::with(vec![
-        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
-        lez("list_accounts", AGENT_ACCOUNTS),
-        lez("get_balance", r#""250""#),
-    ])
+    let mut replies = opened_by_server();
+    replies.push(lez("get_balance", r#""250""#));
+    FakeRunner::with(replies)
 }
 
 #[tokio::test]
@@ -3278,3 +3275,4 @@ fn a_transfer_answered_as_the_wait_ends_is_reported_as_answered() {
     let r = approval_reply(Decision::Waiting, false, "r6", sent).unwrap();
     assert_eq!(body(&r)["status"], "awaiting_approval");
 }
+mod hardening;

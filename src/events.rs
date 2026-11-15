@@ -40,7 +40,9 @@ pub struct ReceivedMessage {
     pub topic: String,
     /// The payload as text when it is valid UTF-8.
     pub text: Option<String>,
-    pub payload_base64: String,
+    /// The payload, only when it isn't text: never sent twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_base64: Option<String>,
     pub source: String,
     pub timestamp_ns: Option<i64>,
 }
@@ -75,6 +77,21 @@ struct Inner {
     transfer_order: VecDeque<String>,
     next_chain_seq: u64,
     lib_blocks: VecDeque<ChainBlock>,
+    /// The newest seq dropped from each topic's buffer, to tell a reader it missed some.
+    dropped_upto: HashMap<String, u64>,
+    chain_dropped_upto: u64,
+}
+
+/// Where a reader's `after` stands against what this store holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    /// Nothing between `after` and what is held was lost.
+    Fine,
+    /// `after` is beyond anything this store has handed out: the server
+    /// restarted and its seqs began again.
+    Restarted,
+    /// Items after `after` were dropped from the buffer before being read.
+    Dropped,
 }
 
 #[derive(Default)]
@@ -164,15 +181,21 @@ impl EventStore {
                     seq: s.next_seq,
                     hash,
                     text: String::from_utf8(payload.clone()).ok(),
-                    payload_base64: base64::engine::general_purpose::STANDARD.encode(&payload),
+                    payload_base64: String::from_utf8(payload.clone())
+                        .is_err()
+                        .then(|| base64::engine::general_purpose::STANDARD.encode(&payload)),
                     source: arg_str(data, 3).unwrap_or_default(),
                     timestamp_ns: arg(data, 4).and_then(Value::as_i64),
                     topic: topic.clone(),
                 };
-                let q = s.topics.entry(topic).or_default();
+                let q = s.topics.entry(topic.clone()).or_default();
                 q.push_back(msg);
+                let mut dropped = None;
                 while q.len() > MAX_MESSAGES_PER_TOPIC {
-                    q.pop_front();
+                    dropped = q.pop_front().map(|m| m.seq);
+                }
+                if let Some(seq) = dropped {
+                    s.dropped_upto.insert(topic, seq);
                 }
             }
             "messageQueued" | "messageSent" | "messagePropagated" | "messageError" => {
@@ -210,7 +233,9 @@ impl EventStore {
                 };
                 s.lib_blocks.push_back(block);
                 while s.lib_blocks.len() > MAX_CHAIN_EVENTS {
-                    s.lib_blocks.pop_front();
+                    if let Some(gone) = s.lib_blocks.pop_front() {
+                        s.chain_dropped_upto = gone.seq;
+                    }
                 }
             }
             "storageUploadProgress"
@@ -294,10 +319,25 @@ impl EventStore {
         };
     }
 
-    /// Messages on `topic` with `seq > after`, oldest first, at most `limit`.
-    pub fn read(&self, topic: &str, after: u64, limit: usize) -> Vec<ReceivedMessage> {
+    /// Messages on `topic` with `seq > after`, oldest first, at most `limit`,
+    /// with where `after` stood: from the start again when it predates a
+    /// restart. Checked and read in one step, so no drop slips between them.
+    pub fn read(&self, topic: &str, after: u64, limit: usize) -> (Cursor, Vec<ReceivedMessage>) {
         let s = self.inner.lock().unwrap();
-        s.topics
+        let cursor = if after > s.next_seq {
+            Cursor::Restarted
+        } else if s.dropped_upto.get(topic).is_some_and(|d| after < *d) {
+            Cursor::Dropped
+        } else {
+            Cursor::Fine
+        };
+        let after = if cursor == Cursor::Restarted {
+            0
+        } else {
+            after
+        };
+        let messages = s
+            .topics
             .get(topic)
             .map(|q| {
                 q.iter()
@@ -306,22 +346,47 @@ impl EventStore {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (cursor, messages)
     }
 
-    /// Finalized chain tips with `seq > after`, oldest first, at most `limit`.
-    pub fn lib_blocks(&self, after: u64, limit: usize) -> Vec<ChainBlock> {
+    /// Finalized chain tips with `seq > after`, oldest first, at most `limit`,
+    /// with where `after` stood, as `read` does for messages.
+    pub fn lib_blocks(&self, after: u64, limit: usize) -> (Cursor, Vec<ChainBlock>) {
         let s = self.inner.lock().unwrap();
-        s.lib_blocks
+        let cursor = if after > s.next_chain_seq {
+            Cursor::Restarted
+        } else if after < s.chain_dropped_upto {
+            Cursor::Dropped
+        } else {
+            Cursor::Fine
+        };
+        let after = if cursor == Cursor::Restarted {
+            0
+        } else {
+            after
+        };
+        let blocks = s
+            .lib_blocks
             .iter()
             .filter(|b| b.seq > after)
             .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        (cursor, blocks)
     }
 
     pub fn send_status(&self, request_id: &str) -> Option<SendStatus> {
         self.inner.lock().unwrap().sends.get(request_id).cloned()
+    }
+
+    /// Settle a transfer this server stopped, so it never reads as a success.
+    pub fn stop_transfer(&self, session_id: &str, error: String) {
+        if let Some(t) = self.inner.lock().unwrap().transfers.get_mut(session_id) {
+            t.done = true;
+            t.success = Some(false);
+            t.error = Some(error);
+        }
     }
 
     pub fn transfer(&self, session_id: &str) -> Option<Transfer> {

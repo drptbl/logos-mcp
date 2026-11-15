@@ -10,7 +10,7 @@ const CONNECTED: &str = r#"{"data":{"arg0":"Connected","arg1":179397892380540500
 fn stores_received_message_with_decoded_text() {
     let s = EventStore::default();
     s.ingest_line(RECEIVED);
-    let msgs = s.read("/logos-mcp/1/smoke/proto", 0, 10);
+    let msgs = s.read("/logos-mcp/1/smoke/proto", 0, 10).1;
     assert_eq!(msgs.len(), 1);
     assert_eq!(
         msgs[0].text.as_deref(),
@@ -18,7 +18,7 @@ fn stores_received_message_with_decoded_text() {
     );
     assert_eq!(msgs[0].source, "live");
     assert_eq!(msgs[0].seq, 1);
-    assert!(s.read("/other/1/topic/proto", 0, 10).is_empty());
+    assert!(s.read("/other/1/topic/proto", 0, 10).1.is_empty());
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn duplicate_deliveries_of_one_message_are_stored_once() {
     s.ingest_line(RECEIVED);
     s.ingest_line(RECEIVED);
     s.ingest_line(RECEIVED);
-    assert_eq!(s.read("/logos-mcp/1/smoke/proto", 0, 10).len(), 1);
+    assert_eq!(s.read("/logos-mcp/1/smoke/proto", 0, 10).1.len(), 1);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn ignores_garbage_and_unrelated_events() {
     s.ingest_line(r#"{"event":"messageReceived"}"#);
     s.ingest_line(r#"{"event":"messageReceived","data":{"arg0":"0x1"}}"#);
     s.ingest_line(CONNECTED);
-    assert!(s.read("/logos-mcp/1/smoke/proto", 0, 10).is_empty());
+    assert!(s.read("/logos-mcp/1/smoke/proto", 0, 10).1.is_empty());
 }
 
 #[test]
@@ -69,10 +69,10 @@ fn read_cursor_and_ring_buffer_bound() {
     for i in 0..(MAX_MESSAGES_PER_TOPIC + 10) {
         s.ingest_line(&RECEIVED.replace("0xe662", &format!("0x{i:04}")));
     }
-    let all = s.read("/logos-mcp/1/smoke/proto", 0, usize::MAX);
+    let all = s.read("/logos-mcp/1/smoke/proto", 0, usize::MAX).1;
     assert_eq!(all.len(), MAX_MESSAGES_PER_TOPIC);
     assert_eq!(all[0].seq, 11, "oldest entries are evicted first");
-    let after = s.read("/logos-mcp/1/smoke/proto", all[100].seq, 5);
+    let after = s.read("/logos-mcp/1/smoke/proto", all[100].seq, 5).1;
     assert_eq!(after.len(), 5);
     assert_eq!(after[0].seq, all[101].seq);
 }
@@ -125,7 +125,7 @@ fn in_process_events_are_accepted_with_named_or_positional_args() {
         "messageReceived",
         &serde_json::json!(["0xbb", "/a/1/b/proto", {"_bytes": "aGk"}, "live", 2]),
     );
-    let got = s.read("/a/1/b/proto", 0, 10);
+    let got = s.read("/a/1/b/proto", 0, 10).1;
     assert_eq!(got.len(), 2);
     assert_eq!(got[1].hash, "0xbb");
     assert_eq!(got[1].text.as_deref(), Some("hi"));

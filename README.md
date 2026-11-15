@@ -24,9 +24,9 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chat_send` | sends a message into a conversation. There is no delivery receipt |
 | `chat_read` | a conversation's messages, paged with `after`, or every conversation, newest first |
 | `wallet_status` | whether the agent wallet is open and the agent may use it, its sequencer, the chain height and the last block its private accounts synced |
-| `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts |
+| `wallet_accounts` | the wallet's accounts with their addresses, balances in lepta and which are agent accounts; none when the open wallet isn't the agent's |
 | `wallet_account` | one public account's balance, nonce and the program data it holds |
-| `wallet_labels` | the account behind a label, or an account's labels |
+| `wallet_labels` | the account behind a label, or an account's labels, in the agent's wallet only |
 | `wallet_tx_status` | whether a LEZ transaction is in a block yet, answered at once by the wallet's sequencer |
 | `wallet_faucet` | asks the LEZ testnet faucet for its drop, 0.1 LEZ once a day, into one of the agent's own public accounts. Needs Basecamp's LEZ Faucet module |
 | `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app |
@@ -47,7 +47,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
 | `storage_exists` | whether a CID is in local storage |
-| `storage_manifests` | the content in local storage, marking what the agent put there |
+| `storage_manifests` | the content the agent put in local storage; anything else is only counted |
 | `storage_remove` | removes content the agent uploaded or downloaded fresh. The rest of local storage is left alone |
 | `storage_space` | local storage quota and usage |
 
