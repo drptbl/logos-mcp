@@ -380,6 +380,15 @@ impl EventStore {
         self.inner.lock().unwrap().sends.get(request_id).cloned()
     }
 
+    /// Settle a transfer this server stopped, so it never reads as a success.
+    pub fn stop_transfer(&self, session_id: &str, error: String) {
+        if let Some(t) = self.inner.lock().unwrap().transfers.get_mut(session_id) {
+            t.done = true;
+            t.success = Some(false);
+            t.error = Some(error);
+        }
+    }
+
     pub fn transfer(&self, session_id: &str) -> Option<Transfer> {
         self.inner
             .lock()

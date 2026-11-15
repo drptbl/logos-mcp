@@ -4201,6 +4201,7 @@ impl LogosServer {
                 }
             };
             tracing::warn!("the agent's download of {cid}: {why}");
+            server.events.stop_transfer(&session, why);
         });
     }
 

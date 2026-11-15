@@ -467,6 +467,16 @@ async fn balances_are_read_a_few_at_a_time() {
     assert!((2..=8).contains(&most), "{most} balance reads at once");
 }
 
+async fn status(s: &LogosServer) -> Value {
+    body(
+        &s.storage_transfer_status(Parameters(SessionParams {
+            session_id: CID.into(),
+        }))
+        .await
+        .unwrap(),
+    )
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_finished_download_over_its_cap_is_removed_without_a_cancel() {
     // Done already: a cancel by CID could only hit someone else's new download.
@@ -486,6 +496,33 @@ async fn a_finished_download_over_its_cap_is_removed_without_a_cancel() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(!dir.path().join("in.bin").exists());
     assert!(!called(&fake, "downloadCancel"));
+    let b = status(&s).await;
+    assert_eq!(
+        b["success"], false,
+        "a removed download never reads as a success: {b}"
+    );
+    assert!(b["error"].as_str().unwrap().contains("cap"), "{b}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_stopped_at_its_cap_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+    ]);
+    let (s, events) = files_server(fake, dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 65536, "total": 5_000_000, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let b = status(&s).await;
+    assert_eq!(b["done"], true, "{b}");
+    assert_eq!(b["success"], false, "{b}");
 }
 
 #[tokio::test(start_paused = true)]
