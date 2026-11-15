@@ -3278,3 +3278,4 @@ fn a_transfer_answered_as_the_wait_ends_is_reported_as_answered() {
     let r = approval_reply(Decision::Waiting, false, "r6", sent).unwrap();
     assert_eq!(body(&r)["status"], "awaiting_approval");
 }
+mod hardening;
