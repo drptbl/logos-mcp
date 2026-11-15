@@ -521,8 +521,8 @@ async fn storage_manifests_lists_only_the_agents_own_content() {
 async fn polling_someone_elses_upload_never_makes_it_the_agents() {
     // In Basecamp the event store sees every upload, the user's too.
     let dir = tempfile::tempdir().unwrap();
+    // Its CID is the user's business: the agent hears of no such session.
     let (s, events) = storage_server(FakeRunner::with(vec![]), dir.path());
-    events.expect_transfer("users-session", "upload");
     emit(
         &events,
         "storageUploadDone",
@@ -534,7 +534,9 @@ async fn polling_someone_elses_upload_never_makes_it_the_agents() {
         }))
         .await
         .unwrap();
-    assert!(!is_error(&r), "{}", text(&r));
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("unknown session"), "{}", text(&r));
+    assert!(!text(&r).contains(CID), "{}", text(&r));
     assert!(!s.is_own_cid(CID).unwrap());
 }
 

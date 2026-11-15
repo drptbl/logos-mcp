@@ -45,7 +45,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chain_block` / `chain_transaction` | a chain block and its transactions by its header id, or a transaction still waiting in the mempool by its hash. The node finds a mined transaction only through its block |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
-| `storage_transfer_status` | progress and result of an upload or download |
+| `storage_transfer_status` | progress and result of an upload or download the agent started |
 | `storage_exists` | whether a CID is in local storage |
 | `storage_manifests` | the content the agent put in local storage; anything else is only counted |
 | `storage_remove` | removes content the agent uploaded or downloaded fresh. The rest of local storage is left alone |
