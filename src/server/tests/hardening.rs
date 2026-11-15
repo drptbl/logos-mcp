@@ -466,3 +466,55 @@ async fn balances_are_read_a_few_at_a_time() {
     let most = lez_core.most.load(std::sync::atomic::Ordering::SeqCst);
     assert!((2..=8).contains(&most), "{most} balance reads at once");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_download_over_its_cap_is_removed_without_a_cancel() {
+    // Done already: a cancel by CID could only hit someone else's new download.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    std::fs::write(dir.path().join("in.bin"), vec![1u8; 5_000]).unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!dir.path().join("in.bin").exists());
+    assert!(!called(&fake, "downloadCancel"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_followed_download_holds_its_cid_and_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(None)).await.unwrap();
+    let again = s.storage_download(download(None)).await.unwrap();
+    assert!(is_error(&again), "{}", text(&again));
+    let other_file = s
+        .download_to(CID, "other.bin", None, std::time::Duration::from_secs(5))
+        .await;
+    assert!(other_file.is_err(), "{other_file:?}");
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        2,
+        "nothing else reached the node"
+    );
+    // Once it finishes, the CID is free again.
+    std::fs::write(dir.path().join("in.bin"), b"ok").unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(s.downloads.lock().unwrap().is_empty());
+}

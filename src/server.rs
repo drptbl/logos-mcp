@@ -238,6 +238,16 @@ impl DownloadGuard {
         left
     }
 
+    /// Remove the file of a transfer that already finished, with no cancel: by
+    /// CID it could only reach someone else's new download. Releases the
+    /// reservation and says whether the file is gone.
+    fn remove_finished(&mut self) -> bool {
+        self.done = true;
+        let removed = remove_inside(&self.server, &self.full);
+        self.release();
+        removed
+    }
+
     fn release(&self) {
         let mut held = self
             .server
@@ -286,17 +296,7 @@ async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path) -> Strin
         .await
         .is_ok()
         || server.events.transfer(cid).is_some_and(|t| t.done);
-    let inside = server.files.as_ref().is_some_and(|root| {
-        full.parent()
-            .and_then(|p| p.canonicalize().ok())
-            .is_some_and(|p| p.starts_with(root.path()))
-    });
-    let removed = inside
-        && match std::fs::remove_file(full) {
-            Ok(()) => true,
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        };
-    match (cancelled, removed) {
+    match (cancelled, remove_inside(server, full)) {
         (true, true) => "nothing was kept".into(),
         (false, true) => format!(
             "it could not be cancelled, so {} may still be written",
@@ -304,6 +304,21 @@ async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path) -> Strin
         ),
         (_, false) => format!("{} could not be removed", full.display()),
     }
+}
+
+/// Remove `full`, but only while its folder still resolves inside the files
+/// root. True when it is gone.
+fn remove_inside(server: &LogosServer, full: &Path) -> bool {
+    let inside = server.files.as_ref().is_some_and(|root| {
+        full.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| p.starts_with(root.path()))
+    });
+    inside
+        && match std::fs::remove_file(full) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
 }
 
 /// The dedicated wallet this server opened or adopted: the sequencer it was on
@@ -3984,27 +3999,30 @@ impl LogosServer {
         &self,
         Parameters(p): Parameters<DownloadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let busy = self
-            .downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&format!("cid:{}", p.cid));
-        if busy {
-            return fail(format!(
-                "{} is being downloaded already: wait for it to finish",
-                p.cid
-            ));
-        }
+        // Held until the follower is done with it, so no other download of this
+        // CID, or into this file, shares the transfer it may stop.
+        let running = match guard::validate_cid(&p.cid)
+            .and_then(|()| self.files()?.new_file(&p.path))
+            .and_then(|full| self.reserve_download(&p.cid, &full))
+        {
+            Ok(running) => running,
+            Err(e) => return fail(e),
+        };
         match self
             .start_download(&p.cid, &p.path, p.private.unwrap_or(false))
             .await
         {
-            Ok((session, full, held)) => {
+            Ok((session, _, held)) => {
                 let cap = p.max_bytes.unwrap_or(DEFAULT_DOWNLOAD_CAP);
-                self.follow_download(session.clone(), p.cid.clone(), full, cap, held);
+                self.follow_download(session.clone(), running, cap, held);
                 ok(json!({ "session_id": session, "path": p.path, "max_bytes": cap }))
             }
-            Err(e) => fail(e),
+            Err(e) => {
+                // The module may have started it all the same: stop it and clean up.
+                let mut running = running;
+                running.cancel_and_remove().await;
+                fail(e)
+            }
         }
     }
 
@@ -4140,9 +4158,10 @@ impl LogosServer {
     /// Follow an agent's download in the background: stop and remove it once
     /// it is over `cap`, and record it as the agent's when it finishes, unless
     /// local storage held the content already.
-    fn follow_download(&self, session: String, cid: String, full: PathBuf, cap: u64, held: bool) {
+    fn follow_download(&self, session: String, mut running: DownloadGuard, cap: u64, held: bool) {
         let server = self.clone();
         tokio::spawn(async move {
+            let cid = running.cid.clone();
             let over_cap = |t: &crate::events::Transfer| {
                 let size = t.total.into_iter().chain(t.bytes).max()?;
                 (size > cap).then(|| format!("{size} bytes, over the {cap} byte cap"))
@@ -4150,22 +4169,38 @@ impl LogosServer {
             let done = server
                 .await_transfer(&session, DOWNLOAD_FOLLOW, over_cap)
                 .await;
-            let too_big = match done {
-                Ok(t) if t.success == Some(true) => {
-                    std::fs::metadata(&full).is_ok_and(|m| m.len() > cap)
+            let why = match done {
+                Ok(t) if t.success == Some(true) => match std::fs::metadata(&running.full) {
+                    Ok(m) if m.len() > cap => {
+                        let size = m.len();
+                        let removed = running.remove_finished();
+                        format!(
+                            "{size} bytes, over the {cap} byte cap: {}",
+                            if removed {
+                                "removed"
+                            } else {
+                                "could not be removed"
+                            }
+                        )
+                    }
+                    _ => {
+                        running.keep();
+                        if !held && let Err(e) = server.remember_cid(&cid, "download") {
+                            tracing::warn!("could not record the agent's download {cid}: {e}");
+                        }
+                        return;
+                    }
+                },
+                Err(why) if why.contains("byte cap") => {
+                    format!("{why}: stopped, {}", running.cancel_and_remove().await)
                 }
-                Ok(_) => return,
-                // Over the cap; one still running after a day is left alone.
-                Err(why) => why.contains("byte cap"),
+                // Failed, or still running after a day: left as it is.
+                _ => {
+                    running.keep();
+                    return;
+                }
             };
-            if too_big {
-                let left = cleanup_download(&server, &cid, &full).await;
-                tracing::warn!("stopped the agent's download of {cid}: over {cap} bytes; {left}");
-                return;
-            }
-            if !held && let Err(e) = server.remember_cid(&cid, "download") {
-                tracing::warn!("could not record the agent's download {cid}: {e}");
-            }
+            tracing::warn!("the agent's download of {cid}: {why}");
         });
     }
 
