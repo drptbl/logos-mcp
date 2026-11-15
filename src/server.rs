@@ -607,6 +607,10 @@ pub struct DownloadParams {
 /// The size cap on an agent's download when it names none: 1 GiB.
 pub const DEFAULT_DOWNLOAD_CAP: u64 = 1 << 30;
 
+/// How long an agent's download is followed to keep it under its cap: a
+/// private one over the mixnet can take hours.
+const DOWNLOAD_FOLLOW: Duration = Duration::from_secs(24 * 3600);
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionParams {
     /// Session id returned by storage_upload or storage_download.
@@ -4114,9 +4118,6 @@ impl LogosServer {
         Ok(())
     }
 
-    /// Once a transfer this server started succeeds, record its content as the
-    /// agent's: an upload's CID from the transfer, a download's given. Waits up
-    /// to an hour in the background.
     /// Follow an agent's download in the background: stop and remove it once
     /// it is over `cap`, and record it as the agent's when it finishes, unless
     /// local storage held the content already.
@@ -4128,14 +4129,14 @@ impl LogosServer {
                 (size > cap).then(|| format!("{size} bytes, over the {cap} byte cap"))
             };
             let done = server
-                .await_transfer(&session, std::time::Duration::from_secs(3600), over_cap)
+                .await_transfer(&session, DOWNLOAD_FOLLOW, over_cap)
                 .await;
             let too_big = match done {
                 Ok(t) if t.success == Some(true) => {
                     std::fs::metadata(&full).is_ok_and(|m| m.len() > cap)
                 }
                 Ok(_) => return,
-                // Over the cap; a download still running after an hour is left alone.
+                // Over the cap; one still running after a day is left alone.
                 Err(why) => why.contains("byte cap"),
             };
             if too_big {

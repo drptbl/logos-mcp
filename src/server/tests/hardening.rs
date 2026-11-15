@@ -396,3 +396,23 @@ fn every_tool_tells_clients_whether_it_changes_anything() {
     assert_eq!(hint("messaging_send").destructive_hint, Some(false));
     assert_eq!(hint("messaging_send").idempotent_hint, Some(false));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_download_is_still_capped_hours_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await;
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 5_000, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(called(&fake, "downloadCancel"));
+}
