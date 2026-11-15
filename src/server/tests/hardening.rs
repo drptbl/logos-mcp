@@ -416,3 +416,53 @@ async fn a_slow_download_is_still_capped_hours_later() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(called(&fake, "downloadCancel"));
 }
+
+/// lez_core answering balances slowly, counting how many it answers at once.
+#[derive(Default)]
+struct SlowBalances {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::logosctl::Runner for SlowBalances {
+    fn run(&self, args: Vec<String>) -> crate::logosctl::RunFuture<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        Box::pin(async move {
+            if args[1] == "status" {
+                return Ok(daemon_status(1, 10));
+            }
+            let accounts: Vec<Value> = (0..40)
+                .map(|i| json!({ "account_id": format!("{i:064x}"), "is_public": true }))
+                .collect();
+            let result = match args[3].as_str() {
+                "get_sequencer_addr" => r#""https://testnet.lez.logos.co/""#.to_string(),
+                "list_accounts" => Value::Array(accounts).to_string(),
+                "get_balance" => {
+                    let now = self.now.fetch_add(1, SeqCst) + 1;
+                    self.most.fetch_max(now, SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    self.now.fetch_sub(1, SeqCst);
+                    r#""1""#.to_string()
+                }
+                other => panic!("unexpected call {other}"),
+            };
+            Ok(lez(&args[3], &result))
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn balances_are_read_a_few_at_a_time() {
+    let lez_core = Arc::new(SlowBalances::default());
+    let s = LogosServer::new(
+        Arc::new(Logosctl::new(lez_core.clone())),
+        Arc::new(EventStore::default()),
+        None,
+        wallet_server(FakeRunner::with(vec![])).settings.clone(),
+    );
+    let listed = s.list_wallet_accounts(true).await.unwrap();
+    assert_eq!(listed["accounts"].as_array().unwrap().len(), 40);
+    assert_eq!(listed["accounts"][39]["balance_lepta"], "1");
+    let most = lez_core.most.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((2..=8).contains(&most), "{most} balance reads at once");
+}

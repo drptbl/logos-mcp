@@ -611,6 +611,10 @@ pub const DEFAULT_DOWNLOAD_CAP: u64 = 1 << 30;
 /// private one over the mixnet can take hours.
 const DOWNLOAD_FOLLOW: Duration = Duration::from_secs(24 * 3600);
 
+/// The most balance reads run at once: a provider's wallet gains an account
+/// per job, and each read is a logosctl process.
+const BALANCE_READS: usize = 8;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionParams {
     /// Session id returned by storage_upload or storage_download.
@@ -1752,25 +1756,38 @@ impl LogosServer {
             Ok(map) => (map, None),
             Err(e) => (std::collections::BTreeMap::new(), Some(e)),
         };
-        let mut accounts = Vec::with_capacity(w.accounts.len());
-        for entry in &w.accounts {
+        // One logosctl call per balance: read a few at a time, then put them in order.
+        let permits = Arc::new(tokio::sync::Semaphore::new(BALANCE_READS));
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, entry) in w.accounts.iter().enumerate() {
             let (Some(id), Some(public)) = (
                 entry.get("account_id").and_then(Value::as_str),
                 entry.get("is_public").and_then(Value::as_bool),
             ) else {
                 continue;
             };
+            let (server, id, permits) = (self.clone(), id.to_string(), permits.clone());
+            reads.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                // lez_core reports a failed balance read as an empty string, not an error.
+                let balance = match server
+                    .node
+                    .call(LEZ, "get_balance", &[Arg::str(&id), Arg::Bool(public)])
+                    .await
+                {
+                    Ok(Value::String(b)) if !b.is_empty() => Some(b),
+                    _ => None,
+                };
+                (index, id, public, balance)
+            });
+        }
+        let mut balances = reads.join_all().await;
+        balances.sort_by_key(|(index, ..)| *index);
+        let mut accounts = Vec::with_capacity(balances.len());
+        for (_, id, public, balance) in balances {
+            let id = id.as_str();
             let kind = if public { "Public" } else { "Private" };
             let address = guard::account_id_base58(id).map(|b58| format!("{kind}/{b58}"));
-            // lez_core reports a failed balance read as an empty string, not an error.
-            let balance = match self
-                .node
-                .call(LEZ, "get_balance", &[Arg::str(id), Arg::Bool(public)])
-                .await
-            {
-                Ok(Value::String(b)) if !b.is_empty() => Some(b),
-                _ => None,
-            };
             let note = match (&balance, public) {
                 (None, _) => Some("balance unavailable"),
                 (Some(_), false) => Some(
