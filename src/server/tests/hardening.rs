@@ -356,3 +356,43 @@ async fn labels_are_not_read_from_a_foreign_wallet() {
     assert!(text(&r).contains("refusing"), "{}", text(&r));
     assert_eq!(lez_calls(&fake, "resolve_label"), 0);
 }
+
+#[test]
+fn every_tool_tells_clients_whether_it_changes_anything() {
+    let tools = LogosServer::tool_router().list_all();
+    let hint = |name: &str| {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        tool.annotations
+            .clone()
+            .unwrap_or_else(|| panic!("{name} has no annotations"))
+    };
+    for tool in &tools {
+        let a = hint(&tool.name);
+        assert!(
+            a.read_only_hint.is_some(),
+            "{} doesn't say if it reads only",
+            tool.name
+        );
+        if a.read_only_hint == Some(false) {
+            assert!(
+                a.destructive_hint.is_some(),
+                "{} doesn't say if it destroys",
+                tool.name
+            );
+        }
+    }
+    for reads in [
+        "wallet_accounts",
+        "messaging_read",
+        "chain_info",
+        "storage_manifests",
+    ] {
+        assert_eq!(hint(reads).read_only_hint, Some(true), "{reads}");
+    }
+    for spends in ["wallet_transfer", "chain_transfer", "storage_remove"] {
+        assert_eq!(hint(spends).read_only_hint, Some(false), "{spends}");
+        assert_eq!(hint(spends).destructive_hint, Some(true), "{spends}");
+    }
+    assert_eq!(hint("messaging_send").destructive_hint, Some(false));
+    assert_eq!(hint("messaging_send").idempotent_hint, Some(false));
+}
