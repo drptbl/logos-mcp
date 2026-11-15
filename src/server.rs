@@ -1005,7 +1005,7 @@ impl LogosServer {
                     Err(SendError::NotSent(reason)) => Decision::Failed { reason },
                     Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
                 };
-                server.approvals.finish(&id, outcome);
+                server.finish_approved(&id, outcome);
                 return;
             }
             let p = TransferParams {
@@ -1024,9 +1024,28 @@ impl LogosServer {
                 Err(SendError::NotSent(reason)) => Decision::Failed { reason },
                 Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
             };
-            server.approvals.finish(&id, outcome);
+            server.finish_approved(&id, outcome);
         });
         Ok(reply)
+    }
+
+    /// Settle an approved transfer, recording its outcome next to the user's
+    /// approval first, so the activity has it by the time the agent hears.
+    fn finish_approved(&self, id: &str, outcome: Decision) {
+        let (ok, result) = match &outcome {
+            Decision::Sent { tx_hash } => (true, format!("sent: tx {tx_hash}")),
+            Decision::Failed { reason } => (false, format!("not sent: {reason}")),
+            Decision::Unknown { reason } => (false, format!("may have been sent: {reason}")),
+            // Only a send settles an approved transfer: never one of these.
+            _ => (false, "not settled".to_string()),
+        };
+        self.record_activity(
+            "transfer_outcome",
+            &json!({ "request_id": id }),
+            ok,
+            &result,
+        );
+        self.approvals.finish(id, outcome);
     }
 
     /// The user denies a waiting transfer: it is never sent.

@@ -1244,6 +1244,44 @@ async fn approved_chain_send(reply: crate::logosctl::RawOutput) -> CallToolResul
     call.await.unwrap()
 }
 
+/// Approve a chain transfer whose send gets `reply`, and return the activity it left.
+async fn approved_chain_send_activity(
+    reply: crate::logosctl::RawOutput,
+) -> Vec<crate::control::Entry> {
+    let mut replies = chain_sender_ok().to_vec();
+    replies.extend(chain_sender_ok());
+    replies.push(reply);
+    let log = Arc::new(ActivityLog::in_memory());
+    let s = hosted_server(FakeRunner::with(replies)).with_activity(log.clone());
+    let (call, id) = request_chain_transfer(&s).await;
+    s.approve_transfer(&id).await.unwrap();
+    call.await.unwrap();
+    log.since(0)
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_activity_shows_what_an_approved_transfer_did() {
+    let entries = approved_chain_send_activity(chain("wallet_transfer_funds", json!(TX))).await;
+    let last = entries.last().unwrap();
+    assert_eq!(last.tool, "transfer_outcome", "{entries:?}");
+    assert!(last.ok);
+    assert!(last.result.contains(TX), "{}", last.result);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_activity_shows_an_approved_transfer_that_may_have_gone_out() {
+    let entries =
+        approved_chain_send_activity(chain_refused("wallet_transfer_funds", "timed out")).await;
+    let last = entries.last().unwrap();
+    assert_eq!(last.tool, "transfer_outcome", "{entries:?}");
+    assert!(!last.ok);
+    assert!(
+        last.result.contains("may have been sent"),
+        "{}",
+        last.result
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_refused_chain_send_may_still_have_gone_out() {
     // The node may refuse after broadcasting, so a refusal is never "not sent".
