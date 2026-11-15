@@ -599,7 +599,13 @@ pub struct DownloadParams {
     pub path: String,
     /// Route the download over the mixnet and do not re-share the content.
     pub private: Option<bool>,
+    /// The most bytes to accept: a larger download is stopped and removed.
+    /// Defaults to 1 GiB.
+    pub max_bytes: Option<u64>,
 }
+
+/// The size cap on an agent's download when it names none: 1 GiB.
+pub const DEFAULT_DOWNLOAD_CAP: u64 = 1 << 30;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionParams {
@@ -3774,7 +3780,7 @@ impl LogosServer {
     ) -> Result<CallToolResult, McpError> {
         match self.start_upload(&p.path).await {
             Ok(session) => {
-                self.record_when_done(session.clone(), None);
+                self.record_upload_when_done(session.clone());
                 ok(json!({ "session_id": session }))
             }
             Err(e) => fail(e),
@@ -3782,7 +3788,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Download content by CID into a new file under the files root. Returns a session_id for storage_transfer_status."
+        description = "Download content by CID into a new file under the files root. Returns a session_id for storage_transfer_status. A download over max_bytes, 1 GiB unless given, is stopped and removed."
     )]
     async fn storage_download(
         &self,
@@ -3803,11 +3809,10 @@ impl LogosServer {
             .start_download(&p.cid, &p.path, p.private.unwrap_or(false))
             .await
         {
-            Ok((session, _, held)) => {
-                if !held {
-                    self.record_when_done(session.clone(), Some(p.cid.clone()));
-                }
-                ok(json!({ "session_id": session, "path": p.path }))
+            Ok((session, full, held)) => {
+                let cap = p.max_bytes.unwrap_or(DEFAULT_DOWNLOAD_CAP);
+                self.follow_download(session.clone(), p.cid.clone(), full, cap, held);
+                ok(json!({ "session_id": session, "path": p.path, "max_bytes": cap }))
             }
             Err(e) => fail(e),
         }
@@ -3940,25 +3945,51 @@ impl LogosServer {
     /// Once a transfer this server started succeeds, record its content as the
     /// agent's: an upload's CID from the transfer, a download's given. Waits up
     /// to an hour in the background.
-    fn record_when_done(&self, session: String, download_cid: Option<String>) {
+    /// Follow an agent's download in the background: stop and remove it once
+    /// it is over `cap`, and record it as the agent's when it finishes, unless
+    /// local storage held the content already.
+    fn follow_download(&self, session: String, cid: String, full: PathBuf, cap: u64, held: bool) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let over_cap = |t: &crate::events::Transfer| {
+                let size = t.total.into_iter().chain(t.bytes).max()?;
+                (size > cap).then(|| format!("{size} bytes, over the {cap} byte cap"))
+            };
+            let done = server
+                .await_transfer(&session, std::time::Duration::from_secs(3600), over_cap)
+                .await;
+            let too_big = match done {
+                Ok(t) if t.success == Some(true) => {
+                    std::fs::metadata(&full).is_ok_and(|m| m.len() > cap)
+                }
+                Ok(_) => return,
+                // Over the cap; a download still running after an hour is left alone.
+                Err(why) => why.contains("byte cap"),
+            };
+            if too_big {
+                let left = cleanup_download(&server, &cid, &full).await;
+                tracing::warn!("stopped the agent's download of {cid}: over {cap} bytes; {left}");
+                return;
+            }
+            if !held && let Err(e) = server.remember_cid(&cid, "download") {
+                tracing::warn!("could not record the agent's download {cid}: {e}");
+            }
+        });
+    }
+
+    /// Record an agent's upload as its own once it finishes.
+    fn record_upload_when_done(&self, session: String) {
         let server = self.clone();
         tokio::spawn(async move {
             let done = server
                 .await_transfer(&session, std::time::Duration::from_secs(3600), |_| None)
                 .await;
             let Ok(t) = done else { return };
-            if t.success != Some(true) {
+            let (Some(true), Some(cid)) = (t.success, t.cid) else {
                 return;
-            }
-            let (cid, via) = match download_cid {
-                Some(cid) => (cid, "download"),
-                None => match t.cid {
-                    Some(cid) => (cid, "upload"),
-                    None => return,
-                },
             };
-            if let Err(e) = server.remember_cid(&cid, via) {
-                tracing::warn!("could not record the agent's {via} {cid}: {e}");
+            if let Err(e) = server.remember_cid(&cid, "upload") {
+                tracing::warn!("could not record the agent's upload {cid}: {e}");
             }
         });
     }

@@ -166,6 +166,7 @@ async fn storage_tools_refuse_without_files_root_or_outside_it() {
             cid: "zAbc".into(),
             path: "/tmp/x".into(),
             private: None,
+            max_bytes: None,
         }))
         .await
         .unwrap();

@@ -342,6 +342,7 @@ async fn the_download_tool_leaves_a_running_download_to_alone() {
             cid: CID.into(),
             path: "other.bin".into(),
             private: None,
+            max_bytes: None,
         }))
         .await
         .unwrap();
@@ -558,6 +559,7 @@ async fn a_failed_download_never_becomes_the_agents() {
             cid: CID.into(),
             path: "in.bin".into(),
             private: None,
+            max_bytes: None,
         }))
         .await
         .unwrap();
