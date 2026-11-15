@@ -3573,8 +3573,22 @@ impl LogosServer {
     }
 
     /// Start uploading `path`, relative to the files root. Returns the session id.
-    async fn start_upload(&self, path: &str) -> Result<String, String> {
+    /// Start uploading `path`. Also returns the CIDs local storage held just
+    /// before, so identical content already there is never claimed as the
+    /// agent's; `None` when they couldn't be listed.
+    async fn start_upload(&self, path: &str) -> Result<(String, Option<BTreeSet<String>>), String> {
         let path = self.files()?.existing_file(path)?;
+        let held = match self.manifests().await {
+            Ok(list) => Some(
+                list.iter()
+                    .filter_map(|m| m["cid"].as_str().map(str::to_string))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!("could not list local storage before an upload: {e}");
+                None
+            }
+        };
         let args = [
             Arg::str(path.display().to_string()),
             Arg::Int(CHUNK_SIZE),
@@ -3583,7 +3597,7 @@ impl LogosServer {
         match self.node.call(STORAGE, "uploadUrl", &args).await {
             Ok(Value::String(session)) => {
                 self.events.expect_transfer(&session, "upload");
-                Ok(session)
+                Ok((session, held))
             }
             Ok(other) => Err(format!("unexpected uploadUrl result: {other}")),
             Err(e) => Err(e.to_string()),
@@ -3656,16 +3670,13 @@ impl LogosServer {
     /// upload that outlasts `timeout` is cancelled. Needs the storage events,
     /// which the standalone server and Basecamp's module both watch.
     pub async fn upload_file(&self, path: &str, timeout: Duration) -> Result<String, String> {
-        let session = self.start_upload(path).await?;
+        let (session, held) = self.start_upload(path).await?;
         match self.await_transfer(&session, timeout, |_| None).await {
             Ok(t) if t.success == Some(true) => {
                 let cid = t
                     .cid
                     .ok_or_else(|| "the upload finished without a CID".to_string())?;
-                // Unrecorded, it only can't be removed later: never fail the upload for it.
-                if let Err(e) = self.remember_cid(&cid, "upload") {
-                    tracing::warn!("could not record the agent's upload {cid}: {e}");
-                }
+                self.record_upload(&cid, held.as_ref());
                 Ok(cid)
             }
             Ok(t) => Err(format!(
@@ -3779,8 +3790,8 @@ impl LogosServer {
         Parameters(p): Parameters<UploadParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.start_upload(&p.path).await {
-            Ok(session) => {
-                self.record_upload_when_done(session.clone());
+            Ok((session, held)) => {
+                self.record_upload_when_done(session.clone(), held);
                 ok(json!({ "session_id": session }))
             }
             Err(e) => fail(e),
@@ -3837,12 +3848,9 @@ impl LogosServer {
         description = "Content this agent put in local storage, which it may remove: CID, size in bytes, file name and type. Other content is only counted, in others."
     )]
     async fn storage_manifests(&self) -> Result<CallToolResult, McpError> {
-        let listed = match self.node.call(STORAGE, "manifests", &[]).await {
-            Ok(v) => embedded_json(v),
-            Err(e) => return logos_fail(e),
-        };
-        let Value::Array(list) = listed else {
-            return fail(format!("unexpected manifests reply: {listed}"));
+        let list = match self.manifests().await {
+            Ok(list) => list,
+            Err(e) => return fail(e),
         };
         // In Basecamp local storage is the user's too: their content is only counted.
         let own = self.own_cid_set();
@@ -3979,20 +3987,43 @@ impl LogosServer {
     }
 
     /// Record an agent's upload as its own once it finishes.
-    fn record_upload_when_done(&self, session: String) {
+    fn record_upload_when_done(&self, session: String, held: Option<BTreeSet<String>>) {
         let server = self.clone();
         tokio::spawn(async move {
             let done = server
                 .await_transfer(&session, std::time::Duration::from_secs(3600), |_| None)
                 .await;
             let Ok(t) = done else { return };
-            let (Some(true), Some(cid)) = (t.success, t.cid) else {
-                return;
-            };
-            if let Err(e) = server.remember_cid(&cid, "upload") {
-                tracing::warn!("could not record the agent's upload {cid}: {e}");
+            if let (Some(true), Some(cid)) = (t.success, t.cid) {
+                server.record_upload(&cid, held.as_ref());
             }
         });
+    }
+
+    /// Record an uploaded CID as the agent's, unless local storage held it
+    /// before the upload or what it held is unknown. Unrecorded, it only can't
+    /// be removed later, so a failure never fails the upload.
+    fn record_upload(&self, cid: &str, held: Option<&BTreeSet<String>>) {
+        if !held.is_some_and(|held| !held.contains(cid)) {
+            return;
+        }
+        if let Err(e) = self.remember_cid(cid, "upload") {
+            tracing::warn!("could not record the agent's upload {cid}: {e}");
+        }
+    }
+
+    /// What local storage holds, one manifest per content.
+    async fn manifests(&self) -> Result<Vec<Value>, String> {
+        let listed = embedded_json(
+            self.node
+                .call(STORAGE, "manifests", &[])
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        match listed {
+            Value::Array(list) => Ok(list),
+            other => Err(format!("unexpected manifests reply: {other}")),
+        }
     }
 
     /// Every CID the agent put in local storage, read once. An unreadable record

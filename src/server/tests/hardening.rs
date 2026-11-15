@@ -223,3 +223,71 @@ async fn an_agent_download_within_its_cap_is_kept_as_the_agents() {
     assert!(s.is_own_cid(CID).unwrap());
     assert!(!called(&fake, "downloadCancel"));
 }
+
+/// Upload out.txt through the tool and finish it with CID.
+async fn upload_through_the_tool(listed_before: crate::logosctl::RawOutput) -> LogosServer {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let fake = FakeRunner::with(vec![listed_before, storage("uploadUrl", r#""91""#)]);
+    let (s, events) = files_server(fake, dir.path());
+    let r = s
+        .storage_upload(Parameters(UploadParams {
+            path: "out.txt".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "91", "success": true, "cid": CID }),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    s
+}
+
+#[tokio::test(start_paused = true)]
+async fn uploading_content_already_stored_does_not_make_it_the_agents() {
+    let held = json!([{ "cid": CID, "datasetSize": 6, "filename": "users.txt" }]);
+    let s = upload_through_the_tool(storage("manifests", &held.to_string())).await;
+    assert!(
+        !s.is_own_cid(CID).unwrap(),
+        "the user's identical file stays theirs"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn uploading_new_content_makes_it_the_agents() {
+    let s = upload_through_the_tool(storage("manifests", "[]")).await;
+    assert!(s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_is_not_claimed_when_the_stored_content_is_unknown() {
+    let s = upload_through_the_tool(out(r#"{"status":"error","error":"no module"}"#)).await;
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waited_upload_of_content_already_stored_is_not_the_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let held = json!([{ "cid": CID }]);
+    let fake = FakeRunner::with(vec![
+        storage("manifests", &held.to_string()),
+        storage("uploadUrl", r#""92""#),
+    ]);
+    let (s, events) = files_server(fake, dir.path());
+    let upload = tokio::spawn({
+        let s = s.clone();
+        async move { s.upload_file("out.txt", Duration::from_secs(30)).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "92", "success": true, "cid": CID }),
+    );
+    assert_eq!(upload.await.unwrap(), Ok(CID.to_string()));
+    assert!(!s.is_own_cid(CID).unwrap());
+}
