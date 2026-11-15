@@ -319,34 +319,25 @@ impl EventStore {
         };
     }
 
-    /// Where a reader at `after` on `topic` stands.
-    pub fn message_cursor(&self, topic: &str, after: u64) -> Cursor {
+    /// Messages on `topic` with `seq > after`, oldest first, at most `limit`,
+    /// with where `after` stood: from the start again when it predates a
+    /// restart. Checked and read in one step, so no drop slips between them.
+    pub fn read(&self, topic: &str, after: u64, limit: usize) -> (Cursor, Vec<ReceivedMessage>) {
         let s = self.inner.lock().unwrap();
-        if after > s.next_seq {
+        let cursor = if after > s.next_seq {
             Cursor::Restarted
         } else if s.dropped_upto.get(topic).is_some_and(|d| after < *d) {
             Cursor::Dropped
         } else {
             Cursor::Fine
-        }
-    }
-
-    /// Where a chain_events reader at `after` stands.
-    pub fn chain_cursor(&self, after: u64) -> Cursor {
-        let s = self.inner.lock().unwrap();
-        if after > s.next_chain_seq {
-            Cursor::Restarted
-        } else if after < s.chain_dropped_upto {
-            Cursor::Dropped
+        };
+        let after = if cursor == Cursor::Restarted {
+            0
         } else {
-            Cursor::Fine
-        }
-    }
-
-    /// Messages on `topic` with `seq > after`, oldest first, at most `limit`.
-    pub fn read(&self, topic: &str, after: u64, limit: usize) -> Vec<ReceivedMessage> {
-        let s = self.inner.lock().unwrap();
-        s.topics
+            after
+        };
+        let messages = s
+            .topics
             .get(topic)
             .map(|q| {
                 q.iter()
@@ -355,18 +346,34 @@ impl EventStore {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (cursor, messages)
     }
 
-    /// Finalized chain tips with `seq > after`, oldest first, at most `limit`.
-    pub fn lib_blocks(&self, after: u64, limit: usize) -> Vec<ChainBlock> {
+    /// Finalized chain tips with `seq > after`, oldest first, at most `limit`,
+    /// with where `after` stood, as `read` does for messages.
+    pub fn lib_blocks(&self, after: u64, limit: usize) -> (Cursor, Vec<ChainBlock>) {
         let s = self.inner.lock().unwrap();
-        s.lib_blocks
+        let cursor = if after > s.next_chain_seq {
+            Cursor::Restarted
+        } else if after < s.chain_dropped_upto {
+            Cursor::Dropped
+        } else {
+            Cursor::Fine
+        };
+        let after = if cursor == Cursor::Restarted {
+            0
+        } else {
+            after
+        };
+        let blocks = s
+            .lib_blocks
             .iter()
             .filter(|b| b.seq > after)
             .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        (cursor, blocks)
     }
 
     pub fn send_status(&self, request_id: &str) -> Option<SendStatus> {

@@ -1640,7 +1640,7 @@ fn only_the_newest_finalized_blocks_are_kept() {
     for h in 0..(crate::events::MAX_CHAIN_EVENTS as u64 + 10) {
         lib_block(&events, h, &format!("{h:064x}"));
     }
-    let kept = events.lib_blocks(0, usize::MAX);
+    let (_, kept) = events.lib_blocks(0, usize::MAX);
     assert_eq!(kept.len(), crate::events::MAX_CHAIN_EVENTS);
     assert_eq!(
         kept.last().unwrap().height,
