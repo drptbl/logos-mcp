@@ -3834,7 +3834,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Content held in local storage: CID, size in bytes, file name and type, and whether this agent put it there (only that content can be removed)."
+        description = "Content this agent put in local storage, which it may remove: CID, size in bytes, file name and type. Other content is only counted, in others."
     )]
     async fn storage_manifests(&self) -> Result<CallToolResult, McpError> {
         let listed = match self.node.call(STORAGE, "manifests", &[]).await {
@@ -3844,25 +3844,26 @@ impl LogosServer {
         let Value::Array(list) = listed else {
             return fail(format!("unexpected manifests reply: {listed}"));
         };
+        // In Basecamp local storage is the user's too: their content is only counted.
         let own = self.own_cid_set();
         let content: Vec<Value> = list
             .iter()
+            .filter(|m| m["cid"].as_str().is_some_and(|cid| own.contains(cid)))
             .map(|m| {
-                let cid = m["cid"].as_str().unwrap_or_default();
                 json!({
-                    "cid": cid,
+                    "cid": m["cid"],
                     "size": m["datasetSize"],
                     "filename": m["filename"],
                     "mimetype": m["mimetype"],
-                    "agent": own.contains(cid),
                 })
             })
             .collect();
-        ok(json!({ "count": content.len(), "content": content }))
+        let others = list.len() - content.len();
+        ok(json!({ "count": content.len(), "content": content, "others": others }))
     }
 
     #[tool(
-        description = "Remove content from local storage, by CID. Only content this agent uploaded, or downloaded when it wasn't held already, can be removed: storage_manifests marks it. Identical content shares one CID, so removing the agent's copy removes any identical copy too."
+        description = "Remove content from local storage, by CID. Only content this agent uploaded, or downloaded when it wasn't held already, can be removed: storage_manifests lists it. Identical content shares one CID, so removing the agent's copy removes any identical copy too."
     )]
     async fn storage_remove(
         &self,

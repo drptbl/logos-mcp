@@ -486,7 +486,7 @@ async fn a_download_of_content_already_held_is_not_the_agents() {
 }
 
 #[tokio::test]
-async fn storage_manifests_marks_the_agents_own_content() {
+async fn storage_manifests_lists_only_the_agents_own_content() {
     let dir = tempfile::tempdir().unwrap();
     let listed = json!([
         { "cid": CID, "datasetSize": 661, "filename": "a.txt", "mimetype": null, "blockSize": 65536, "treeCid": "zDz" },
@@ -497,10 +497,11 @@ async fn storage_manifests_marks_the_agents_own_content() {
     s.remember_cid(CID, "download").unwrap();
     let b = body(&s.storage_manifests().await.unwrap());
     let content = b["content"].as_array().unwrap();
-    assert_eq!(content.len(), 2, "{b}");
-    assert_eq!(content[0]["agent"], true, "{b}");
+    assert_eq!(content.len(), 1, "{b}");
+    assert_eq!(content[0]["cid"], CID, "{b}");
     assert_eq!(content[0]["size"], 661, "{b}");
-    assert_eq!(content[1]["agent"], false, "{b}");
+    assert_eq!(b["others"], 1, "the user's content is only counted: {b}");
+    assert!(!b.to_string().contains("b.txt"), "{b}");
 }
 
 #[tokio::test(start_paused = true)]

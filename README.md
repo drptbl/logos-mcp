@@ -47,7 +47,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
 | `storage_transfer_status` | progress and result of an upload or download |
 | `storage_exists` | whether a CID is in local storage |
-| `storage_manifests` | the content in local storage, marking what the agent put there |
+| `storage_manifests` | the content the agent put in local storage; anything else is only counted |
 | `storage_remove` | removes content the agent uploaded or downloaded fresh. The rest of local storage is left alone |
 | `storage_space` | local storage quota and usage |
 
