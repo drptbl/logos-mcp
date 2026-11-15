@@ -350,9 +350,11 @@ pub fn judge(
         })
         .filter_map(|p| member_key(text(p, "account")))
         .collect();
+    // A decline is final in Muster: that member's approval counts toward
+    // nothing, whichever came first.
     let approvals = signed
         .intersection(&committed)
-        .filter(|k| room.approvers.contains(*k))
+        .filter(|k| room.approvers.contains(*k) && !declined.contains(*k))
         .count();
     if state == "executable" && approvals >= room.approvals {
         Verdict::Send

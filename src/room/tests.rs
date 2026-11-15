@@ -394,3 +394,20 @@ fn an_approval_named_by_a_roster_identity_counts_like_its_key() {
         Verdict::Send
     );
 }
+
+#[test]
+fn a_trusted_human_who_declined_never_counts_even_after_approving() {
+    // Muster: a decline is final, whichever arrived first.
+    let room = config(&[HUMAN, OTHER], 1);
+    let seen = muster(
+        "executable",
+        &[Sig(AGENT, COMMITTED), Sig(HUMAN, COMMITTED)],
+        &[HUMAN],
+        TOPIC,
+        EXPIRY,
+    );
+    assert!(matches!(
+        verdict(&room, the_call(), seen),
+        Verdict::Wait { approvals: 0, .. }
+    ));
+}
