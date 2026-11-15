@@ -75,6 +75,11 @@ struct Inner {
     send_order: VecDeque<String>,
     transfers: HashMap<String, Transfer>,
     transfer_order: VecDeque<String>,
+    /// Sessions a server sharing this store started, kept apart from the
+    /// transfers themselves: in Basecamp the store also sees the user's own,
+    /// which can push the agent's out of `transfers`.
+    started: HashMap<String, ()>,
+    started_order: VecDeque<String>,
     next_chain_seq: u64,
     lib_blocks: VecDeque<ChainBlock>,
     /// The newest seq dropped from each topic's buffer, to tell a reader it missed some.
@@ -290,6 +295,12 @@ impl EventStore {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
         track(
+            &mut s.started,
+            &mut s.started_order,
+            session_id,
+            MAX_TRACKED_TRANSFERS,
+        );
+        track(
             &mut s.transfers,
             &mut s.transfer_order,
             session_id,
@@ -307,6 +318,12 @@ impl EventStore {
     pub fn reset_transfer(&self, session_id: &str, kind: &str) {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
+        track(
+            &mut s.started,
+            &mut s.started_order,
+            session_id,
+            MAX_TRACKED_TRANSFERS,
+        );
         track(
             &mut s.transfers,
             &mut s.transfer_order,
@@ -387,6 +404,18 @@ impl EventStore {
             t.success = Some(false);
             t.error = Some(error);
         }
+    }
+
+    /// Whether a server sharing this store started `session_id`.
+    pub fn started_here(&self, session_id: &str) -> bool {
+        self.inner.lock().unwrap().started.contains_key(session_id)
+    }
+
+    /// Take back `started_here` for a transfer that never started.
+    pub fn never_started(&self, session_id: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.started.remove(session_id);
+        s.started_order.retain(|id| id != session_id);
     }
 
     pub fn transfer(&self, session_id: &str) -> Option<Transfer> {

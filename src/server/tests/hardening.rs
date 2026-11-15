@@ -555,3 +555,52 @@ async fn a_followed_download_holds_its_cid_and_file() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(s.downloads.lock().unwrap().is_empty());
 }
+
+async fn transfer_status(s: &LogosServer, session: &str) -> CallToolResult {
+    s.storage_transfer_status(Parameters(SessionParams {
+        session_id: session.into(),
+    }))
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_agents_transfer_stays_readable_after_many_of_the_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, events) = files_server(FakeRunner::with(vec![]), dir.path());
+    events.expect_transfer("agents", "upload");
+    for n in 0..crate::events::MAX_TRACKED_TRANSFERS + 10 {
+        emit(
+            &events,
+            "storageUploadDone",
+            json!({ "sessionId": format!("users-{n}"), "success": true, "cid": CID }),
+        );
+    }
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "agents", "success": true, "cid": CID }),
+    );
+    let r = transfer_status(&s, "agents").await;
+    assert!(!is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_download_that_never_started_grants_no_view_of_the_cid() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = out(
+        r#"{"method":"downloadToUrl","module":"storage_module","result":{"error":"busy","success":false,"value":null},"status":"ok"}"#,
+    );
+    let fake = FakeRunner::with(vec![storage("exists", "false"), refused]);
+    let (s, events) = files_server(fake, dir.path());
+    let r = s.storage_download(download(None)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    // Later the user downloads that CID in Basecamp.
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    let r = transfer_status(&s, CID).await;
+    assert!(is_error(&r), "{}", text(&r));
+}

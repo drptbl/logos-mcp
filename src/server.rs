@@ -3820,8 +3820,14 @@ impl LogosServer {
                 self.events.expect_transfer(&session, "download");
                 Ok((session, full, held))
             }
-            Ok(other) => Err(format!("unexpected downloadToUrl result: {other}")),
-            Err(e) => Err(e.to_string()),
+            refused => {
+                // A later download of this CID would be the user's, not ours.
+                self.events.never_started(cid);
+                Err(match refused {
+                    Ok(other) => format!("unexpected downloadToUrl result: {other}"),
+                    Err(e) => e.to_string(),
+                })
+            }
         }
     }
 
@@ -4027,7 +4033,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Progress and result (including the CID for uploads) of a storage upload or download.",
+        description = "Progress and result (including the CID for uploads) of a storage upload or download this agent started.",
         annotations(read_only_hint = true)
     )]
     async fn storage_transfer_status(
@@ -4035,10 +4041,12 @@ impl LogosServer {
         Parameters(p): Parameters<SessionParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.events.transfer(&p.session_id) {
-            // Recording happens where the agent started the transfer: the store
-            // also sees uploads the agent didn't start.
-            Some(t) => ok(serde_json::to_value(t).unwrap_or(Value::Null)),
-            None => fail(format!("unknown session {}", p.session_id)),
+            // The store also sees the user's transfers in Basecamp: those read as
+            // unknown, so their CIDs stay theirs.
+            Some(t) if self.events.started_here(&p.session_id) => {
+                ok(serde_json::to_value(t).unwrap_or(Value::Null))
+            }
+            _ => fail(format!("unknown session {}", p.session_id)),
         }
     }
 
