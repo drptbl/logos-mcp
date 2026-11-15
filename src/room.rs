@@ -11,6 +11,8 @@ use crate::{
 };
 
 const MUSTER: &str = "muster_module";
+/// What every proposal's `ref` starts with, the request id following it.
+pub const REF_PREFIX: &str = "logos-mcp/";
 /// How long the first proposal waits for Muster's delivery node: a send made
 /// while it starts is lost (corpetty/muster#373).
 const DELIVERY_WAIT: Duration = Duration::from_secs(90);
@@ -437,6 +439,7 @@ impl Room {
                 }
                 tokio::time::sleep(DELIVERY_POLL).await;
             }
+            self.sweep(node).await;
             *ready = true;
         }
         let rooms = muster(node, "coordinate_conversations", &[]).await?;
@@ -554,6 +557,44 @@ impl Room {
             &provenance,
             now,
         ))
+    }
+
+    /// Decline what an earlier run of this server left open: the agent's own
+    /// proposals, still collecting, for requests a restart dropped and so never
+    /// sends. An executable one is left alone, as it was most likely sent.
+    /// Best effort: a Muster that can't be read leaves them open.
+    async fn sweep(&self, node: &dyn Node) {
+        let intents = match muster(node, "coordinate_intents", &[]).await {
+            Ok(intents) => intents,
+            Err(e) => {
+                tracing::warn!("could not look for room proposals left open: {e}");
+                return;
+            }
+        };
+        let left_open = intents
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|i| {
+                matches!(text(i, "state"), "proposed" | "collecting")
+                    && i.pointer("/effect/ref")
+                        .and_then(Value::as_str)
+                        .is_some_and(|r| r.starts_with(REF_PREFIX))
+                    && i.get("proposedBy")
+                        .and_then(Value::as_array)
+                        .is_some_and(|by| {
+                            by.iter()
+                                .any(|p| p.get("mine").and_then(Value::as_bool) == Some(true))
+                        })
+            });
+        for intent in left_open {
+            tracing::info!(
+                intent_id = text(intent, "id"),
+                "declining a room proposal a restart left open"
+            );
+            self.withdraw(node, text(intent, "id")).await;
+        }
     }
 
     /// Take back the agent's approval of a proposal that will never be sent, so

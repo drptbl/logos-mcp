@@ -243,7 +243,8 @@ Keep in mind:
 
 - the agent must have no shell on that `logosctl` session. With one it could call Muster or `lez_core` itself
 - the limit is per transfer, so the agent can still send several transfers under it
-- a restart drops waiting requests, and nothing dropped is ever sent
+- a restart drops waiting requests, and nothing dropped is ever sent. The first room proposal after a restart declines the agent's own proposals they left collecting in Muster
+- run one logos-mcp per agent Muster. A second one would decline the first one's proposals when it starts proposing
 - the first proposal waits up to 90 s for Muster's delivery node, because Muster loses sends made while it starts ([corpetty/muster#373](https://github.com/corpetty/muster/issues/373))
 - it's standalone only for now. Basecamp runs one Muster with your own identity, so the agent would propose and approve as you
 

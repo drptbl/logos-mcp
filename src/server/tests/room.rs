@@ -603,3 +603,42 @@ async fn a_request_that_ends_unsent_withdraws_the_agents_approval() {
     assert_eq!(runner.muster_calls("coordinate_decline").len(), 1);
     assert_eq!(runner.sends(), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_first_proposal_after_a_restart_declines_the_cards_left_open() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let mine = json!([{"who": format!("{AGENT_KEY}{X25519}"), "mine": true}]);
+    let theirs = json!([{"who": format!("{HUMAN}{X25519}"), "mine": false}]);
+    let ours = |id: &str, state: &str, proposed_by: &Value, reference: &str| {
+        json!({"id": id, "state": state, "approvals": 1, "proposedBy": proposed_by,
+               "effect": {"effect": "invoke", "ref": reference}})
+    };
+    // What an earlier run left: only its own still-open proposals are declined.
+    runner.always(
+        "coordinate_intents",
+        json!([
+            ours("0x01", "collecting", &mine, "logos-mcp/old-request"),
+            ours("0x02", "executable", &mine, "logos-mcp/paid-request"),
+            ours("0x03", "collecting", &theirs, "logos-mcp/spoofed"),
+            ours("0x04", "collecting", &mine, "someone-else"),
+            ours("0x05", "declined", &mine, "logos-mcp/declined"),
+        ]),
+    );
+    runner.answer("coordinate_intents", json!([]));
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let _call = propose(&s, &runner).await;
+    let declined: Vec<String> = runner
+        .muster_calls("coordinate_decline")
+        .iter()
+        .map(|c| c[4].clone())
+        .collect();
+    assert_eq!(declined, ["str:0x01"]);
+    let calls = runner.calls.lock().unwrap().clone();
+    let at = |m: &str| {
+        calls
+            .iter()
+            .position(|c| c.get(3).map(String::as_str) == Some(m))
+            .unwrap()
+    };
+    assert!(at("coordinate_decline") < at("coordinate_propose"));
+}

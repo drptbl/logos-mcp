@@ -2631,7 +2631,11 @@ impl LogosServer {
                 Err(e) => return fail(e),
             };
         let intent = match room
-            .propose(self.node.as_ref(), &args, &format!("logos-mcp/{id}"))
+            .propose(
+                self.node.as_ref(),
+                &args,
+                &format!("{}{id}", crate::room::REF_PREFIX),
+            )
             .await
         {
             Ok(intent) => intent,
