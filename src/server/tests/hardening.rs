@@ -291,3 +291,68 @@ async fn a_waited_upload_of_content_already_stored_is_not_the_agents() {
     assert_eq!(upload.await.unwrap(), Ok(CID.to_string()));
     assert!(!s.is_own_cid(CID).unwrap());
 }
+
+/// A wallet someone else opened in lez_core: never the agent's.
+fn foreign_wallet() -> Vec<crate::logosctl::RawOutput> {
+    vec![
+        lez("get_sequencer_addr", r#""https://testnet.lez.logos.co/""#),
+        lez("list_accounts", OTHER_ACCOUNTS),
+    ]
+}
+
+fn lez_calls(fake: &FakeRunner, method: &str) -> usize {
+    fake.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some(method))
+        .count()
+}
+
+#[tokio::test]
+async fn the_agent_is_not_shown_a_foreign_wallets_accounts() {
+    let fake = FakeRunner::with(foreign_wallet());
+    let b = body(&wallet_server(fake.clone()).wallet_accounts().await.unwrap());
+    assert_eq!(b["accounts"], json!([]), "{b}");
+    assert_eq!(b["hidden"], 1, "{b}");
+    assert!(
+        b["warning"]
+            .as_str()
+            .unwrap()
+            .contains("may not be the agent wallet"),
+        "{b}"
+    );
+    assert!(!b.to_string().contains("846d9a70"), "{b}");
+    assert_eq!(lez_calls(&fake, "get_balance"), 0);
+}
+
+#[tokio::test]
+async fn the_user_still_sees_every_account_in_the_app() {
+    let mut replies = foreign_wallet();
+    replies.extend([
+        lez("get_current_block_height", "78065"),
+        lez("get_last_synced_block", "0"),
+    ]);
+    replies.extend(foreign_wallet());
+    replies.push(lez("get_balance", r#""7""#));
+    let overview = wallet_server(FakeRunner::with(replies))
+        .wallet_overview()
+        .await
+        .unwrap();
+    assert_eq!(overview["accounts"][0]["balance_lepta"], "7", "{overview}");
+}
+
+#[tokio::test]
+async fn labels_are_not_read_from_a_foreign_wallet() {
+    let fake = FakeRunner::with(foreign_wallet());
+    let r = wallet_server(fake.clone())
+        .wallet_labels(Parameters(LabelsParams {
+            label: Some("alice".into()),
+            account: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("refusing"), "{}", text(&r));
+    assert_eq!(lez_calls(&fake, "resolve_label"), 0);
+}

@@ -946,11 +946,11 @@ impl LogosServer {
         self
     }
 
-    /// The open wallet for the Agent app: its status and every account, exactly as
-    /// the wallet_status and wallet_accounts tools report them.
+    /// The open wallet for the Agent app: its status as wallet_status reports it,
+    /// and every account, even in a wallet that isn't the agent's.
     pub async fn wallet_overview(&self) -> Result<Value, String> {
         let status = tool_json(self.wallet_status().await)?;
-        let mut accounts = tool_json(self.wallet_accounts().await)?;
+        let mut accounts = self.list_wallet_accounts(true).await?;
         // What the user handed over, whether or not the agent can use it right now
         // (`agent`): a grant on an account this wallet lacks must stay visible, so
         // the user can take it back.
@@ -1594,7 +1594,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "LEZ account labels: resolve a label to the account it names, or list the labels on an account. Give label or account, not both. Read-only."
+        description = "LEZ account labels: resolve a label to the account it names, or list the labels on an account. Give label or account, not both. Read-only, and only in the agent's wallet."
     )]
     pub async fn wallet_labels(
         &self,
@@ -1608,8 +1608,13 @@ impl LogosServer {
             }),
             _ => return fail("give a label to resolve, or an account to list the labels of"),
         };
-        if let Err(e) = self.ensure_wallet().await {
-            return fail(e);
+        // Labels are the wallet owner's notes: only the agent's wallet's are read.
+        match self.ensure_wallet().await {
+            Ok(w) if !w.trusted => {
+                return fail(format!("refusing: {}", w.warning().unwrap_or_default()));
+            }
+            Ok(_) => {}
+            Err(e) => return fail(e),
         }
         match lookup {
             Ok(label) => {
@@ -1692,13 +1697,28 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "The agent wallet's own accounts with their addresses and balances in lepta."
+        description = "The agent wallet's own accounts with their addresses and balances in lepta. A wallet that isn't the agent's shows none."
     )]
     pub async fn wallet_accounts(&self) -> Result<CallToolResult, McpError> {
-        let w = match self.ensure_wallet().await {
-            Ok(v) => v,
-            Err(e) => return fail(e),
-        };
+        match self.list_wallet_accounts(false).await {
+            Ok(listed) => ok(listed),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// The open wallet's accounts with their balances. Only the user's app
+    /// (`foreign`) sees them when the wallet isn't the agent's.
+    async fn list_wallet_accounts(&self, foreign: bool) -> Result<Value, String> {
+        let w = self.ensure_wallet().await?;
+        // An empty listing has nothing to hide, and may be a failed one.
+        if !w.trusted && !foreign && !w.accounts.is_empty() {
+            return Ok(json!({
+                "accounts": [],
+                "hidden": w.accounts.len(),
+                "warning": w.warning(),
+                "note": "this wallet isn't the agent's, so its accounts aren't shown",
+            }));
+        }
         // Only marks which accounts were made for jobs: the list stands without it.
         let (job_accounts, unreadable) = match self.job_accounts() {
             Ok(map) => (map, None),
@@ -1754,7 +1774,7 @@ impl LogosServer {
             )),
             (false, None) => None,
         };
-        ok(json!({
+        Ok(json!({
             "accounts": accounts,
             "warning": w.warning(),
             "note": note,
