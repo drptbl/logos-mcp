@@ -29,7 +29,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `wallet_labels` | the account behind a label, or an account's labels, in the agent's wallet only |
 | `wallet_tx_status` | whether a LEZ transaction is in a block yet, answered at once by the wallet's sequencer |
 | `wallet_faucet` | asks the LEZ testnet faucet for its drop, 0.1 LEZ once a day, into one of the agent's own public accounts. Needs Basecamp's LEZ Faucet module |
-| `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app. With [room approval](#room-approval), a transfer over the limit waits for trusted people in a Muster room |
+| `wallet_transfer` | sends lepta from one of the agent accounts to a public account, or waits for [approval](#room-approval): your OK in the AI Agent app, or trusted people in a Muster room |
 | `wallet_transfer_status` | where a transfer that waited for approval stands, with its `tx_hash` once sent. A room request also shows its proposal and the trusted approvals so far |
 | `wallet_new_account` | creates a public account in the agent wallet, for example a fresh receive address per job |
 | `discovery_advertise` / `discovery_stop` | advertises a service on the Logos discovery network, or stops |
@@ -41,7 +41,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chain_events` | each new finalized block's height and header id as it arrives, paged by `after_seq` |
 | `chain_rewards` / `chain_claim_reward` | the leader reward vouchers and mined tickets the chain node hasn't claimed, or claims one voucher into its wallet. The claim's fee comes from the node's funding key |
 | `chain_wallet` | the chain node's own addresses with their balances, or one address with its notes |
-| `chain_transfer` | sends TestToken from one of the chain node's addresses. Always waits for your Approve in the AI Agent app, so it only works inside Basecamp |
+| `chain_transfer` | sends TestToken from one of the chain node's addresses. Waits for your OK in the AI Agent app by default, or for a Muster room. Outside Basecamp only a room can approve it |
 | `chain_block` / `chain_transaction` | a chain block and its transactions by its header id, or a transaction still waiting in the mempool by its hash. The node finds a mined transaction only through its block |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
@@ -202,9 +202,10 @@ nix build .#lgx-portable
 ```
 
 1. Connect => the address, the token, a ready `claude mcp add` command and a button that issues a new token
-2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chain, chat). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there. Ask me before each transfer, off by default, makes every transfer wait for your Approve or Deny in the Wallet tab. Chain transfers always wait, since they spend your chain node's wallet
-3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account. Accounts made for service jobs fold into one line with their total
-4. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message and chat text shows in the app only, the file keeps its size
+2. Permissions => a switch per tool group (messaging, storage, wallet, transfers, discovery, chain, chat). A group you turn off disappears from the agent's list and is refused if called. Basecamp runs one Chat module, so with chat on the agent uses your Logos Chat account: it reads and sends in every conversation you have there
+3. Wallet => the accounts in your open wallet and their balances. Hand one of your public accounts to the agent, take it back, or create a new agent account. Accounts made for service jobs fold into one line with their total. Transfers waiting for you show here with Approve and Deny, and those waiting for the room with their approvals so far and a Cancel
+4. Approvals => who approves each wallet's transfers, see [Room approval](#room-approval)
+5. Activity => every tool call the agent made, also kept in `activity.jsonl` in the module's data folder. Message and chat text shows in the app only, the file keeps its size
 
 ## Networks
 
@@ -221,11 +222,39 @@ Start on `logos.dev` if you just want to try it.
 
 ## Room approval
 
-Outside Basecamp nobody clicks Approve, so the wallet's balance is the agent's only limit. Room approval adds one: a transfer over `--room-above-lepta` waits for trusted people to approve it in a [Muster](https://github.com/corpetty/muster) room.
+For each wallet, a limit splits transfers in two, and each side is one of:
 
-1. Give the agent its own Muster identity => install `muster_module` into the agent's `logosctl` session from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`) with `logosctl package install muster_module`
-2. Invite the agent into your room from your own Muster, and have it join. Muster proposes in its active room, so if the agent is in several rooms, join this one last
-3. Start logos-mcp with the room's topic and the Ed25519 keys of the people whose approval counts. Muster's `identity` shows yours as `ed25519`
+1. Send => the agent sends it
+2. Ask me => it waits for your Approve or Deny in the AI Agent app's Wallet tab
+3. Room => it waits for trusted people to approve it in a [Muster](https://github.com/corpetty/muster) room
+
+The side above the limit can't be looser than the one under it, and a limit of 0 puts every transfer above it. The agent wallet covers LEZ transfers and escrow payments. The node wallet covers Logos chain transfers, which spend your chain node's own wallet, so it asks you for every one unless you change it.
+
+The room approves with the agent as its own member, never as you. The agent proposes and endorses from its own Muster identity, a headless `logosctl` session with `muster_module`, and you approve like any member.
+
+### In Basecamp
+
+Open the AI Agent app's Approvals tab. It needs `logosctl` installed.
+
+1. Set up agent seat => the module makes a `logosctl` session in its data folder, installs Muster and the six modules it needs from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`), and runs it while the module runs
+2. Copy the invite id and invite the agent into your room from Muster's app, then press Join next to the invite
+3. Pick the room, tick who's trusted (you by default), set how many approvals are needed and the tiers, then Save
+
+A change applies to the next transfer, and to room requests still waiting: an unticked person stops counting, and a different room or none cancels them.
+
+### Standalone
+
+Give the agent's `logosctl` session its own Muster:
+
+```bash
+logosctl -D -d
+logosctl catalog add https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json
+logosctl package install muster_module --no-optional -y
+logosctl module load muster_module --no-optional
+logosctl call muster_module coordinate_start_inbox
+```
+
+Invite it into your room from your own Muster: its `identity` call gives `ed25519` and `x25519`, and the invite id is the two joined. Accept with `logosctl call muster_module coordinate_join str:<topic>`. Then start logos-mcp with the room's topic and the Ed25519 keys of the people whose approval counts. Muster's `identity` shows yours as `ed25519`:
 
 ```bash
 logos-mcp --config-dir ~/.logosctl-agent \
@@ -235,20 +264,22 @@ logos-mcp --config-dir ~/.logosctl-agent \
   --room-above-lepta 3000000
 ```
 
-An over-limit `wallet_transfer` proposes `lez_core.transfer_public(from, to, amount)` in the room through the agent's Muster, approves it as the agent and returns `awaiting_approval` with a `request_id`. Muster's card shows only the method, so the agent first posts what it does in the room's chat, e.g. `[logos-mcp] proposal 0x5a6c…: Pay 7000000 lepta from Public/4gbL… into escrow for Public/HvNb…`. Check that the line comes from the agent, then approve or decline the card in Muster.
+The agent wallet then sends up to `--room-above-lepta` and asks the room above it. Chain transfers always ask the room, since there is no app to ask you in.
 
-A payment through a program call, such as a logos-agents escrow open, is proposed as the exact `lez_core.send_generic_public_transaction` call it sends. It waits no longer than the call's own deadline, and one with less than a minute left is refused.
+### How the room decides
 
-logos-mcp sends the transfer once the agent's Muster shows the proposal executable, bound to this room and not expired, signed for exactly that call, and approved by `--room-approvals` distinct trusted people. The agent's own approval never counts. Neither does a signature copied in from another proposal, which Muster grades `unattested`. A decline, an expiry or a different call ends the request unsent. When it ends unsent for any reason but your decline, the agent declines its own proposal. Its approval then counts for nothing, and the card closes once the room can't reach Muster's threshold without it.
+A transfer for the room proposes the exact call logos-mcp will send, such as `lez_core.transfer_public(from, to, amount)`, an escrow's `lez_core.send_generic_public_transaction` or a chain transfer's `blockchain_module.wallet_transfer_funds`, and returns `awaiting_approval` with a `request_id`. Muster's card shows only the method, so the agent first posts what it does in the room's chat, e.g. `[logos-mcp] proposal 0x5a6c…: Pay 7000000 lepta from Public/4gbL… into escrow for Public/HvNb…`. Check that the line comes from the agent, then approve or decline the card in Muster.
+
+logos-mcp sends the transfer once the agent's Muster shows the proposal executable, bound to this room and not expired, signed for exactly that call, and approved by enough distinct trusted people. The agent's own approval never counts. Neither does a signature copied in from another proposal, which Muster grades `unattested`. A decline, an expiry or a different call ends the request unsent. When it ends unsent for any reason but your decline, the agent declines its own proposal. Its approval then counts for nothing, and the card closes once the room can't reach Muster's threshold without it. An escrow payment waits no longer than its own deadline, and one with less than a minute left is refused.
 
 Keep in mind:
 
-- the agent must have no shell on that `logosctl` session. With one it could call Muster or `lez_core` itself
+- the agent must have no shell on its Muster's `logosctl` session. With one it could call Muster itself
 - the limit is per transfer, so the agent can still send several transfers under it
 - a restart drops waiting requests, and nothing dropped is ever sent. The first room proposal after a restart declines the agent's own proposals they left collecting in Muster
 - run one logos-mcp per agent Muster. A second one would decline the first one's proposals when it starts proposing
 - the first proposal waits up to 90 s for Muster's delivery node, because Muster loses sends made while it starts ([corpetty/muster#373](https://github.com/corpetty/muster/issues/373))
-- it's standalone only for now. Basecamp runs one Muster with your own identity, so the agent would propose and approve as you
+- inside Basecamp the agent's seat is a second Logos runtime next to Basecamp's, since one Basecamp has one Muster identity ([corpetty/muster#376](https://github.com/corpetty/muster/issues/376))
 
 ## Security
 
@@ -259,7 +290,8 @@ The server is the boundary between your agent and your node, so it checks what t
 - messages are limited to 150 KiB (the network limit) and topics must look like `/app/1/name/proto`
 - there is no tool that calls arbitrary module methods
 - `wallet_tx_status` is the one tool that skips `logosctl`: it asks the sequencer in the wallet config directly, because `lez_core` only has a lookup that blocks for minutes
-- `chain_transfer` spends the chain node's wallet, which is yours, so each one waits for your Approve whatever the switches say. Outside Basecamp there is nobody to approve, so it refuses
+- `chain_transfer` spends the chain node's wallet, which is yours, so each one waits for your Approve unless you set its tiers otherwise. Outside Basecamp only a room can approve it
+- room approval never uses your own Muster: proposals come only from the agent's own seat, and without one they're refused
 - with room approval, `wallet_transfer` over the limit sends only what trusted people approved in the room, read from the agent's own Muster. No tool approves anything
 - `wallet_faucet` only pays into the agent's own public accounts
 - `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest
