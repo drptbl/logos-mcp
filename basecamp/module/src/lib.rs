@@ -412,9 +412,9 @@ impl LogosMcpModule for ModuleImpl {
 
     fn seat_status(&self) -> String {
         for_app(|c| {
-            let set_up = c.agent_seat();
             let mut status = on_seat(|seat| async move { Ok(seat.status().await) })?;
-            status["set_up"] = json!(set_up);
+            // After the seat's own status: a setup it saw finish is remembered by now.
+            status["set_up"] = json!(c.agent_seat());
             status["logosctl"] = json!(find_logosctl());
             status["you"] = json!(users_muster_key());
             Ok(status)

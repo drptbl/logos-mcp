@@ -240,11 +240,16 @@ impl Seat {
     /// rooms it is in and the invites waiting for it, and whether it is being
     /// set up or why that failed.
     pub async fn status(&self) -> Value {
+        // Read first: a setup that ends meanwhile then shows as still running
+        // for one more look, never as not set up.
+        let setup = match &*self.setup() {
+            Setup::Idle => None,
+            Setup::Running => Some(("setting_up", json!(true))),
+            Setup::Failed(e) => Some(("setup_error", json!(e))),
+        };
         let mut status = self.session_status().await;
-        match &*self.setup() {
-            Setup::Idle => {}
-            Setup::Running => status["setting_up"] = json!(true),
-            Setup::Failed(e) => status["setup_error"] = json!(e),
+        if let Some((key, value)) = setup {
+            status[key] = value;
         }
         status
     }
