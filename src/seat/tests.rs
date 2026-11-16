@@ -108,30 +108,6 @@ async fn a_seat_not_running_says_so() {
 }
 
 #[tokio::test]
-async fn a_rooms_members_come_back_as_keys_with_the_agent_marked() {
-    let fake = FakeRunner::with(vec![
-        muster("identity", serde_json::json!({"ed25519": ED, "x25519": X})),
-        muster(
-            "coordinate_conversations",
-            serde_json::json!([{"topic": TOPIC, "active": false}]),
-        ),
-        muster("coordinate_join", serde_json::json!({"topic": TOPIC})),
-        muster(
-            "coordinate_members",
-            serde_json::json!([
-                {"identity": format!("{HUMAN}{X}"), "self": false, "alias": "Jakub"},
-                {"identity": format!("{ED}{X}"), "self": true, "alias": ""},
-            ]),
-        ),
-    ]);
-    let members = Seat::new(fake).members(TOPIC).await.unwrap();
-    assert_eq!(members[0]["key"], format!("ed:{HUMAN}"));
-    assert_eq!(members[0]["alias"], "Jakub");
-    assert_eq!(members[0]["agent"], false);
-    assert_eq!(members[1]["agent"], true);
-}
-
-#[tokio::test]
 async fn stopping_stops_the_daemon() {
     let fake = FakeRunner::with(vec![out(
         r#"{"message":"Daemon shutting down.","status":"ok"}"#,

@@ -394,6 +394,20 @@ pub(crate) async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Resu
     }
 }
 
+/// Decline proposal `intent_id` in `topic` as the agent, best effort: for
+/// callers that already hold the seat.
+async fn withdraw_now(node: &dyn Node, topic: &str, intent_id: &str) {
+    let declined = match activate(node, topic).await {
+        Ok(()) => muster(node, "coordinate_decline", &[intent_id])
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = declined {
+        tracing::warn!(%intent_id, "could not withdraw the room proposal: {e}");
+    }
+}
+
 /// Make `topic` the agent Muster's active room: Muster reads and writes only
 /// its active room, and only that room takes in new messages. The seat is the
 /// agent's own, so this disturbs nobody.
@@ -428,10 +442,17 @@ impl Room {
         agent: &mut Option<String>,
     ) -> Result<(), String> {
         if agent.is_none() {
-            node.ensure_loaded(MUSTER).await.map_err(|e| {
-                format!("room approval needs muster_module in this logosctl session: {e}")
-            })?;
-            let identity = muster(node, "identity", &[]).await?;
+            // A seat set up by logos-mcp has Muster loaded already, without its
+            // optional extras: load it only when it isn't.
+            let identity = match muster(node, "identity", &[]).await {
+                Ok(identity) => identity,
+                Err(_) => {
+                    node.ensure_loaded(MUSTER).await.map_err(|e| {
+                        format!("room approval needs muster_module in this logosctl session: {e}")
+                    })?;
+                    muster(node, "identity", &[]).await?
+                }
+            };
             let key = identity
                 .get("ed25519")
                 .and_then(Value::as_str)
@@ -542,7 +563,7 @@ impl Room {
         }
         let said = format!("[logos-mcp] proposal {id}: {}", call.note);
         if let Err(e) = muster(node, "coordinate_post_message", &[&said]).await {
-            self.withdraw(node, &room.topic, &id).await;
+            withdraw_now(node, &room.topic, &id).await;
             return Err(format!(
                 "couldn't say in the room what the proposal does, so it was withdrawn: nothing was sent ({e})"
             ));
@@ -571,7 +592,10 @@ impl Room {
                 "this room approval was already used".into(),
             ));
         }
-        if let Some(key) = self.agent.lock().await.as_deref()
+        // Held across making the room active and reading it: the seat has one
+        // active room for everything it does.
+        let agent = self.agent.lock().await;
+        if let Some(key) = agent.as_deref()
             && room.trusts(key)
         {
             return Ok(Verdict::Refused(format!(
@@ -619,22 +643,46 @@ impl Room {
                 intent_id = text(intent, "id"),
                 "declining a room proposal a restart left open"
             );
-            self.withdraw(node, topic, text(intent, "id")).await;
+            withdraw_now(node, topic, text(intent, "id")).await;
         }
     }
 
     /// Take back the agent's approval of a proposal that will never be sent, so
     /// the room sees it closed. Best effort: nothing is sent either way.
     pub async fn withdraw(&self, node: &dyn Node, topic: &str, intent_id: &str) {
-        let declined = match activate(node, topic).await {
-            Ok(()) => muster(node, "coordinate_decline", &[intent_id])
-                .await
-                .map(|_| ()),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = declined {
-            tracing::warn!(%intent_id, "could not withdraw the room proposal: {e}");
-        }
+        let _seat = self.agent.lock().await;
+        withdraw_now(node, topic, intent_id).await;
+    }
+
+    /// Join `topic`: accept an invite, or make a joined room active.
+    pub async fn join(&self, node: &dyn Node, topic: &str) -> Result<(), String> {
+        crate::guard::validate_topic(topic)?;
+        let _seat = self.agent.lock().await;
+        muster(node, "coordinate_join", &[topic]).await.map(|_| ())
+    }
+
+    /// The members of `topic`, a room the seat is in, as their `ed:` keys with
+    /// any alias, and which of them is the agent.
+    pub async fn members(&self, node: &dyn Node, topic: &str) -> Result<Vec<Value>, String> {
+        let _seat = self.agent.lock().await;
+        let identity = muster(node, "identity", &[]).await?;
+        let agent = text(&identity, "ed25519").to_ascii_lowercase();
+        activate(node, topic).await?;
+        let members = muster(node, "coordinate_members", &[]).await?;
+        Ok(members
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let key = member_key(text(m, "identity"))?;
+                Some(json!({
+                    "key": format!("ed:{key}"),
+                    "alias": m["alias"],
+                    "agent": key == agent,
+                }))
+            })
+            .collect())
     }
 
     /// Spend proposal `intent_id`'s approval: false when it was already spent.

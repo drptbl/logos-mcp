@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     logosctl::{Logosctl, ProcessRunner, RawOutput, Runner},
     node::Node,
-    room::{activate, member_key, muster, text},
+    room::{member_key, muster, text},
 };
 
 /// Muster's own package catalogue.
@@ -30,27 +30,42 @@ pub fn find_logosctl() -> Option<PathBuf> {
     })
 }
 
+/// How long installing Muster may take: it downloads seven packages.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// A logosctl session holding the agent's Muster.
 pub struct Seat {
     runner: Arc<dyn Runner>,
     ctl: Logosctl,
+    /// For installing, which takes far longer than any other call.
+    slow: Logosctl,
 }
 
 impl Seat {
     pub fn new(runner: Arc<dyn Runner>) -> Self {
         Self {
             ctl: Logosctl::new(runner.clone()),
+            slow: Logosctl::new(runner.clone()),
             runner,
         }
     }
 
-    /// The session in `dir`, driven by the logosctl binary `bin`.
+    /// The session in `dir`, driven by the logosctl binary `bin`, each call
+    /// within `timeout`, but installing within five minutes.
     pub fn in_dir(bin: PathBuf, dir: PathBuf, timeout: Duration) -> Self {
-        Self::new(Arc::new(ProcessRunner {
-            bin,
-            config_dir: Some(dir),
-            timeout,
-        }))
+        let runner = |timeout| {
+            Arc::new(ProcessRunner {
+                bin: bin.clone(),
+                config_dir: Some(dir.clone()),
+                timeout,
+            })
+        };
+        let ctl = runner(timeout);
+        Self {
+            ctl: Logosctl::new(ctl.clone()),
+            slow: Logosctl::new(runner(INSTALL_TIMEOUT)),
+            runner: ctl,
+        }
     }
 
     /// Where the seat's Muster calls go.
@@ -115,7 +130,7 @@ impl Seat {
                 .await
                 .map_err(|e| format!("could not add Muster's catalogue: {e}"))?;
         }
-        self.ctl
+        self.slow
             .command(&["package", "install", "muster_module", "--no-optional", "-y"])
             .await
             .map_err(|e| format!("could not install Muster: {e}"))?;
@@ -175,38 +190,6 @@ impl Seat {
             "rooms": rooms,
             "invites": invites,
         })
-    }
-
-    /// Join `topic`: accept an invite, or make a joined room active.
-    pub async fn join(&self, topic: &str) -> Result<(), String> {
-        crate::guard::validate_topic(topic)?;
-        muster(self.ctl_node(), "coordinate_join", &[topic])
-            .await
-            .map(|_| ())
-    }
-
-    /// The members of `topic`, a room the seat is in, as their `ed:` keys with
-    /// any alias, and which of them is the agent.
-    pub async fn members(&self, topic: &str) -> Result<Vec<Value>, String> {
-        let node = self.ctl_node();
-        let identity = muster(node, "identity", &[]).await?;
-        let agent = text(&identity, "ed25519").to_ascii_lowercase();
-        activate(node, topic).await?;
-        let members = muster(node, "coordinate_members", &[]).await?;
-        Ok(members
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|m| {
-                let key = member_key(text(m, "identity"))?;
-                Some(json!({
-                    "key": format!("ed:{key}"),
-                    "alias": m["alias"],
-                    "agent": key == agent,
-                }))
-            })
-            .collect())
     }
 }
 
