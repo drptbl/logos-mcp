@@ -1030,6 +1030,30 @@ async fn changing_the_room_cancels_a_waiting_request_and_closes_its_card() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_sent_room_request_reports_the_approvals_that_sent_it() {
+    let mut replies = wallet_open().to_vec(); // checks before proposing
+    replies.extend(wallet_open()); // checks again before sending
+    replies.push(sent("cd34"));
+    let runner = RoomRunner::new(replies);
+    let (s, _dir, _policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    let status = status_of(&s, &id).await;
+    assert_eq!(status["state"], "sent", "{status}");
+    assert_eq!(status["room"]["approvals"], 1, "{status}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_unticked_approver_stops_counting_for_a_waiting_request() {
     let runner = RoomRunner::new(wallet_open().to_vec());
     let other = "7a1c000000000000000000000000000000000000000000000000000000e0f2aa";

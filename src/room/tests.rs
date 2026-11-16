@@ -140,7 +140,10 @@ fn a_trusted_humans_approval_of_exactly_this_call_passes() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), seen), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), seen),
+        Verdict::Send { approvals: 1 }
+    );
 }
 
 #[test]
@@ -208,7 +211,10 @@ fn every_required_approval_must_come_from_a_distinct_trusted_human() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), both), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), both),
+        Verdict::Send { approvals: 2 }
+    );
 }
 
 #[test]
@@ -283,7 +289,10 @@ fn a_declined_proposal_ends_unsent() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), seen), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), seen),
+        Verdict::Send { approvals: 1 }
+    );
 }
 
 #[test]
@@ -392,7 +401,7 @@ fn an_approval_named_by_a_roster_identity_counts_like_its_key() {
     }
     assert_eq!(
         verdict(&room, the_call(), (intents, provenance)),
-        Verdict::Send
+        Verdict::Send { approvals: 1 }
     );
 }
 
@@ -491,7 +500,7 @@ fn a_program_call_passes_only_when_the_room_signed_exactly_it() {
         |(intents, provenance): (Value, Value)| judge(&room, ID, &call, &intents, &provenance, NOW);
     assert_eq!(
         judged(folded("send_generic_public_transaction", &sent)),
-        Verdict::Send
+        Verdict::Send { approvals: 1 }
     );
     for (method, other) in [
         (

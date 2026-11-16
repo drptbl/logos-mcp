@@ -232,8 +232,8 @@ pub struct RoomCall {
 /// What the agent's Muster says about a proposed transfer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Trusted humans approved exactly this call: send it.
-    Send,
+    /// Trusted humans approved exactly this call: send it. How many did.
+    Send { approvals: usize },
     /// Not yet: Muster's state, and the trusted approvals counted so far.
     Wait { state: String, approvals: usize },
     /// The room declined it, or too many trusted humans did for it to pass.
@@ -356,7 +356,7 @@ pub fn judge(
         .filter(|k| room.approvers.contains(*k) && !declined.contains(*k))
         .count();
     if state == "executable" && approvals >= room.approvals {
-        Verdict::Send
+        Verdict::Send { approvals }
     } else {
         Verdict::Wait {
             state: state.into(),

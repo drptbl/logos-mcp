@@ -2935,12 +2935,14 @@ impl LogosServer {
                 },
                 // The settings may have changed while Muster was read: judge
                 // again by the ones in force now.
-                Verdict::Send
+                Verdict::Send { .. }
                     if self.room_settings_for(&topic, wallet, &amount) != Some(settings) =>
                 {
                     continue;
                 }
-                Verdict::Send => {
+                Verdict::Send { approvals } => {
+                    self.approvals
+                        .room_progress(&id, |p| p.approvals = approvals);
                     if !room.use_once(&intent) {
                         Decision::Failed {
                             reason: "this room approval was already used: nothing was sent".into(),
