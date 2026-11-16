@@ -63,12 +63,18 @@ Item {
         try { return JSON.parse(text) } catch (e) { return fallback }
     }
 
-    function call(pending, done) {
+    // `failed`, if given, runs after an error is shown.
+    function call(pending, done, failed) {
         logos.watch(pending, function (raw) {
             var reply = parse(raw, {})
-            if (reply.error) root.notice = reply.error
-            else done(reply)
-        }, function (error) { root.notice = String(error) })
+            if (reply.error) {
+                root.notice = reply.error
+                if (failed) failed()
+            } else done(reply)
+        }, function (error) {
+            root.notice = String(error)
+            if (failed) failed()
+        })
     }
 
     function loadToken() {
@@ -131,11 +137,10 @@ Item {
     }
 
     function buildPolicy() {
-        const usesRoom = [root.agentUpTo, root.agentAbove, root.nodeUpTo, root.nodeAbove].indexOf(2) >= 0
         return {
             agent: { limit_lepta: root.agentLimit || "0", up_to: root.approverKeys[root.agentUpTo], above: root.approverKeys[root.agentAbove] },
             node: { limit_lepta: root.nodeLimit || "0", up_to: root.approverKeys[root.nodeUpTo], above: root.approverKeys[root.nodeAbove] },
-            room: usesRoom || root.roomTopic !== "" ? {
+            room: root.roomTopic !== "" ? {
                 topic: root.roomTopic,
                 approvers: root.roomApprovers,
                 approvals: root.roomApprovals,
@@ -151,16 +156,22 @@ Item {
         })
     }
 
+    // The room's members; with none trusted yet, you are ticked by default.
     function loadMembers(topic) {
         root.members = []
         if (!topic) return
-        call(backend.roomMembers(topic), function (reply) { root.members = reply.members || [] })
+        call(backend.roomMembers(topic), function (reply) {
+            root.members = reply.members || []
+            const you = root.members.filter(function (m) { return m.you && !m.agent })
+            if (root.roomApprovers.length === 0 && you.length > 0) root.roomApprovers = [you[0].key]
+        })
     }
 
     function toggleApprover(key, on) {
         const now = root.roomApprovers.filter(function (k) { return k !== key })
         if (on) now.push(key)
         root.roomApprovers = now
+        root.roomApprovals = Math.max(1, Math.min(root.roomApprovals, now.length))
         root.draftDirty = true
     }
 
@@ -563,10 +574,12 @@ Item {
                                     Layout.preferredWidth: 160
                                     validator: RegularExpressionValidator { regularExpression: /[0-9]{1,30}/ }
                                     text: modelData.node ? root.nodeLimit : root.agentLimit
+                                    // Editing breaks the binding: bind again, so Discard shows the saved limit.
                                     onTextEdited: {
                                         if (modelData.node) root.nodeLimit = text
                                         else root.agentLimit = text
                                         root.draftDirty = true
+                                        text = Qt.binding(function () { return modelData.node ? root.nodeLimit : root.agentLimit })
                                     }
                                 }
                                 LogosText { text: qsTr("Up to it") }
@@ -577,6 +590,7 @@ Item {
                                         if (modelData.node) root.nodeUpTo = index
                                         else root.agentUpTo = index
                                         root.draftDirty = true
+                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeUpTo : root.agentUpTo })
                                     }
                                 }
                                 LogosText { text: qsTr("Above it") }
@@ -587,6 +601,7 @@ Item {
                                         if (modelData.node) root.nodeAbove = index
                                         else root.agentAbove = index
                                         root.draftDirty = true
+                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeAbove : root.agentAbove })
                                     }
                                 }
                             }
@@ -630,7 +645,7 @@ Item {
                                 root.call(root.backend.seatSetUp(), function () {
                                     root.settingUpSeat = false
                                     root.notice = qsTr("The agent's seat is ready. Invite it into your room from Muster.")
-                                })
+                                }, function () { root.settingUpSeat = false })
                             }
                         }
                     }
@@ -677,14 +692,18 @@ Item {
                     ComboBox {
                         id: roomPicker
                         Layout.fillWidth: true
-                        model: (root.seat.rooms || []).map(function (r) { return r.title ? r.title + "  " + r.topic : r.topic })
-                        currentIndex: (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
-                        displayText: currentIndex < 0 ? qsTr("Pick one of the agent's rooms") : currentText
+                        // First "No room": a room tier then can't be saved, and requests waiting for a room are cancelled.
+                        model: [qsTr("No room")].concat((root.seat.rooms || []).map(function (r) { return r.title ? r.title + "  " + r.topic : r.topic }))
+                        currentIndex: 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
                         onActivated: function (index) {
-                            root.roomTopic = root.seat.rooms[index].topic
+                            root.roomTopic = index === 0 ? "" : root.seat.rooms[index - 1].topic
                             root.roomApprovers = []
+                            root.roomApprovals = 1
                             root.draftDirty = true
                             root.loadMembers(root.roomTopic)
+                            currentIndex = Qt.binding(function () {
+                                return 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
+                            })
                         }
                     }
                     Repeater {
@@ -696,7 +715,10 @@ Item {
                             text: (modelData.agent ? qsTr("The agent (never trusted)")
                                 : modelData.you ? qsTr("You")
                                 : modelData.alias || modelData.key)
-                            onToggled: root.toggleApprover(modelData.key, checked)
+                            onToggled: {
+                                root.toggleApprover(modelData.key, checked)
+                                checked = Qt.binding(function () { return !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0 })
+                            }
                         }
                     }
                     RowLayout {
@@ -705,14 +727,22 @@ Item {
                             from: 1
                             to: Math.max(1, root.roomApprovers.length)
                             value: root.roomApprovals
-                            onValueModified: { root.roomApprovals = value; root.draftDirty = true }
+                            onValueModified: {
+                                root.roomApprovals = value
+                                root.draftDirty = true
+                                value = Qt.binding(function () { return root.roomApprovals })
+                            }
                         }
                         LogosText { text: qsTr("Waits up to (minutes)") }
                         SpinBox {
                             from: 1
                             to: 10080
                             value: root.roomExpires
-                            onValueModified: { root.roomExpires = value; root.draftDirty = true }
+                            onValueModified: {
+                                root.roomExpires = value
+                                root.draftDirty = true
+                                value = Qt.binding(function () { return root.roomExpires })
+                            }
                         }
                     }
 
