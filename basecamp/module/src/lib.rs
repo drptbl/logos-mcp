@@ -131,9 +131,9 @@ static WALLET: std::sync::OnceLock<(LogosServer, tokio::runtime::Handle)> =
 static ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// The agent's own seat in Muster: Basecamp's one Muster is the user's.
 static SEAT: std::sync::OnceLock<Seat> = std::sync::OnceLock::new();
-/// How long one logosctl call to the agent's seat may take: installing Muster
-/// downloads it.
-const SEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long one logosctl call to the agent's seat may take. Installing Muster
+/// has its own, longer limit.
+const SEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
 
 fn start(data_dir: PathBuf) -> Result<(), String> {
@@ -333,12 +333,13 @@ impl LogosMcpModule for ModuleImpl {
     }
 
     fn about_to_unload(&self) -> logos_rust_sdk::Shutdown {
-        if let Some(stop) = STOP.get() {
-            stop.cancel();
-        }
-        // The seat runs while the module does. Invites wait in the store meanwhile.
+        // The seat runs while the module does, stopped first, while the runtime
+        // still runs. Invites wait in the store meanwhile.
         if let (Some(seat), Some((_, runtime))) = (SEAT.get(), WALLET.get()) {
             runtime.block_on(seat.stop());
+        }
+        if let Some(stop) = STOP.get() {
+            stop.cancel();
         }
         logos_rust_sdk::Shutdown::Synchronous
     }
@@ -423,13 +424,13 @@ impl LogosMcpModule for ModuleImpl {
     }
 
     fn seat_join(&self, topic: String) -> String {
-        for_app(|_| on_seat(|seat| async move { seat.join(&topic).await.map(|()| json!({ "joined": topic })) }))
+        for_app(|_| on_server(|s| async move { s.seat_join(&topic).await.map(|()| json!({ "joined": topic })) }))
     }
 
     fn room_members(&self, topic: String) -> String {
         for_app(|_| {
             let you = users_muster_key();
-            let members = on_seat(|seat| async move { seat.members(&topic).await.map(Value::from) })?;
+            let members = on_server(|s| async move { s.room_members(&topic).await.map(Value::from) })?;
             let marked: Vec<Value> = members
                 .as_array()
                 .cloned()
