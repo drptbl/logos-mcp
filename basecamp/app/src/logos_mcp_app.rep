@@ -6,8 +6,12 @@ class LogosMcpApp
     PROP(QString activity="[]" READONLY)
     // The open wallet: its status and accounts, which of them are the agent's.
     PROP(QString wallet="{}" READONLY)
-    // Transfers waiting for the user's approval.
+    // Transfers waiting for the user's approval, and those waiting for the room.
     PROP(QString approvals="{}" READONLY)
+    // Who approves each wallet's transfers: tiers per wallet and the room.
+    PROP(QString approvalPolicy="{}" READONLY)
+    // The agent's own seat in Muster: running, its invite id, rooms, invites.
+    PROP(QString seat="{}" READONLY)
     SLOT(QString token())
     SLOT(QString rotateToken())
     SLOT(QString setPermission(QString group, bool enabled))
@@ -16,4 +20,10 @@ class LogosMcpApp
     SLOT(void refreshWallet())
     SLOT(QString approve(QString requestId))
     SLOT(QString deny(QString requestId))
+    SLOT(QString cancelRoomRequest(QString requestId))
+    SLOT(QString saveApprovalPolicy(QString policy))
+    SLOT(QString seatSetUp())
+    SLOT(QString seatJoin(QString topic))
+    SLOT(QString roomMembers(QString topic))
+    SLOT(void refreshSeat())
 }

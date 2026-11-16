@@ -18,6 +18,27 @@ Item {
     readonly property var activity: parse(backend ? backend.activity : "[]", [])
     readonly property var wallet: parse(backend ? backend.wallet : "{}", {})
     readonly property var approvals: parse(backend ? backend.approvals : "{}", {})
+    readonly property var approvalPolicy: parse(backend ? backend.approvalPolicy : "{}", {})
+    readonly property var seat: parse(backend ? backend.seat : "{}", {})
+
+    // The approval policy being edited: loaded from what logos_mcp saved,
+    // until the user changes something, and saved as a whole.
+    property bool draftDirty: false
+    property string agentLimit: "0"
+    property int agentUpTo: 0
+    property int agentAbove: 0
+    property string nodeLimit: "0"
+    property int nodeUpTo: 1
+    property int nodeAbove: 1
+    property string roomTopic: ""
+    property var roomApprovers: []
+    property int roomApprovals: 1
+    property int roomExpires: 60
+    // The chosen room's members, as the agent's seat sees them.
+    property var members: []
+    property bool settingUpSeat: false
+    readonly property var approverKeys: ["send", "ask", "room"]
+    readonly property var approverNames: [qsTr("Send"), qsTr("Ask me"), qsTr("Room")]
     // The account waiting for the user to confirm handing it over.
     property var handOver: null
 
@@ -35,8 +56,7 @@ Item {
         { key: "transfers", title: qsTr("Transfers"), detail: qsTr("Send LEZ from the agent accounts, and ask to send TestToken from your chain node") },
         { key: "discovery", title: qsTr("Discovery"), detail: qsTr("Advertise and find services, see connected peers") },
         { key: "chain", title: qsTr("Chain"), detail: qsTr("Read the Logos chain, and claim your node's leader rewards, which costs a fee") },
-        { key: "chat", title: qsTr("Chat"), detail: qsTr("Uses your Basecamp chat account: the agent reads and sends in every Logos Chat conversation you have") },
-        { key: "ask_before_transfer", title: qsTr("Ask me before each transfer"), detail: qsTr("Every transfer waits for your OK in the Wallet tab. Off: the agent sends on its own") }
+        { key: "chat", title: qsTr("Chat"), detail: qsTr("Uses your Basecamp chat account: the agent reads and sends in every Logos Chat conversation you have") }
     ]
 
     function parse(text, fallback) {
@@ -90,6 +110,72 @@ Item {
         return sum.replace(/^0+(?=.)/, "")
     }
 
+    // ---- the approval policy draft -------------------------------------------
+    function tier(name) { return Math.max(0, root.approverKeys.indexOf(name)) }
+
+    function loadDraft() {
+        const p = root.approvalPolicy
+        if (!p.agent) return
+        root.agentLimit = p.agent.limit_lepta
+        root.agentUpTo = tier(p.agent.up_to)
+        root.agentAbove = tier(p.agent.above)
+        root.nodeLimit = p.node.limit_lepta
+        root.nodeUpTo = tier(p.node.up_to)
+        root.nodeAbove = tier(p.node.above)
+        const room = p.room || {}
+        if (room.topic && room.topic !== root.roomTopic) loadMembers(room.topic)
+        root.roomTopic = room.topic || ""
+        root.roomApprovers = room.approvers || []
+        root.roomApprovals = room.approvals || 1
+        root.roomExpires = room.expires_mins || 60
+    }
+
+    function buildPolicy() {
+        const usesRoom = [root.agentUpTo, root.agentAbove, root.nodeUpTo, root.nodeAbove].indexOf(2) >= 0
+        return {
+            agent: { limit_lepta: root.agentLimit || "0", up_to: root.approverKeys[root.agentUpTo], above: root.approverKeys[root.agentAbove] },
+            node: { limit_lepta: root.nodeLimit || "0", up_to: root.approverKeys[root.nodeUpTo], above: root.approverKeys[root.nodeAbove] },
+            room: usesRoom || root.roomTopic !== "" ? {
+                topic: root.roomTopic,
+                approvers: root.roomApprovers,
+                approvals: root.roomApprovals,
+                expires_mins: root.roomExpires
+            } : null
+        }
+    }
+
+    function savePolicy() {
+        call(backend.saveApprovalPolicy(JSON.stringify(buildPolicy())), function () {
+            root.draftDirty = false
+            root.notice = qsTr("Saved: transfers follow the new approvals now, waiting ones too.")
+        })
+    }
+
+    function loadMembers(topic) {
+        root.members = []
+        if (!topic) return
+        call(backend.roomMembers(topic), function (reply) { root.members = reply.members || [] })
+    }
+
+    function toggleApprover(key, on) {
+        const now = root.roomApprovers.filter(function (k) { return k !== key })
+        if (on) now.push(key)
+        root.roomApprovers = now
+        root.draftDirty = true
+    }
+
+    // What a waiting transfer does, in words.
+    function describe(request) {
+        return request.chain
+            ? qsTr("%1 on the Logos chain from your node's %2 to %3")
+                .arg(root.lez(request.amount_lepta, "TestToken")).arg(request.from).arg(request.to)
+            : request.call
+            ? qsTr("%1 from %2 %3").arg(root.lez(request.amount_lepta)).arg(request.from).arg(request.call.description)
+            : qsTr("%1 from %2 to %3").arg(root.lez(request.amount_lepta)).arg(request.from).arg(request.to)
+    }
+
+    onApprovalPolicyChanged: if (!root.draftDirty) loadDraft()
+
     function time(seconds) {
         return new Date(seconds * 1000).toLocaleTimeString(Qt.locale(), Locale.ShortFormat)
     }
@@ -138,6 +224,7 @@ Item {
             TabButton { text: qsTr("Connect") }
             TabButton { text: qsTr("Permissions") }
             TabButton { text: qsTr("Wallet") }
+            TabButton { text: qsTr("Approvals") }
             TabButton { text: qsTr("Activity") }
         }
 
@@ -225,10 +312,8 @@ Item {
                         // Always shows what logos_mcp saved: any flip by input snaps back,
                         // and a click only asks for the change.
                         Switch {
-                            // Asking is off unless saved on; tool groups are on unless saved off.
-                            readonly property bool saved: modelData.key === "ask_before_transfer"
-                                ? root.permissions[modelData.key] === true
-                                : root.permissions[modelData.key] !== false
+                            // Tool groups are on unless saved off.
+                            readonly property bool saved: root.permissions[modelData.key] !== false
                             checked: saved
                             onCheckedChanged: if (checked !== saved) checked = Qt.binding(function () { return saved })
                             enabled: root.ready
@@ -296,18 +381,7 @@ Item {
                             wrapMode: Text.WordWrap
                             // A program call, such as an escrow open, says what it does.
                             // A chain transfer spends the chain node's own wallet.
-                            text: modelData.chain
-                                ? qsTr("%1 on the Logos chain from your node's %2 to %3, asked at %4")
-                                    .arg(root.lez(modelData.amount_lepta, "TestToken")).arg(modelData.from)
-                                    .arg(modelData.to).arg(root.time(modelData.requested_at))
-                                : modelData.call
-                                ? qsTr("%1 from %2 %3, asked at %4")
-                                    .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
-                                    .arg(modelData.call.description)
-                                    .arg(root.time(modelData.requested_at))
-                                : qsTr("%1 from %2 to %3, asked at %4")
-                                    .arg(root.lez(modelData.amount_lepta)).arg(modelData.from)
-                                    .arg(modelData.to).arg(root.time(modelData.requested_at))
+                            text: qsTr("%1, asked at %2").arg(root.describe(modelData)).arg(root.time(modelData.requested_at))
                         }
                         LogosButton {
                             text: qsTr("Deny")
@@ -321,6 +395,36 @@ Item {
                             enabled: root.ready
                             onClicked: root.call(root.backend.approve(modelData.id), function () {
                                 root.notice = qsTr("Approved: sending it now.")
+                            })
+                        }
+                    }
+                }
+
+                // Transfers waiting for the Muster room: approved there, never here.
+                LogosText {
+                    visible: (root.approvals.room || []).length > 0
+                    font.weight: Theme.typography.weightBold
+                    color: Theme.palette.warning
+                    text: qsTr("Waiting for the room")
+                }
+                Repeater {
+                    model: root.approvals.room || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        LogosText {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: qsTr("%1. %2 of %3 approvals, approve it in Muster. Expires at %4")
+                                .arg(root.describe(modelData))
+                                .arg(modelData.room.approvals).arg(modelData.room.required)
+                                .arg(root.time(modelData.room.expires_at))
+                        }
+                        LogosButton {
+                            text: qsTr("Cancel")
+                            enabled: root.ready
+                            onClicked: root.call(root.backend.cancelRoomRequest(modelData.id), function () {
+                                root.notice = qsTr("Cancelled: it will not be sent, and its card closes in the room.")
                             })
                         }
                     }
@@ -420,6 +524,208 @@ Item {
                                     })
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // ---- Approvals -----------------------------------------------
+            ScrollView {
+                id: approvalsView
+                clip: true
+                contentWidth: availableWidth
+
+                ColumnLayout {
+                    width: approvalsView.availableWidth
+                    spacing: Theme.spacing.medium
+
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: Theme.palette.textSecondary
+                        text: qsTr("For each wallet, a limit splits transfers in two. Each side is sent by the agent, waits for your OK in the Wallet tab, or waits for trusted people in a Muster room. The side above the limit can't be looser than the one under it. A limit of 0 puts every transfer above it.")
+                    }
+
+                    Repeater {
+                        model: [
+                            { title: qsTr("Agent wallet (LEZ, escrow payments included)"), node: false },
+                            { title: qsTr("Node wallet (Logos chain transfers)"), node: true }
+                        ]
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            spacing: Theme.spacing.small
+                            LogosText { text: modelData.title; font.weight: Theme.typography.weightMedium }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                LogosText { text: qsTr("Limit (lepta)") }
+                                TextField {
+                                    Layout.preferredWidth: 160
+                                    validator: RegularExpressionValidator { regularExpression: /[0-9]{1,30}/ }
+                                    text: modelData.node ? root.nodeLimit : root.agentLimit
+                                    onTextEdited: {
+                                        if (modelData.node) root.nodeLimit = text
+                                        else root.agentLimit = text
+                                        root.draftDirty = true
+                                    }
+                                }
+                                LogosText { text: qsTr("Up to it") }
+                                ComboBox {
+                                    model: root.approverNames
+                                    currentIndex: modelData.node ? root.nodeUpTo : root.agentUpTo
+                                    onActivated: function (index) {
+                                        if (modelData.node) root.nodeUpTo = index
+                                        else root.agentUpTo = index
+                                        root.draftDirty = true
+                                    }
+                                }
+                                LogosText { text: qsTr("Above it") }
+                                ComboBox {
+                                    model: root.approverNames
+                                    currentIndex: modelData.node ? root.nodeAbove : root.agentAbove
+                                    onActivated: function (index) {
+                                        if (modelData.node) root.nodeAbove = index
+                                        else root.agentAbove = index
+                                        root.draftDirty = true
+                                    }
+                                }
+                            }
+                            LogosText {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                color: Theme.palette.warning
+                                visible: modelData.node && (root.nodeUpTo === 0 || root.nodeAbove === 0)
+                                text: qsTr("With Send, the agent spends your own node wallet without asking anyone.")
+                            }
+                        }
+                    }
+
+                    LogosText { text: qsTr("The agent's seat in Muster"); font.weight: Theme.typography.weightMedium }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: Theme.palette.textSecondary
+                        text: qsTr("A room approves with the agent as its own member, never as you. Its seat is a logosctl session the module runs in its data folder.")
+                    }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        visible: !root.seat.logosctl
+                        color: Theme.palette.warning
+                        text: qsTr("logosctl isn't installed: install it first, then come back here.")
+                    }
+                    RowLayout {
+                        visible: !!root.seat.logosctl && !root.seat.set_up
+                        Layout.fillWidth: true
+                        LogosText {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: qsTr("Sets up the seat: installs Muster and the six modules it needs from Muster's catalogue (github.com/corpetty/muster) into its own session, and runs it while this module runs.")
+                        }
+                        LogosButton {
+                            text: root.settingUpSeat ? qsTr("Setting up…") : qsTr("Set up agent seat")
+                            enabled: root.ready && !root.settingUpSeat
+                            onClicked: {
+                                root.settingUpSeat = true
+                                root.call(root.backend.seatSetUp(), function () {
+                                    root.settingUpSeat = false
+                                    root.notice = qsTr("The agent's seat is ready. Invite it into your room from Muster.")
+                                })
+                            }
+                        }
+                    }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        visible: !!root.seat.set_up
+                        color: root.seat.running ? Theme.palette.success : Theme.palette.warning
+                        text: root.seat.running ? qsTr("The seat is running as %1.").arg(root.seat.key || "")
+                            : qsTr("The seat isn't running: %1").arg(root.seat.error || qsTr("starting"))
+                    }
+                    RowLayout {
+                        visible: !!root.seat.invite_id
+                        Layout.fillWidth: true
+                        LogosText {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            font.family: "monospace"
+                            text: qsTr("Invite id: %1").arg(root.seat.invite_id || "")
+                        }
+                        LogosButton { text: qsTr("Copy"); onClicked: root.copy(root.seat.invite_id) }
+                    }
+                    Repeater {
+                        model: root.seat.invites || []
+                        delegate: RowLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            LogosText {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                text: qsTr("Invited to %1 by %2").arg(modelData.topic).arg(modelData.from_alias || modelData.from)
+                            }
+                            LogosButton {
+                                text: qsTr("Join")
+                                enabled: root.ready
+                                onClicked: root.call(root.backend.seatJoin(modelData.topic), function () {
+                                    root.notice = qsTr("The agent joined the room. Its members show up within a minute.")
+                                })
+                            }
+                        }
+                    }
+
+                    LogosText { text: qsTr("Room"); font.weight: Theme.typography.weightMedium }
+                    ComboBox {
+                        id: roomPicker
+                        Layout.fillWidth: true
+                        model: (root.seat.rooms || []).map(function (r) { return r.title ? r.title + "  " + r.topic : r.topic })
+                        currentIndex: (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
+                        displayText: currentIndex < 0 ? qsTr("Pick one of the agent's rooms") : currentText
+                        onActivated: function (index) {
+                            root.roomTopic = root.seat.rooms[index].topic
+                            root.roomApprovers = []
+                            root.draftDirty = true
+                            root.loadMembers(root.roomTopic)
+                        }
+                    }
+                    Repeater {
+                        model: root.members
+                        delegate: CheckBox {
+                            required property var modelData
+                            enabled: !modelData.agent
+                            checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
+                            text: (modelData.agent ? qsTr("The agent (never trusted)")
+                                : modelData.you ? qsTr("You")
+                                : modelData.alias || modelData.key)
+                            onToggled: root.toggleApprover(modelData.key, checked)
+                        }
+                    }
+                    RowLayout {
+                        LogosText { text: qsTr("Approvals needed") }
+                        SpinBox {
+                            from: 1
+                            to: Math.max(1, root.roomApprovers.length)
+                            value: root.roomApprovals
+                            onValueModified: { root.roomApprovals = value; root.draftDirty = true }
+                        }
+                        LogosText { text: qsTr("Waits up to (minutes)") }
+                        SpinBox {
+                            from: 1
+                            to: 10080
+                            value: root.roomExpires
+                            onValueModified: { root.roomExpires = value; root.draftDirty = true }
+                        }
+                    }
+
+                    RowLayout {
+                        LogosButton {
+                            text: qsTr("Save")
+                            enabled: root.ready && root.draftDirty
+                            onClicked: root.savePolicy()
+                        }
+                        LogosButton {
+                            text: qsTr("Discard changes")
+                            enabled: root.draftDirty
+                            onClicked: { root.draftDirty = false; root.loadDraft() }
                         }
                     }
                 }

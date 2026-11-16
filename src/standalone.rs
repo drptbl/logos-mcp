@@ -145,7 +145,6 @@ fn approval_policy(cli: &Cli) -> anyhow::Result<Option<ApprovalPolicy>> {
     Ok(Some(policy))
 }
 
-
 /// Parse `args` (the program name first, as `std::env::args_os` gives them),
 /// set up logging to stderr and connect to the node through logosctl: the
 /// server `run` serves, for callers that drive it themselves, such as a

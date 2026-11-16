@@ -13,4 +13,11 @@ module logos_mcp {
   method approvals() -> tstr
   method approve(request_id: tstr) -> tstr
   method deny(request_id: tstr) -> tstr
+  method cancel_room_request(request_id: tstr) -> tstr
+  method approval_policy() -> tstr
+  method set_approval_policy(policy: tstr) -> tstr
+  method seat_status() -> tstr
+  method seat_set_up() -> tstr
+  method seat_join(topic: tstr) -> tstr
+  method room_members(topic: tstr) -> tstr
 }

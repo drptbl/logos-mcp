@@ -38,6 +38,8 @@ pub const DEFAULT_PORT: u16 = 8765;
 pub const TOKEN_FILE: &str = "token";
 /// Settings the user (and later the Agent app) can edit, in the module's data folder.
 pub const CONFIG_FILE: &str = "config.json";
+/// The agent's own logosctl session for Muster, in the module's data folder.
+pub const AGENT_SEAT_DIR: &str = "agent-seat";
 /// The record of the agent's tool calls, in the module's data folder.
 pub const ACTIVITY_FILE: &str = "activity.jsonl";
 
@@ -345,6 +347,16 @@ impl Control {
         });
         self.policy.send_replace(policy);
         Ok(self.approval_policy())
+    }
+
+    /// Whether the agent's seat was set up, as saved now.
+    pub fn agent_seat(&self) -> bool {
+        ModuleConfig::load_or_create(&self.dir).is_ok_and(|c| c.agent_seat)
+    }
+
+    /// Where the agent's seat keeps its logosctl session.
+    pub fn agent_seat_dir(&self) -> PathBuf {
+        self.dir.join(AGENT_SEAT_DIR)
     }
 
     /// Remember that the agent's seat was set up, so it starts with the module.
