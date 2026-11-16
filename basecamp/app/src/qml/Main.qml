@@ -716,16 +716,25 @@ Item {
                     }
                     Repeater {
                         model: root.members
-                        delegate: CheckBox {
+                        // The label is LogosText: CheckBox's own text takes the style's
+                        // dark colour, unreadable on Basecamp's dark background.
+                        delegate: RowLayout {
                             required property var modelData
-                            enabled: !modelData.agent
-                            checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
-                            text: (modelData.agent ? qsTr("The agent (never trusted)")
-                                : modelData.you ? qsTr("You")
-                                : modelData.alias || modelData.key)
-                            onToggled: {
-                                root.toggleApprover(modelData.key, checked)
-                                checked = Qt.binding(function () { return !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0 })
+                            CheckBox {
+                                enabled: !modelData.agent
+                                checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
+                                onToggled: {
+                                    root.toggleApprover(modelData.key, checked)
+                                    checked = Qt.binding(function () { return !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0 })
+                                }
+                            }
+                            LogosText {
+                                Layout.fillWidth: true
+                                elide: Text.ElideMiddle
+                                color: modelData.agent ? Theme.palette.textTertiary : Theme.palette.text
+                                text: (modelData.agent ? qsTr("The agent (never trusted)")
+                                    : modelData.you ? qsTr("You")
+                                    : modelData.alias || modelData.key)
                             }
                         }
                     }
