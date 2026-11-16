@@ -720,7 +720,10 @@ Item {
                         // dark colour, unreadable on Basecamp's dark background.
                         delegate: RowLayout {
                             required property var modelData
+                            Layout.fillWidth: true
                             CheckBox {
+                                id: box
+                                Accessible.name: label.text
                                 enabled: !modelData.agent
                                 checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
                                 onToggled: {
@@ -729,8 +732,14 @@ Item {
                                 }
                             }
                             LogosText {
+                                id: label
                                 Layout.fillWidth: true
                                 elide: Text.ElideMiddle
+                                // Like a CheckBox's own text, the name ticks it too.
+                                TapHandler {
+                                    enabled: box.enabled
+                                    onTapped: root.toggleApprover(modelData.key, !box.checked)
+                                }
                                 color: modelData.agent ? Theme.palette.textTertiary : Theme.palette.text
                                 text: (modelData.agent ? qsTr("The agent (never trusted)")
                                     : modelData.you ? qsTr("You")
