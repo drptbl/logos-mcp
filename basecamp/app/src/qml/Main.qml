@@ -763,7 +763,8 @@ Item {
                         LogosButton {
                             text: qsTr("Discard changes")
                             enabled: root.draftDirty
-                            onClicked: { root.draftDirty = false; root.loadDraft() }
+                            // A refusal of the discarded edit no longer applies.
+                            onClicked: { root.draftDirty = false; root.notice = ""; root.loadDraft() }
                         }
                     }
                 }
