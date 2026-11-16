@@ -2971,8 +2971,10 @@ impl LogosServer {
                     continue;
                 }
                 Verdict::Send { approvals } => {
-                    self.approvals
-                        .room_progress(&id, |p| p.approvals = approvals);
+                    self.approvals.room_progress(&id, |p| {
+                        p.approvals = approvals;
+                        p.required = settings.approvals;
+                    });
                     if !room.use_once(&intent) {
                         Decision::Failed {
                             reason: "this room approval was already used: nothing was sent".into(),

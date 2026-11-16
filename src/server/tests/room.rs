@@ -1054,6 +1054,33 @@ async fn a_sent_room_request_reports_the_approvals_that_sent_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_request_sent_after_the_count_was_raised_reports_the_new_count() {
+    let mut replies = wallet_open().to_vec(); // checks before proposing
+    replies.extend(wallet_open()); // checks again before sending
+    replies.push(sent("cd34"));
+    let runner = RoomRunner::new(replies);
+    let other = "7a1c000000000000000000000000000000000000000000000000000000e0f2aa";
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN, other]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    policy.send_modify(|p| p.room.as_mut().unwrap().approvals = 2);
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN, other],
+        &[],
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    let status = status_of(&s, &id).await;
+    assert_eq!(status["state"], "sent", "{status}");
+    assert_eq!(status["room"]["approvals"], 2, "{status}");
+    assert_eq!(status["room"]["required"], 2, "{status}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn settings_changed_while_an_approved_transfer_waits_for_the_wallet_stop_it() {
     let mut replies = wallet_open().to_vec(); // checks before proposing
     replies.extend(wallet_open()); // checks again before sending
