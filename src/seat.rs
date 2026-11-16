@@ -42,6 +42,40 @@ enum Setup {
     Failed(String),
 }
 
+/// The one setup under way. It records how setup ended when dropped: if
+/// dropped before it finishes, as when its runtime shuts down, the seat is
+/// free to be set up again.
+struct SetupClaim {
+    seat: &'static Seat,
+    result: Option<Result<(), String>>,
+}
+
+impl SetupClaim {
+    fn take(seat: &'static Seat) -> Result<Self, String> {
+        let mut setup = seat.setup.lock().unwrap();
+        if matches!(*setup, Setup::Running) {
+            return Err("the agent seat is already being set up".into());
+        }
+        *setup = Setup::Running;
+        Ok(Self { seat, result: None })
+    }
+
+    fn finish(mut self, result: Result<(), String>) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for SetupClaim {
+    fn drop(&mut self) {
+        let ended = match self.result.take() {
+            Some(Ok(())) => Setup::Idle,
+            Some(Err(e)) => Setup::Failed(e),
+            None => Setup::Failed("setting the seat up stopped before it finished".into()),
+        };
+        *self.seat.setup.lock().unwrap_or_else(|e| e.into_inner()) = ended;
+    }
+}
+
 /// A logosctl session holding the agent's Muster.
 pub struct Seat {
     runner: Arc<dyn Runner>,
@@ -124,26 +158,29 @@ impl Seat {
         self.load_muster().await
     }
 
-    /// Make the session: add Muster's catalogue, install Muster without its
-    /// optional extras, and start it. One at a time: `status` says while it
-    /// runs, and why it failed if it did.
-    pub async fn set_up(&self) -> Result<(), String> {
-        {
-            let mut setup = self.setup.lock().unwrap();
-            if matches!(*setup, Setup::Running) {
-                return Err("the agent seat is already being set up".into());
-            }
-            *setup = Setup::Running;
-        }
-        let result = self.install().await;
-        *self.setup.lock().unwrap() = match &result {
-            Ok(()) => Setup::Idle,
-            Err(e) => Setup::Failed(e.clone()),
-        };
-        result
+    /// Start setting the seat up on `runtime`, and return: installing
+    /// outlasts what a caller may wait. Then `remember` records the seat as
+    /// set up, and its error counts as setup's. One setup at a time: `status`
+    /// says while it runs, and why it failed if it did.
+    pub fn set_up_in_background(
+        &'static self,
+        runtime: &tokio::runtime::Handle,
+        remember: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<(), String> {
+        let claim = SetupClaim::take(self)?;
+        runtime.spawn(async move {
+            let result = match self.prepare_session().await {
+                Ok(()) => remember(),
+                Err(e) => Err(e),
+            };
+            claim.finish(result);
+        });
+        Ok(())
     }
 
-    async fn install(&self) -> Result<(), String> {
+    /// Make the session: add Muster's catalogue, install Muster without its
+    /// optional extras, and start it.
+    async fn prepare_session(&self) -> Result<(), String> {
         self.ensure_daemon().await?;
         let catalogs = self
             .ctl
@@ -181,7 +218,7 @@ impl Seat {
     /// rooms it is in and the invites waiting for it, and whether it is being
     /// set up or why that failed.
     pub async fn status(&self) -> Value {
-        let mut status = self.seat_status().await;
+        let mut status = self.session_status().await;
         match &*self.setup.lock().unwrap() {
             Setup::Idle => {}
             Setup::Running => status["setting_up"] = json!(true),
@@ -190,7 +227,7 @@ impl Seat {
         status
     }
 
-    async fn seat_status(&self) -> Value {
+    async fn session_status(&self) -> Value {
         if !self.running().await {
             return json!({ "running": false });
         }

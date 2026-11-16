@@ -17,6 +17,30 @@ fn muster(method: &str, value: serde_json::Value) -> RawOutput {
 const NO_DAEMON: &str = r#"{"daemon":{"reason":"No daemon running"}}"#;
 const RUNNING: &str = r#"{"daemon":{"pid":4242,"status":"running"},"modules":[]}"#;
 
+/// A seat that outlives the test, as the module's does.
+fn seat(runner: Arc<dyn Runner>) -> &'static Seat {
+    Box::leak(Box::new(Seat::new(runner)))
+}
+
+/// Set `seat` up on this test's runtime, remembering it with `remember`.
+fn set_up(
+    seat: &'static Seat,
+    remember: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    seat.set_up_in_background(&tokio::runtime::Handle::current(), remember)
+}
+
+fn setting_up(seat: &Seat) -> bool {
+    matches!(*seat.setup.lock().unwrap(), Setup::Running)
+}
+
+/// Until the background setup ends.
+async fn settled(seat: &Seat) {
+    while setting_up(seat) {
+        tokio::task::yield_now().await;
+    }
+}
+
 fn argv(fake: &FakeRunner) -> Vec<String> {
     fake.calls
         .lock()
@@ -40,7 +64,9 @@ async fn setting_up_installs_muster_without_its_optional_extras_and_opens_the_in
             serde_json::json!({"inbox": "/muster/1/muster.inbox.9/proto", "rooms": []}),
         ),
     ]);
-    Seat::new(fake.clone()).set_up().await.unwrap();
+    let seat = seat(fake.clone());
+    set_up(seat, || Ok(())).unwrap();
+    settled(seat).await;
     assert_eq!(
         argv(&fake),
         [
@@ -150,21 +176,27 @@ async fn while_setting_up_the_status_says_so_and_another_set_up_is_refused() {
         ),
     ]);
     let gate = Arc::new(tokio::sync::Notify::new());
-    let seat = Arc::new(Seat::new(Arc::new(SlowInstall {
+    let seat = seat(Arc::new(SlowInstall {
         fake: fake.clone(),
         gate: gate.clone(),
-    })));
-    let setting_up = tokio::spawn({
-        let seat = seat.clone();
-        async move { seat.set_up().await }
-    });
+    }));
+    let remembered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = remembered.clone();
+    set_up(seat, move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    // Busy as soon as the call returns, before anything ran.
+    assert!(set_up(seat, || Ok(())).is_err());
     while !argv(&fake).iter().any(|c| c.contains("install")) {
         tokio::task::yield_now().await;
     }
     assert_eq!(seat.status().await["setting_up"], true);
-    assert!(seat.set_up().await.is_err());
     gate.notify_one();
-    setting_up.await.unwrap().unwrap();
+    settled(seat).await;
+    assert!(remembered.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(seat.status().await["setup_error"], serde_json::Value::Null);
     assert_eq!(
         argv(&fake).iter().filter(|c| c.contains("install")).count(),
         1
@@ -179,9 +211,62 @@ async fn a_failed_set_up_leaves_its_error_in_the_status() {
         out(r#"[{"name":"muster","enabled":true}]"#),
         // installing gets no reply: it fails
     ]);
-    let seat = Seat::new(fake);
-    let error = seat.set_up().await.unwrap_err();
+    let seat = seat(fake);
+    set_up(seat, || panic!("a failed setup is never remembered")).unwrap();
+    settled(seat).await;
     let status = seat.status().await;
     assert_eq!(status["setting_up"], serde_json::Value::Null);
-    assert_eq!(status["setup_error"], error);
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("could not install Muster")),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn a_seat_installed_but_not_remembered_says_why() {
+    let fake = FakeRunner::with(vec![
+        out(RUNNING),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+        out(r#"{"status":"ok"}"#),
+        out(r#"{"status":"ok"}"#),
+        muster(
+            "coordinate_start_inbox",
+            serde_json::json!({"inbox": "x", "rooms": []}),
+        ),
+    ]);
+    let seat = seat(fake);
+    set_up(seat, || Err("could not save the config: disk full".into())).unwrap();
+    settled(seat).await;
+    assert_eq!(
+        seat.status().await["setup_error"],
+        "could not save the config: disk full"
+    );
+}
+
+#[test]
+fn a_setup_stopped_midway_can_be_started_again() {
+    let fake = FakeRunner::with(vec![
+        out(NO_DAEMON),
+        out("Daemon started (pid 4242)"),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+    ]);
+    let seat = seat(Arc::new(SlowInstall {
+        fake: fake.clone(),
+        gate: Arc::new(tokio::sync::Notify::new()), // never opens
+    }));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    seat.set_up_in_background(runtime.handle(), || Ok(()))
+        .unwrap();
+    runtime.block_on(async {
+        while !argv(&fake).iter().any(|c| c.contains("install")) {
+            tokio::task::yield_now().await;
+        }
+    });
+    drop(runtime); // drops the setup mid-install
+    assert!(!setting_up(seat));
+    assert!(matches!(*seat.setup.lock().unwrap(), Setup::Failed(_)));
 }

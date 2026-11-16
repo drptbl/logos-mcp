@@ -273,14 +273,20 @@ where
     runtime.block_on(f(server.clone()))
 }
 
-/// `f` on the control surface, or why there is none.
+/// The agent's seat and the runtime its calls run on, or why there are none.
+fn seat() -> Result<(&'static Seat, &'static tokio::runtime::Handle), String> {
+    let seat = SEAT.get().ok_or("the agent seat isn't ready")?;
+    let (_, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
+    Ok((seat, runtime))
+}
+
+/// `f` on the agent's seat, or why there is none.
 fn on_seat<F, Fut>(f: F) -> Result<Value, String>
 where
     F: FnOnce(&'static Seat) -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
-    let seat = SEAT.get().ok_or("the agent seat isn't ready")?;
-    let (_, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
+    let (seat, runtime) = seat()?;
     runtime.block_on(f(seat))
 }
 
@@ -419,15 +425,13 @@ impl LogosMcpModule for ModuleImpl {
     /// Basecamp's call limit. `seat_status` says how it goes.
     fn seat_set_up(&self) -> String {
         for_app(|_| {
-            let seat = SEAT.get().ok_or("the agent seat isn't ready")?;
-            let (_, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
-            runtime.spawn(async move {
-                if seat.set_up().await.is_ok() {
-                    if let Some(Err(e)) = CONTROL.get().map(Control::remember_agent_seat) {
-                        eprintln!("logos_mcp: the agent seat is set up but not remembered: {e}");
-                    }
-                }
-            });
+            let (seat, runtime) = seat()?;
+            seat.set_up_in_background(runtime, || {
+                CONTROL
+                    .get()
+                    .ok_or("the data folder was not opened")?
+                    .remember_agent_seat()
+            })?;
             Ok(json!({ "setting_up": true }))
         })
     }
