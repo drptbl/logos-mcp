@@ -235,7 +235,9 @@ logos-mcp --config-dir ~/.logosctl-agent \
   --room-above-lepta 3000000
 ```
 
-An over-limit `wallet_transfer` proposes `lez_core.transfer_public(from, to, amount)` in the room through the agent's Muster, approves it as the agent and returns `awaiting_approval` with a `request_id`. You approve or decline the card in Muster.
+An over-limit `wallet_transfer` proposes `lez_core.transfer_public(from, to, amount)` in the room through the agent's Muster, approves it as the agent and returns `awaiting_approval` with a `request_id`. Muster's card shows only the method, so the agent first posts what it does in the room's chat, e.g. `[logos-mcp] proposal 0x5a6c…: Pay 7000000 lepta from Public/4gbL… into escrow for Public/HvNb…`. Check that the line comes from the agent, then approve or decline the card in Muster.
+
+A payment through a program call, such as a logos-agents escrow open, is proposed as the exact `lez_core.send_generic_public_transaction` call it sends. It waits no longer than the call's own deadline, and one with less than a minute left is refused.
 
 logos-mcp sends the transfer once the agent's Muster shows the proposal executable, bound to this room and not expired, signed for exactly that call, and approved by `--room-approvals` distinct trusted people. The agent's own approval never counts. Neither does a signature copied in from another proposal, which Muster grades `unattested`. A decline, an expiry or a different call ends the request unsent. When it ends unsent for any reason but your decline, the agent declines its own proposal. Its approval then counts for nothing, and the card closes once the room can't reach Muster's threshold without it.
 
