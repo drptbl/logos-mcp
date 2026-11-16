@@ -29,8 +29,8 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `wallet_labels` | the account behind a label, or an account's labels, in the agent's wallet only |
 | `wallet_tx_status` | whether a LEZ transaction is in a block yet, answered at once by the wallet's sequencer |
 | `wallet_faucet` | asks the LEZ testnet faucet for its drop, 0.1 LEZ once a day, into one of the agent's own public accounts. Needs Basecamp's LEZ Faucet module |
-| `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app |
-| `wallet_transfer_status` | where a transfer that waited for approval stands, with its `tx_hash` once sent |
+| `wallet_transfer` | sends lepta from one of the agent accounts to a public account. With approvals on, it waits for your OK in the AI Agent app. With [room approval](#room-approval), a transfer over the limit waits for trusted people in a Muster room |
+| `wallet_transfer_status` | where a transfer that waited for approval stands, with its `tx_hash` once sent. A room request also shows its proposal and the trusted approvals so far |
 | `wallet_new_account` | creates a public account in the agent wallet, for example a fresh receive address per job |
 | `discovery_advertise` / `discovery_stop` | advertises a service on the Logos discovery network, or stops |
 | `discovery_lookup` | finds nodes that advertise a service |
@@ -143,9 +143,14 @@ Every flag also has an environment variable.
 | `--wallet-storage` | `LOGOS_MCP_WALLET_STORAGE` | none | the agent wallet's key storage |
 | `--discovery-bootstrap` | `LOGOS_MCP_DISCOVERY_BOOTSTRAP` | none | discovery peers as `/.../p2p/<peer id>` multiaddrs, comma separated. Discovery tools are off without them |
 | `--delivery-config` | `LOGOS_MCP_DELIVERY_CONFIG` | none | `delivery_module`'s full `createNode` config as JSON, in place of `--mode` and `--preset`, for a network no preset names, such as a local devnet hub. logos-mcp never logs it, but `delivery_module` may on a config it rejects, and it reaches `logosctl` as a command-line argument |
+| `--room-topic` | `LOGOS_MCP_ROOM_TOPIC` | none | the Muster room that approves transfers over `--room-above-lepta`, see [Room approval](#room-approval). Needs the wallet flags and `--room-approvers` |
+| `--room-approvers` | `LOGOS_MCP_ROOM_APPROVERS` | none | trusted people's Ed25519 keys as `ed:<hex>`, comma separated. Never the agent's own |
+| `--room-approvals` | `LOGOS_MCP_ROOM_APPROVALS` | `1` | distinct trusted approvals a transfer needs |
+| `--room-above-lepta` | `LOGOS_MCP_ROOM_ABOVE_LEPTA` | `0` | transfers strictly above this many lepta need the room. `0` sends every transfer to it |
+| `--room-expires-mins` | `LOGOS_MCP_ROOM_EXPIRES_MINS` | `60` | minutes a room proposal waits before it expires unsent |
 | `--timeout-secs` | | `60` | timeout for each `logosctl` call |
 
-Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit. Create it once with `logosctl`, using a config that points at the LEZ sequencer:
+Give the agent its own wallet with a small balance, not the one you use. The agent can spend all of it, so the balance is its limit, unless you add [room approval](#room-approval). Create it once with `logosctl`, using a config that points at the LEZ sequencer:
 
 ```bash
 logosctl call lez_core create_new str:$HOME/.logos-agent/wallet_config.json str:$HOME/.logos-agent/storage.json str:
@@ -214,6 +219,37 @@ On `logos.test` every message carries a rate-limiting proof, so your node needs 
 
 Start on `logos.dev` if you just want to try it.
 
+## Room approval
+
+Outside Basecamp nobody clicks Approve, so the wallet's balance is the agent's only limit. Room approval adds one: a transfer over `--room-above-lepta` waits for trusted people to approve it in a [Muster](https://github.com/corpetty/muster) room.
+
+1. Give the agent its own Muster identity => install `muster_module` into the agent's `logosctl` session from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`) with `logosctl package install muster_module`
+2. Invite the agent into your room from your own Muster, and have it join. Muster proposes in its active room, so if the agent is in several rooms, join this one last
+3. Start logos-mcp with the room's topic and the Ed25519 keys of the people whose approval counts. Muster's `identity` shows yours as `ed25519`
+
+```bash
+logos-mcp --config-dir ~/.logosctl-agent \
+  --wallet-config ~/.logos-agent/wallet_config.json --wallet-storage ~/.logos-agent/storage.json \
+  --room-topic /muster/1/my-room/proto \
+  --room-approvers ed:0b00086682a0d169f90095b9d58e6c003ee591531ccf8b59c712c1cb70603269 \
+  --room-above-lepta 3000000
+```
+
+An over-limit `wallet_transfer` proposes `lez_core.transfer_public(from, to, amount)` in the room through the agent's Muster, approves it as the agent and returns `awaiting_approval` with a `request_id`. Muster's card shows only the method, so the agent first posts what it does in the room's chat, e.g. `[logos-mcp] proposal 0x5a6c…: Pay 7000000 lepta from Public/4gbL… into escrow for Public/HvNb…`. Check that the line comes from the agent, then approve or decline the card in Muster.
+
+A payment through a program call, such as a logos-agents escrow open, is proposed as the exact `lez_core.send_generic_public_transaction` call it sends. It waits no longer than the call's own deadline, and one with less than a minute left is refused.
+
+logos-mcp sends the transfer once the agent's Muster shows the proposal executable, bound to this room and not expired, signed for exactly that call, and approved by `--room-approvals` distinct trusted people. The agent's own approval never counts. Neither does a signature copied in from another proposal, which Muster grades `unattested`. A decline, an expiry or a different call ends the request unsent. When it ends unsent for any reason but your decline, the agent declines its own proposal. Its approval then counts for nothing, and the card closes once the room can't reach Muster's threshold without it.
+
+Keep in mind:
+
+- the agent must have no shell on that `logosctl` session. With one it could call Muster or `lez_core` itself
+- the limit is per transfer, so the agent can still send several transfers under it
+- a restart drops waiting requests, and nothing dropped is ever sent. The first room proposal after a restart declines the agent's own proposals they left collecting in Muster
+- run one logos-mcp per agent Muster. A second one would decline the first one's proposals when it starts proposing
+- the first proposal waits up to 90 s for Muster's delivery node, because Muster loses sends made while it starts ([corpetty/muster#373](https://github.com/corpetty/muster/issues/373))
+- it's standalone only for now. Basecamp runs one Muster with your own identity, so the agent would propose and approve as you
+
 ## Security
 
 The server is the boundary between your agent and your node, so it checks what the agent asks for:
@@ -224,6 +260,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - there is no tool that calls arbitrary module methods
 - `wallet_tx_status` is the one tool that skips `logosctl`: it asks the sequencer in the wallet config directly, because `lez_core` only has a lookup that blocks for minutes
 - `chain_transfer` spends the chain node's wallet, which is yours, so each one waits for your Approve whatever the switches say. Outside Basecamp there is nobody to approve, so it refuses
+- with room approval, `wallet_transfer` over the limit sends only what trusted people approved in the room, read from the agent's own Muster. No tool approves anything
 - `wallet_faucet` only pays into the agent's own public accounts
 - `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest
 - `wallet_transfer` only sends from the agent wallet: the one this server opened, or the configured wallet found already open, with exactly its accounts on its sequencer. If `lez_core` has another wallet open, it refuses

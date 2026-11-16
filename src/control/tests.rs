@@ -382,3 +382,78 @@ async fn waiting_requests_are_capped() {
         .unwrap_err();
     assert!(e.contains("waiting"), "{e}");
 }
+
+fn room_progress() -> RoomProgress {
+    RoomProgress {
+        topic: "/muster/1/r/proto".into(),
+        intent_id: None,
+        muster_state: "proposing".into(),
+        approvals: 0,
+        required: 1,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_the_room_answers_a_room_request() {
+    let approvals = Approvals::default();
+    let (id, _) = approvals
+        .request_room(
+            "Public/a",
+            "Public/b",
+            "9",
+            None,
+            room_progress(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+    assert!(approvals.waiting().is_empty(), "the user isn't asked");
+    assert!(approvals.approve(&id).unwrap_err().contains("room"));
+    assert!(approvals.deny(&id).unwrap_err().contains("room"));
+    approvals.room_progress(&id, |p| {
+        p.intent_id = Some("0xab".into());
+        p.approvals = 1;
+    });
+    let status = approvals.status(&id).unwrap();
+    assert_eq!(status["state"], "waiting");
+    assert_eq!(status["room"]["intent_id"], "0xab");
+    assert_eq!(status["room"]["approvals"], 1);
+    approvals.room_answer(&id, Decision::Approved).unwrap();
+    assert_eq!(approvals.status(&id).unwrap()["state"], "approved");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_request_expires_after_its_own_window() {
+    let approvals = Approvals::default();
+    let (id, _) = approvals
+        .request_room(
+            "Public/a",
+            "Public/b",
+            "9",
+            None,
+            room_progress(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+    tokio::time::advance(APPROVAL_EXPIRES + Duration::from_secs(1)).await;
+    assert_eq!(approvals.status(&id).unwrap()["state"], "waiting");
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(approvals.status(&id).unwrap()["state"], "expired");
+    assert!(approvals.room_answer(&id, Decision::Approved).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agent_can_cancel_its_room_request() {
+    let approvals = Approvals::default();
+    let (id, _) = approvals
+        .request_room(
+            "Public/a",
+            "Public/b",
+            "9",
+            None,
+            room_progress(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+    assert_eq!(approvals.cancel(&id), Decision::Cancelled);
+    assert!(approvals.room_answer(&id, Decision::Approved).is_err());
+}

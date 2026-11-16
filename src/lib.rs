@@ -9,6 +9,7 @@ pub mod events;
 pub mod guard;
 pub mod logosctl;
 pub mod node;
+pub mod room;
 pub mod server;
 #[cfg(feature = "cli")]
 pub mod standalone;

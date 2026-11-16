@@ -13,6 +13,7 @@ use crate::{
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
     node::Node,
+    room::RoomApproval,
     server::{DeliveryConfig, LogosServer, NodeSettings, WalletMode, WalletPaths},
 };
 
@@ -66,9 +67,68 @@ struct Cli {
     #[arg(long, env = "LOGOS_MCP_DELIVERY_CONFIG", hide_env_values = true)]
     delivery_config: Option<String>,
 
+    /// The Muster room whose trusted humans approve transfers over --room-above-lepta,
+    /// e.g. /muster/1/my-room/proto. The agent's own muster_module, in this logosctl
+    /// session, must have joined it.
+    #[arg(long, env = "LOGOS_MCP_ROOM_TOPIC", requires_all = ["room_approvers", "wallet_config"])]
+    room_topic: Option<String>,
+
+    /// Trusted humans whose approval counts in the room, as ed:<Ed25519 key hex>,
+    /// comma separated. Never the agent's own key.
+    #[arg(
+        long,
+        env = "LOGOS_MCP_ROOM_APPROVERS",
+        value_delimiter = ',',
+        requires = "room_topic"
+    )]
+    room_approvers: Vec<String>,
+
+    /// How many distinct trusted humans must approve a transfer.
+    #[arg(
+        long,
+        env = "LOGOS_MCP_ROOM_APPROVALS",
+        default_value_t = 1,
+        requires = "room_topic"
+    )]
+    room_approvals: usize,
+
+    /// Transfers strictly above this many lepta need the room; 0 sends every one to it.
+    #[arg(
+        long,
+        env = "LOGOS_MCP_ROOM_ABOVE_LEPTA",
+        default_value_t = 0,
+        requires = "room_topic"
+    )]
+    room_above_lepta: u128,
+
+    /// Minutes a room proposal waits for approval before it expires unsent.
+    #[arg(
+        long,
+        env = "LOGOS_MCP_ROOM_EXPIRES_MINS",
+        default_value_t = 60,
+        requires = "room_topic"
+    )]
+    room_expires_mins: u64,
+
     /// Timeout for each logosctl call, in seconds.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
+}
+
+/// The room approval the options set up, if any.
+fn room_approval(cli: &Cli) -> anyhow::Result<Option<RoomApproval>> {
+    let Some(topic) = &cli.room_topic else {
+        return Ok(None);
+    };
+    RoomApproval::new(
+        topic,
+        &cli.room_approvers,
+        cli.room_approvals,
+        cli.room_above_lepta,
+        cli.room_expires_mins,
+    )
+    .map(Some)
+    .map_err(anyhow::Error::msg)
 }
 
 fn find_logosctl() -> Option<PathBuf> {
@@ -111,6 +171,7 @@ where
         .about(app.about)
         .get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches)?;
+    let room = room_approval(&cli)?;
     let bin = match cli.logosctl.or_else(find_logosctl) {
         Some(b) if b.is_file() => b,
         Some(b) => bail!("logosctl not found at {}", b.display()),
@@ -179,7 +240,14 @@ where
     node.watch("delivery_module", events.clone());
     node.watch("storage_module", events.clone());
 
-    Ok(LogosServer::new(node, events, files, settings))
+    let server = LogosServer::new(node, events, files, settings);
+    Ok(match room {
+        Some(room) => {
+            tracing::info!(topic = %room.topic, approvals = room.approvals, above_lepta = %room.above_lepta, "room approval on");
+            server.with_room_approval(room)
+        }
+        None => server,
+    })
 }
 
 /// Parse the process's options, connect to the node through logosctl and serve
@@ -228,6 +296,94 @@ mod tests {
         .err()
         .expect("a missing logosctl is refused");
         assert!(err.to_string().contains("/nonexistent/logosctl"), "{err}");
+    }
+
+    fn fake_logosctl(dir: &std::path::Path) -> OsString {
+        let logosctl = dir.join("logosctl");
+        std::fs::write(&logosctl, "").unwrap();
+        logosctl.into_os_string()
+    }
+
+    #[tokio::test]
+    async fn room_approval_needs_the_agent_wallet_and_a_sound_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let logosctl = fake_logosctl(dir.path());
+        let room = |extra: &[&str]| {
+            let mut args: Vec<OsString> = vec![
+                "logos-mcp-test".into(),
+                "--logosctl".into(),
+                logosctl.clone(),
+            ];
+            args.extend(extra.iter().map(OsString::from));
+            Cli::try_parse_from(args)
+        };
+        let approver = "ed:0b00086682a0d169f90095b9d58e6c003ee591531ccf8b59c712c1cb70603269";
+        // A room without the agent wallet, or approvers without a room, is refused.
+        assert!(
+            room(&[
+                "--room-topic",
+                "/muster/1/r/proto",
+                "--room-approvers",
+                approver
+            ])
+            .is_err()
+        );
+        assert!(room(&["--room-approvers", approver]).is_err());
+        let wallet = dir.path().join("w.json");
+        std::fs::write(&wallet, "{}").unwrap();
+        let wallet = wallet.to_str().unwrap();
+        let cli = room(&[
+            "--wallet-config",
+            wallet,
+            "--wallet-storage",
+            wallet,
+            "--room-topic",
+            "/muster/1/r/proto",
+            "--room-approvers",
+            approver,
+            "--room-above-lepta",
+            "3000000",
+        ])
+        .unwrap();
+        let config = room_approval(&cli).unwrap().unwrap();
+        assert_eq!(config.approvals, 1);
+        assert_eq!(config.expires, Duration::from_secs(3600));
+        assert!(!config.needs_room("3000000"));
+        assert!(config.needs_room("3000001"));
+        let too_many = room(&[
+            "--wallet-config",
+            wallet,
+            "--wallet-storage",
+            wallet,
+            "--room-topic",
+            "/muster/1/r/proto",
+            "--room-approvers",
+            approver,
+            "--room-approvals",
+            "2",
+        ])
+        .unwrap();
+        assert!(room_approval(&too_many).is_err());
+        // A limit without a room would leave transfers ungated: refused.
+        for flag in [
+            ["--room-above-lepta", "5"],
+            ["--room-approvals", "2"],
+            ["--room-expires-mins", "5"],
+        ] {
+            assert!(
+                room(&[
+                    "--wallet-config",
+                    wallet,
+                    "--wallet-storage",
+                    wallet,
+                    flag[0],
+                    flag[1],
+                ])
+                .is_err()
+            );
+        }
+        let none = room(&[]).unwrap();
+        assert!(room_approval(&none).unwrap().is_none());
     }
 
     #[tokio::test]

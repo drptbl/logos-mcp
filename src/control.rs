@@ -158,6 +158,24 @@ pub struct TransferRequest {
     /// one: `from` and `to` are chain keys and the amount is in its lepta.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub chain: bool,
+    /// Set when trusted humans in a Muster room decide it, not the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomProgress>,
+}
+
+/// How far a room's decision on a transfer has got.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoomProgress {
+    /// The Muster room's content topic.
+    pub topic: String,
+    /// The room proposal, once made.
+    pub intent_id: Option<String>,
+    /// The proposal's state as the agent's Muster folds it.
+    pub muster_state: String,
+    /// Trusted humans' approvals counted so far.
+    pub approvals: usize,
+    /// Trusted approvals it needs.
+    pub required: usize,
 }
 
 /// A program call that moves the amount out of `from` in place of a plain
@@ -197,7 +215,7 @@ pub struct Approvals {
     next: AtomicU64,
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -212,7 +230,10 @@ impl Approvals {
         amount_lepta: &str,
         call: Option<ProgramCall>,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
-        self.file(from, to, amount_lepta, call, false)
+        self.file(
+            Self::new_request(from, to, amount_lepta, call),
+            APPROVAL_EXPIRES,
+        )
     }
 
     /// File a Logos chain transfer from the node's own wallet.
@@ -222,16 +243,54 @@ impl Approvals {
         to: &str,
         amount_lepta: &str,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
-        self.file(from, to, amount_lepta, None, true)
+        let request = TransferRequest {
+            chain: true,
+            ..Self::new_request(from, to, amount_lepta, None)
+        };
+        self.file(request, APPROVAL_EXPIRES)
     }
 
-    fn file(
+    /// File a transfer, or a program call that moves the amount, that the room
+    /// decides, waiting up to `expires`.
+    pub fn request_room(
         &self,
         from: &str,
         to: &str,
         amount_lepta: &str,
         call: Option<ProgramCall>,
-        chain: bool,
+        progress: RoomProgress,
+        expires: Duration,
+    ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        let request = TransferRequest {
+            room: Some(progress),
+            ..Self::new_request(from, to, amount_lepta, call)
+        };
+        self.file(request, expires)
+    }
+
+    /// A LEZ transfer request, before it is filed and given its id.
+    fn new_request(
+        from: &str,
+        to: &str,
+        amount_lepta: &str,
+        call: Option<ProgramCall>,
+    ) -> TransferRequest {
+        TransferRequest {
+            id: String::new(),
+            from: from.to_string(),
+            to: to.to_string(),
+            amount_lepta: amount_lepta.to_string(),
+            requested_at: 0,
+            call,
+            chain: false,
+            room: None,
+        }
+    }
+
+    fn file(
+        &self,
+        request: TransferRequest,
+        expires: Duration,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         // Unique across restarts too, so an old id never names a new request.
         let id = format!(
@@ -250,7 +309,7 @@ impl Approvals {
             .count();
         if open >= MAX_WAITING {
             return Err(format!(
-                "{MAX_WAITING} transfers are already waiting for the user: wait for answers first"
+                "{MAX_WAITING} transfers are already waiting for approval: wait for answers first"
             ));
         }
         pending.insert(
@@ -258,14 +317,10 @@ impl Approvals {
             Pending {
                 request: TransferRequest {
                     id: id.clone(),
-                    from: from.to_string(),
-                    to: to.to_string(),
-                    amount_lepta: amount_lepta.to_string(),
                     requested_at: unix_now(),
-                    call,
-                    chain,
+                    ..request
                 },
-                expires: tokio::time::Instant::now() + APPROVAL_EXPIRES,
+                expires: tokio::time::Instant::now() + expires,
                 decision,
             },
         );
@@ -293,11 +348,19 @@ impl Approvals {
         }
     }
 
-    /// Move a waiting request on, or say why it can't be.
-    fn answer(&self, id: &str, to: Decision) -> Result<TransferRequest, String> {
+    /// Move a waiting request on, or say why it can't be. Only the room moves
+    /// a room request on (`by_room`), and only a room request.
+    fn answer(&self, id: &str, to: Decision, by_room: bool) -> Result<TransferRequest, String> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         Self::tidy(&mut pending);
         let p = pending.get(id).ok_or("no such transfer request")?;
+        if p.request.room.is_some() != by_room {
+            return Err(if by_room {
+                "this request is the user's to answer, not the room's".into()
+            } else {
+                "trusted humans in the Muster room decide this transfer, not the app".into()
+            });
+        }
         match &*p.decision.borrow() {
             Decision::Waiting => {}
             Decision::Expired => return Err("this request expired and will not be sent".into()),
@@ -310,17 +373,43 @@ impl Approvals {
 
     /// The user approved: the caller sends it, then reports with `finish`.
     pub fn approve(&self, id: &str) -> Result<TransferRequest, String> {
-        self.answer(id, Decision::Approved)
+        self.answer(id, Decision::Approved, false)
     }
 
     pub fn deny(&self, id: &str) -> Result<TransferRequest, String> {
-        self.answer(id, Decision::Denied)
+        self.answer(id, Decision::Denied, false)
+    }
+
+    /// The room decided a room request: approved (the caller sends it, then
+    /// reports with `finish`) or denied.
+    pub(crate) fn room_answer(&self, id: &str, to: Decision) -> Result<TransferRequest, String> {
+        self.answer(id, to, true)
+    }
+
+    /// Update how far the room's decision has got.
+    pub(crate) fn room_progress(&self, id: &str, update: impl FnOnce(&mut RoomProgress)) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(progress) = pending.get_mut(id).and_then(|p| p.request.room.as_mut()) {
+            update(progress);
+        }
+    }
+
+    /// Where request `id` stands, `None` once it is gone.
+    pub(crate) fn decision(&self, id: &str) -> Option<Decision> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        Self::tidy(&mut pending);
+        pending.get(id).map(|p| p.decision.borrow().clone())
     }
 
     /// The agent gave up waiting. A request still waiting is cancelled and never
     /// sent; one the user already approved goes ahead. Returns where it stands.
     pub fn cancel(&self, id: &str) -> Decision {
-        let _ = self.answer(id, Decision::Cancelled);
+        // The agent may cancel its own request, whoever decides it.
+        let by_room = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.get(id).is_some_and(|p| p.request.room.is_some())
+        };
+        let _ = self.answer(id, Decision::Cancelled, by_room);
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending
             .get(id)
@@ -357,7 +446,7 @@ impl Approvals {
         Self::tidy(&mut pending);
         let mut waiting: Vec<TransferRequest> = pending
             .values()
-            .filter(|p| *p.decision.borrow() == Decision::Waiting)
+            .filter(|p| *p.decision.borrow() == Decision::Waiting && p.request.room.is_none())
             .map(|p| p.request.clone())
             .collect();
         waiting.sort_by_key(|r| r.requested_at);

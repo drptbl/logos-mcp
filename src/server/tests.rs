@@ -3045,6 +3045,7 @@ async fn actions_taken_without_a_tool_call_show_in_the_activity() {
 }
 
 mod coverage;
+mod room;
 mod wallet_trust;
 
 #[tokio::test]
@@ -3254,25 +3255,26 @@ fn a_transfer_answered_as_the_wait_ends_is_reported_as_answered() {
         },
         false,
         "r1",
+        Approver::User,
         sent,
     )
     .unwrap();
     assert_eq!(body(&r)["tx_hash"], "aa");
     // The agent gave up just as the user denied it.
-    let r = approval_reply(Decision::Denied, true, "r2", sent).unwrap();
+    let r = approval_reply(Decision::Denied, true, "r2", Approver::User, sent).unwrap();
     assert!(text(&r).contains("denied"), "{}", text(&r));
-    let r = approval_reply(Decision::Expired, true, "r3", sent).unwrap();
+    let r = approval_reply(Decision::Expired, true, "r3", Approver::User, sent).unwrap();
     assert!(text(&r).contains("did not answer"), "{}", text(&r));
     // The agent gave up after the user approved: it may still go out.
-    let r = approval_reply(Decision::Approved, true, "r4", sent).unwrap();
+    let r = approval_reply(Decision::Approved, true, "r4", Approver::User, sent).unwrap();
     assert!(
         is_error(&r) && text(&r).contains("may be sent"),
         "{}",
         text(&r)
     );
-    let r = approval_reply(Decision::Approved, false, "r5", sent).unwrap();
+    let r = approval_reply(Decision::Approved, false, "r5", Approver::User, sent).unwrap();
     assert_eq!(body(&r)["status"], "approved_sending");
-    let r = approval_reply(Decision::Waiting, false, "r6", sent).unwrap();
+    let r = approval_reply(Decision::Waiting, false, "r6", Approver::User, sent).unwrap();
     assert_eq!(body(&r)["status"], "awaiting_approval");
 }
 mod hardening;
