@@ -216,6 +216,24 @@ impl ModuleConfig {
     }
 }
 
+/// The approval policy `config` saved, checked. One that can't be followed,
+/// such as a hand-edited file, fails closed: every transfer asks the user.
+/// A config from before approval tiers carries its ask switch over.
+fn saved_policy(config: &ModuleConfig) -> ApprovalPolicy {
+    match &config.approvals {
+        Some(policy) => match policy.check() {
+            Ok(()) => policy.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    "the saved approval policy can't be followed ({e}): every transfer asks the user"
+                );
+                ApprovalPolicy::ask_for_everything()
+            }
+        },
+        None => ApprovalPolicy::from_ask_before_transfer(config.tools.ask_before_transfer),
+    }
+}
+
 /// What the Agent app reads and changes: the endpoint and its token, the tool
 /// groups the agent may use, and the record of its calls.
 pub struct Control {
@@ -240,9 +258,7 @@ impl Control {
             dir: dir.to_path_buf(),
             tokens: Tokens::load_or_create(dir).map_err(|e| e.to_string())?,
             groups: tokio::sync::watch::Sender::new(config.tools.clone()),
-            policy: tokio::sync::watch::Sender::new(config.approvals.clone().unwrap_or_else(
-                || ApprovalPolicy::from_ask_before_transfer(config.tools.ask_before_transfer),
-            )),
+            policy: tokio::sync::watch::Sender::new(saved_policy(&config)),
             saving: std::sync::Mutex::new(()),
             activity: Arc::new(ActivityLog::open(dir.join(ACTIVITY_FILE))?),
             approvals: Arc::default(),
@@ -331,12 +347,18 @@ impl Control {
     /// it can be followed, then saved and applied at once, to waiting room
     /// requests too. The old ask switch is kept in step for older apps.
     pub fn set_approval_policy(&self, json: &str) -> Result<Value, String> {
-        let policy: ApprovalPolicy =
+        let given: Value =
             serde_json::from_str(json).map_err(|e| format!("not an approval policy: {e}"))?;
+        // Both wallets in full: a missing one would quietly take its default.
+        if given.get("agent").is_none() || given.get("node").is_none() {
+            return Err("an approval policy gives both the agent and the node wallet".into());
+        }
+        let policy: ApprovalPolicy =
+            serde_json::from_value(given).map_err(|e| format!("not an approval policy: {e}"))?;
         policy.check()?;
         let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ModuleConfig::load_or_create(&self.dir)?;
-        let asks = policy.agent.up_to == Approver::Ask || policy.agent.above == Approver::Ask;
+        let asks = policy.agent.uses(Approver::Ask);
         config.tools.ask_before_transfer = asks;
         config.approvals = Some(policy.clone());
         config.save(&self.dir)?;

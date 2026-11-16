@@ -365,3 +365,35 @@ fn the_agent_seat_is_remembered_once_set_up() {
     control.remember_agent_seat().unwrap();
     assert!(Control::open(dir.path()).unwrap().config().agent_seat);
 }
+
+#[test]
+fn a_saved_policy_that_cant_be_followed_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut looser = room_policy();
+    looser["agent"]["above"] = "send".into();
+    std::fs::write(
+        dir.path().join(CONFIG_FILE),
+        serde_json::json!({"approvals": looser}).to_string(),
+    )
+    .unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let policy: ApprovalPolicy = serde_json::from_value(control.approval_policy()).unwrap();
+    assert_eq!(policy, ApprovalPolicy::ask_for_everything());
+}
+
+#[test]
+fn a_policy_missing_a_wallet_or_misspelt_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    assert!(control.set_approval_policy("{}").is_err());
+    let mut only_agent = room_policy();
+    only_agent.as_object_mut().unwrap().remove("node");
+    assert!(
+        control
+            .set_approval_policy(&only_agent.to_string())
+            .is_err()
+    );
+    let mut misspelt = room_policy();
+    misspelt["agent"]["abvoe"] = "room".into();
+    assert!(control.set_approval_policy(&misspelt.to_string()).is_err());
+}

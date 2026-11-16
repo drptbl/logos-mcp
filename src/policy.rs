@@ -29,6 +29,7 @@ pub enum Wallet {
 /// A limit and who approves at or under it, and above it. A limit of 0 makes
 /// one tier: every transfer is above it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tiers {
     #[serde(with = "lepta")]
     pub limit_lepta: u128,
@@ -63,13 +64,15 @@ impl Tiers {
         Ok(())
     }
 
-    fn uses(&self, approver: Approver) -> bool {
+    /// Whether either tier is `approver`.
+    pub fn uses(&self, approver: Approver) -> bool {
         self.up_to == approver || self.above == approver
     }
 }
 
 /// The Muster room both wallets' room tiers use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoomSettings {
     /// The room's content topic.
     pub topic: String,
@@ -95,7 +98,7 @@ impl RoomSettings {
 /// Who approves each wallet's transfers. Read on every transfer: a change
 /// applies to the next one, and to room requests still waiting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ApprovalPolicy {
     pub agent: Tiers,
     pub node: Tiers,
@@ -158,6 +161,16 @@ impl ApprovalPolicy {
             (None, true) => Err("a tier asks the room, but no room is set".into()),
             (Some(room), _) => room.room_approval().map(|_| ()),
             (None, false) => Ok(()),
+        }
+    }
+
+    /// The policy to fall back on when a saved one can't be followed: every
+    /// transfer, from either wallet, waits for the user.
+    pub fn ask_for_everything() -> Self {
+        Self {
+            agent: Tiers::both(Approver::Ask),
+            node: Tiers::both(Approver::Ask),
+            room: None,
         }
     }
 
