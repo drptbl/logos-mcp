@@ -445,6 +445,25 @@ impl Approvals {
         Some(status)
     }
 
+    /// Room requests still waiting for the room, oldest first.
+    pub fn room_waiting(&self) -> Vec<TransferRequest> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        Self::tidy(&mut pending);
+        let mut waiting: Vec<TransferRequest> = pending
+            .values()
+            .filter(|p| *p.decision.borrow() == Decision::Waiting && p.request.room.is_some())
+            .map(|p| p.request.clone())
+            .collect();
+        waiting.sort_by_key(|r| r.requested_at);
+        waiting
+    }
+
+    /// The user stops a room request from the app: it is never sent, and its
+    /// watcher takes the agent's proposal back.
+    pub fn cancel_room(&self, id: &str) -> Result<TransferRequest, String> {
+        self.answer(id, Decision::Cancelled, true)
+    }
+
     /// Requests waiting for the user, oldest first.
     pub fn waiting(&self) -> Vec<TransferRequest> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());

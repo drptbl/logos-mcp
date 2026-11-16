@@ -145,18 +145,6 @@ fn approval_policy(cli: &Cli) -> anyhow::Result<Option<ApprovalPolicy>> {
     Ok(Some(policy))
 }
 
-fn find_logosctl() -> Option<PathBuf> {
-    let on_path = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join("logosctl"))
-            .find(|p| p.is_file())
-    });
-    on_path.or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let p = PathBuf::from(home).join(".local/logosctl/bin/logosctl");
-        p.is_file().then_some(p)
-    })
-}
 
 /// Parse `args` (the program name first, as `std::env::args_os` gives them),
 /// set up logging to stderr and connect to the node through logosctl: the
@@ -186,7 +174,7 @@ where
         .get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches)?;
     let policy = approval_policy(&cli)?;
-    let bin = match cli.logosctl.or_else(find_logosctl) {
+    let bin = match cli.logosctl.or_else(crate::seat::find_logosctl) {
         Some(b) if b.is_file() => b,
         Some(b) => bail!("logosctl not found at {}", b.display()),
         None => bail!("logosctl not found; pass --logosctl or set LOGOS_MCP_LOGOSCTL"),

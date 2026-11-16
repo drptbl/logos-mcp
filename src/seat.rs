@@ -16,6 +16,20 @@ use crate::{
 pub const MUSTER_CATALOG: &str =
     "https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json";
 
+/// The logosctl binary: on `PATH`, then `~/.local/logosctl/bin/logosctl`.
+pub fn find_logosctl() -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("logosctl"))
+            .find(|p| p.is_file())
+    });
+    on_path.or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let p = PathBuf::from(home).join(".local/logosctl/bin/logosctl");
+        p.is_file().then_some(p)
+    })
+}
+
 /// A logosctl session holding the agent's Muster.
 pub struct Seat {
     runner: Arc<dyn Runner>,

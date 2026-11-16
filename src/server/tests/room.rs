@@ -1089,16 +1089,67 @@ async fn basecamp_without_the_agent_seat_never_proposes_through_the_users_muster
     let runner = RoomRunner::new(wallet_open().to_vec());
     let (s, _dir, _policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), true);
     // The same server without its seat: Basecamp's own node is the user's Muster.
-    let s = LogosServer {
-        muster: None,
-        ..s
-    };
+    let s = LogosServer { muster: None, ..s };
     let r = s
-        .wallet_transfer(CancellationToken::new(), transfer(AGENT_FROM, RLN_PAYER, OVER))
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, OVER),
+        )
         .await
         .unwrap();
     assert!(text(&r).contains("agent's own seat"), "{}", text(&r));
     for method in ["coordinate_propose", "coordinate_contribute", "identity"] {
         assert!(runner.muster_calls(method).is_empty(), "{method}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_app_lists_room_requests_and_can_cancel_one() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let listed = s.approvals();
+    assert!(listed["waiting"].as_array().unwrap().is_empty());
+    assert_eq!(listed["room"][0]["id"], id);
+    assert_eq!(listed["room"][0]["room"]["intent_id"], INTENT);
+    s.cancel_room_request(&id).unwrap();
+    assert!(s.approvals()["room"].as_array().unwrap().is_empty());
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_app_cannot_cancel_a_request_the_user_answers() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let mut policy = cli_policy(&[HUMAN]);
+    policy.agent.up_to = policy::Approver::Ask;
+    let (s, _dir, _tx) = policy_server(runner.clone(), policy, true);
+    let agent = s.clone();
+    let _small = tokio::spawn(async move {
+        agent
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1000"),
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..200 {
+        if !s.approvals()["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let id = s.approvals()["waiting"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(s.cancel_room_request(&id).is_err());
 }

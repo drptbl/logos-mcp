@@ -265,3 +265,103 @@ fn asking_before_each_transfer_is_off_until_switched_on() {
             .ask_before_transfer
     );
 }
+
+// ---- the approval policy ---------------------------------------------------
+
+use crate::policy::{ApprovalPolicy, Approver, Wallet};
+
+const HUMAN_KEY: &str = "ed:0b00086682a0d169f90095b9d58e6c003ee591531ccf8b59c712c1cb70603269";
+
+fn room_policy() -> serde_json::Value {
+    serde_json::json!({
+        "agent": {"limit_lepta": "3000000", "up_to": "ask", "above": "room"},
+        "node": {"limit_lepta": "0", "up_to": "ask", "above": "ask"},
+        "room": {"topic": "/muster/1/r/proto", "approvers": [HUMAN_KEY], "approvals": 1, "expires_mins": 60}
+    })
+}
+
+#[test]
+fn an_old_config_carries_its_ask_switch_over_and_keeps_the_node_wallet_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(CONFIG_FILE),
+        r#"{"port": 8765, "tools": {"ask_before_transfer": true}}"#,
+    )
+    .unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let policy: ApprovalPolicy = serde_json::from_value(control.approval_policy()).unwrap();
+    assert_eq!(policy.approver(Wallet::Agent, "1"), Approver::Ask);
+    assert_eq!(policy.approver(Wallet::Node, "1"), Approver::Ask);
+
+    let fresh = tempfile::tempdir().unwrap();
+    let control = Control::open(fresh.path()).unwrap();
+    let policy: ApprovalPolicy = serde_json::from_value(control.approval_policy()).unwrap();
+    assert_eq!(policy, ApprovalPolicy::default());
+}
+
+#[test]
+fn a_policy_change_is_checked_saved_and_applied_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let live = control.approval_policy_watch();
+    control
+        .set_approval_policy(&room_policy().to_string())
+        .unwrap();
+    assert_eq!(
+        live.borrow().approver(Wallet::Agent, "3000001"),
+        Approver::Room
+    );
+    assert_eq!(
+        live.borrow().approver(Wallet::Agent, "3000000"),
+        Approver::Ask
+    );
+    // Saved: a restart reads it back.
+    let reopened = Control::open(dir.path()).unwrap();
+    assert_eq!(reopened.approval_policy(), room_policy());
+    // The old switch shows what the policy does.
+    assert_eq!(reopened.permissions()["ask_before_transfer"], true);
+}
+
+#[test]
+fn a_policy_that_cant_be_followed_is_refused_and_not_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let mut looser = room_policy();
+    looser["agent"]["above"] = "send".into();
+    assert!(control.set_approval_policy(&looser.to_string()).is_err());
+    let mut no_room = room_policy();
+    no_room["room"] = serde_json::Value::Null;
+    assert!(control.set_approval_policy(&no_room.to_string()).is_err());
+    assert!(control.set_approval_policy("not json").is_err());
+    assert_eq!(
+        Control::open(dir.path()).unwrap().approval_policy(),
+        serde_json::to_value(ApprovalPolicy::default()).unwrap()
+    );
+}
+
+#[test]
+fn the_old_ask_switch_writes_through_and_keeps_the_room_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    control
+        .set_approval_policy(&room_policy().to_string())
+        .unwrap();
+    control
+        .set_permission("ask_before_transfer", false)
+        .unwrap();
+    let policy: ApprovalPolicy = serde_json::from_value(control.approval_policy()).unwrap();
+    assert_eq!(policy.approver(Wallet::Agent, "1"), Approver::Send);
+    assert_eq!(policy.approver(Wallet::Agent, "3000001"), Approver::Room);
+    let reopened: ApprovalPolicy =
+        serde_json::from_value(Control::open(dir.path()).unwrap().approval_policy()).unwrap();
+    assert_eq!(reopened, policy);
+}
+
+#[test]
+fn the_agent_seat_is_remembered_once_set_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    assert!(!control.config().agent_seat);
+    control.remember_agent_seat().unwrap();
+    assert!(Control::open(dir.path()).unwrap().config().agent_seat);
+}

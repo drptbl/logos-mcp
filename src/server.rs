@@ -1146,9 +1146,18 @@ impl LogosServer {
         }))
     }
 
-    /// Transfers waiting for the user, for the Agent app.
+    /// Transfers waiting for the user, and those waiting for the room, for
+    /// the Agent app.
     pub fn approvals(&self) -> Value {
-        json!({ "waiting": self.approvals.waiting() })
+        json!({ "waiting": self.approvals.waiting(), "room": self.approvals.room_waiting() })
+    }
+
+    /// The user cancels a transfer waiting for the room: never sent, and the
+    /// agent declines its own proposal so the room sees it closed.
+    pub fn cancel_room_request(&self, id: &str) -> Result<Value, String> {
+        self.approvals.cancel_room(id)?;
+        self.record_decision("cancel_room_request", id);
+        Ok(json!({ "request_id": id, "state": "cancelled" }))
     }
 
     /// The user approves a waiting transfer. It is checked again and sent on the

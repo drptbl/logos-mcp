@@ -29,6 +29,7 @@ use crate::{
     control::{ActivityLog, Approvals, ToolGroups},
     guard::FilesRoot,
     logosctl::LogosError,
+    policy::{ApprovalPolicy, Approver},
     server::LogosServer,
 };
 
@@ -147,6 +148,12 @@ pub struct ModuleConfig {
     pub discovery_bootstrap: Vec<String>,
     /// The tool groups the agent may use, switched from the Agent app.
     pub tools: ToolGroups,
+    /// Who approves each wallet's transfers. Missing from configs written
+    /// before 0.10: then the tools' "ask before transfer" switch decides.
+    pub approvals: Option<ApprovalPolicy>,
+    /// Whether the agent's own seat in Muster was set up, so it starts with
+    /// the module.
+    pub agent_seat: bool,
 }
 
 impl Default for ModuleConfig {
@@ -156,6 +163,8 @@ impl Default for ModuleConfig {
             files_root: None,
             discovery_bootstrap: Vec::new(),
             tools: ToolGroups::default(),
+            approvals: None,
+            agent_seat: false,
         }
     }
 }
@@ -212,6 +221,8 @@ pub struct Control {
     config: ModuleConfig,
     tokens: Tokens,
     groups: tokio::sync::watch::Sender<ToolGroups>,
+    /// Who approves each wallet's transfers, read by every server live.
+    policy: tokio::sync::watch::Sender<ApprovalPolicy>,
     /// Held while a switch is saved, so two saves can't interleave.
     saving: std::sync::Mutex<()>,
     activity: Arc<ActivityLog>,
@@ -227,6 +238,9 @@ impl Control {
             dir: dir.to_path_buf(),
             tokens: Tokens::load_or_create(dir).map_err(|e| e.to_string())?,
             groups: tokio::sync::watch::Sender::new(config.tools.clone()),
+            policy: tokio::sync::watch::Sender::new(config.approvals.clone().unwrap_or_else(
+                || ApprovalPolicy::from_ask_before_transfer(config.tools.ask_before_transfer),
+            )),
             saving: std::sync::Mutex::new(()),
             activity: Arc::new(ActivityLog::open(dir.join(ACTIVITY_FILE))?),
             approvals: Arc::default(),
@@ -255,6 +269,7 @@ impl Control {
     pub fn attach(&self, server: LogosServer) -> LogosServer {
         server
             .with_tool_groups(self.tool_groups())
+            .with_approval_policy(self.approval_policy_watch())
             .with_activity(self.activity_log())
             .with_approvals(self.approvals.clone())
     }
@@ -277,11 +292,21 @@ impl Control {
 
     /// Switch one tool group and save it. Only that group changes in the file,
     /// so other edits there are kept, and the file's groups then apply live.
+    /// "ask_before_transfer" also sets the agent wallet's tiers, keeping any
+    /// room tier: older apps, such as logos-agents', still switch it.
     pub fn set_permission(&self, group: &str, on: bool) -> Result<Value, String> {
         let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ModuleConfig::load_or_create(&self.dir)?;
         config.tools.set(group, on)?;
-        config.save(&self.dir)?;
+        if group == "ask_before_transfer" {
+            let mut policy = self.policy.borrow().clone();
+            policy.set_ask_before_transfer(on);
+            config.approvals = Some(policy.clone());
+            config.save(&self.dir)?;
+            self.policy.send_replace(policy);
+        } else {
+            config.save(&self.dir)?;
+        }
         // Only a real change tells connected agents to re-list.
         self.groups.send_if_modified(|groups| {
             let changed = *groups != config.tools;
@@ -289,6 +314,45 @@ impl Control {
             changed
         });
         Ok(self.permissions())
+    }
+
+    /// Who approves each wallet's transfers now.
+    pub fn approval_policy(&self) -> Value {
+        serde_json::to_value(&*self.policy.borrow()).unwrap_or_default()
+    }
+
+    pub fn approval_policy_watch(&self) -> tokio::sync::watch::Receiver<ApprovalPolicy> {
+        self.policy.subscribe()
+    }
+
+    /// Replace the approval policy, from the Agent app's JSON: refused unless
+    /// it can be followed, then saved and applied at once, to waiting room
+    /// requests too. The old ask switch is kept in step for older apps.
+    pub fn set_approval_policy(&self, json: &str) -> Result<Value, String> {
+        let policy: ApprovalPolicy =
+            serde_json::from_str(json).map_err(|e| format!("not an approval policy: {e}"))?;
+        policy.check()?;
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let mut config = ModuleConfig::load_or_create(&self.dir)?;
+        let asks = policy.agent.up_to == Approver::Ask || policy.agent.above == Approver::Ask;
+        config.tools.ask_before_transfer = asks;
+        config.approvals = Some(policy.clone());
+        config.save(&self.dir)?;
+        self.groups.send_if_modified(|groups| {
+            let changed = groups.ask_before_transfer != asks;
+            groups.ask_before_transfer = asks;
+            changed
+        });
+        self.policy.send_replace(policy);
+        Ok(self.approval_policy())
+    }
+
+    /// Remember that the agent's seat was set up, so it starts with the module.
+    pub fn remember_agent_seat(&self) -> Result<(), String> {
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let mut config = ModuleConfig::load_or_create(&self.dir)?;
+        config.agent_seat = true;
+        config.save(&self.dir)
     }
 
     /// Calls after sequence number `after`, and the cursor to pass next time.
