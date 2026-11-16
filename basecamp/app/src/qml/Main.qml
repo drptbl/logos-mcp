@@ -676,6 +676,13 @@ Item {
                         }
                         LogosButton { text: qsTr("Copy"); onClicked: root.copy(root.seat.invite_id) }
                     }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        visible: !!root.seat.invite_id && !(root.seat.rooms || []).length && !(root.seat.invites || []).length
+                        color: Theme.palette.textSecondary
+                        text: qsTr("Invite the agent into your room from Muster with this id, then join here.")
+                    }
                     Repeater {
                         model: root.seat.invites || []
                         delegate: RowLayout {
