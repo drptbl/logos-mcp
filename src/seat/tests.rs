@@ -115,3 +115,73 @@ async fn stopping_stops_the_daemon() {
     Seat::new(fake.clone()).stop().await;
     assert_eq!(argv(&fake), ["--json daemon stop"]);
 }
+
+/// The fake, except that installing waits for `gate`.
+struct SlowInstall {
+    fake: Arc<FakeRunner>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl Runner for SlowInstall {
+    fn run(&self, args: Vec<String>) -> crate::logosctl::RunFuture<'_> {
+        let installing = args.iter().any(|a| a == "install");
+        let reply = self.fake.run(args);
+        Box::pin(async move {
+            if installing {
+                self.gate.notified().await;
+            }
+            reply.await
+        })
+    }
+}
+
+#[tokio::test]
+async fn while_setting_up_the_status_says_so_and_another_set_up_is_refused() {
+    let fake = FakeRunner::with(vec![
+        out(NO_DAEMON),
+        out("Daemon started (pid 4242)"),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+        out(r#"{"status":"ok"}"#), // install, once the gate opens
+        out(NO_DAEMON),            // status, meanwhile
+        out(r#"{"status":"ok"}"#), // module load
+        muster(
+            "coordinate_start_inbox",
+            serde_json::json!({"inbox": "x", "rooms": []}),
+        ),
+    ]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let seat = Arc::new(Seat::new(Arc::new(SlowInstall {
+        fake: fake.clone(),
+        gate: gate.clone(),
+    })));
+    let setting_up = tokio::spawn({
+        let seat = seat.clone();
+        async move { seat.set_up().await }
+    });
+    while !argv(&fake).iter().any(|c| c.contains("install")) {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(seat.status().await["setting_up"], true);
+    assert!(seat.set_up().await.is_err());
+    gate.notify_one();
+    setting_up.await.unwrap().unwrap();
+    assert_eq!(
+        argv(&fake).iter().filter(|c| c.contains("install")).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_failed_set_up_leaves_its_error_in_the_status() {
+    let fake = FakeRunner::with(vec![
+        out(NO_DAEMON),
+        out("Daemon started (pid 4242)"),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+        // installing gets no reply: it fails
+    ]);
+    let seat = Seat::new(fake);
+    let error = seat.set_up().await.unwrap_err();
+    let status = seat.status().await;
+    assert_eq!(status["setting_up"], serde_json::Value::Null);
+    assert_eq!(status["setup_error"], error);
+}

@@ -415,11 +415,20 @@ impl LogosMcpModule for ModuleImpl {
         })
     }
 
+    /// Starts setting the seat up and returns: installing Muster outlasts
+    /// Basecamp's call limit. `seat_status` says how it goes.
     fn seat_set_up(&self) -> String {
-        for_app(|c| {
-            on_seat(|seat| async move { seat.set_up().await.map(|()| Value::Null) })?;
-            c.remember_agent_seat()?;
-            on_seat(|seat| async move { Ok(seat.status().await) })
+        for_app(|_| {
+            let seat = SEAT.get().ok_or("the agent seat isn't ready")?;
+            let (_, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
+            runtime.spawn(async move {
+                if seat.set_up().await.is_ok() {
+                    if let Some(Err(e)) = CONTROL.get().map(Control::remember_agent_seat) {
+                        eprintln!("logos_mcp: the agent seat is set up but not remembered: {e}");
+                    }
+                }
+            });
+            Ok(json!({ "setting_up": true }))
         })
     }
 

@@ -638,16 +638,24 @@ Item {
                             text: qsTr("Sets up the seat: installs Muster and the six modules it needs from Muster's catalogue (github.com/corpetty/muster) into its own session, and runs it while this module runs.")
                         }
                         LogosButton {
-                            text: root.settingUpSeat ? qsTr("Setting up…") : qsTr("Set up agent seat")
-                            enabled: root.ready && !root.settingUpSeat
+                            // The module sets the seat up in the background; its status follows.
+                            readonly property bool busy: root.settingUpSeat || !!root.seat.setting_up
+                            text: busy ? qsTr("Setting up…") : qsTr("Set up agent seat")
+                            enabled: root.ready && !busy
                             onClicked: {
                                 root.settingUpSeat = true
                                 root.call(root.backend.seatSetUp(), function () {
                                     root.settingUpSeat = false
-                                    root.notice = qsTr("The agent's seat is ready. Invite it into your room from Muster.")
                                 }, function () { root.settingUpSeat = false })
                             }
                         }
+                    }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        visible: !root.seat.set_up && !root.seat.setting_up && !!root.seat.setup_error
+                        color: Theme.palette.warning
+                        text: qsTr("Setting up the seat failed: %1").arg(root.seat.setup_error || "")
                     }
                     LogosText {
                         Layout.fillWidth: true

@@ -33,12 +33,22 @@ pub fn find_logosctl() -> Option<PathBuf> {
 /// How long installing Muster may take: it downloads seven packages.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Where setting the seat up stands.
+#[derive(Default)]
+enum Setup {
+    #[default]
+    Idle,
+    Running,
+    Failed(String),
+}
+
 /// A logosctl session holding the agent's Muster.
 pub struct Seat {
     runner: Arc<dyn Runner>,
     ctl: Logosctl,
     /// For installing, which takes far longer than any other call.
     slow: Logosctl,
+    setup: std::sync::Mutex<Setup>,
 }
 
 impl Seat {
@@ -47,6 +57,7 @@ impl Seat {
             ctl: Logosctl::new(runner.clone()),
             slow: Logosctl::new(runner.clone()),
             runner,
+            setup: Default::default(),
         }
     }
 
@@ -65,6 +76,7 @@ impl Seat {
             ctl: Logosctl::new(ctl.clone()),
             slow: Logosctl::new(runner(INSTALL_TIMEOUT)),
             runner: ctl,
+            setup: Default::default(),
         }
     }
 
@@ -113,8 +125,25 @@ impl Seat {
     }
 
     /// Make the session: add Muster's catalogue, install Muster without its
-    /// optional extras, and start it.
+    /// optional extras, and start it. One at a time: `status` says while it
+    /// runs, and why it failed if it did.
     pub async fn set_up(&self) -> Result<(), String> {
+        {
+            let mut setup = self.setup.lock().unwrap();
+            if matches!(*setup, Setup::Running) {
+                return Err("the agent seat is already being set up".into());
+            }
+            *setup = Setup::Running;
+        }
+        let result = self.install().await;
+        *self.setup.lock().unwrap() = match &result {
+            Ok(()) => Setup::Idle,
+            Err(e) => Setup::Failed(e.clone()),
+        };
+        result
+    }
+
+    async fn install(&self) -> Result<(), String> {
         self.ensure_daemon().await?;
         let catalogs = self
             .ctl
@@ -149,8 +178,19 @@ impl Seat {
     }
 
     /// Whether the seat runs, its key and the id people invite it by, the
-    /// rooms it is in and the invites waiting for it.
+    /// rooms it is in and the invites waiting for it, and whether it is being
+    /// set up or why that failed.
     pub async fn status(&self) -> Value {
+        let mut status = self.seat_status().await;
+        match &*self.setup.lock().unwrap() {
+            Setup::Idle => {}
+            Setup::Running => status["setting_up"] = json!(true),
+            Setup::Failed(e) => status["setup_error"] = json!(e),
+        }
+        status
+    }
+
+    async fn seat_status(&self) -> Value {
         if !self.running().await {
             return json!({ "running": false });
         }

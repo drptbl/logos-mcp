@@ -88,8 +88,8 @@ QString LogosMcpAppBackend::saveApprovalPolicy(QString policy)
     return reply;
 }
 
-// Installs Muster into the agent's own logosctl session: a download, so it can
-// take a minute.
+// Starts installing Muster into the agent's own logosctl session. That's a
+// download, so it runs on after this returns, and the seat's status follows it.
 QString LogosMcpAppBackend::seatSetUp()
 {
     const QString reply = checked(modules().logos_mcp.seat_set_up());
