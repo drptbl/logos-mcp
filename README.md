@@ -240,7 +240,7 @@ Open the AI Agent app's Approvals tab. It needs `logosctl` installed.
 2. Copy the invite id and invite the agent into your room from Muster's app, then press Join next to the invite
 3. Pick the room, tick who's trusted (you by default), set how many approvals are needed and the tiers, then Save
 
-A change applies to the next transfer, and to room requests still waiting: an unticked person stops counting, and a different room or none cancels them.
+A change applies to the next transfer, and to requests still waiting: an unticked person stops counting, and a different room, No room, or a tier that no longer asks the room cancels them. A request waiting for you that the room now decides can only be denied.
 
 ### Standalone
 
@@ -278,6 +278,7 @@ Keep in mind:
 - the limit is per transfer, so the agent can still send several transfers under it
 - a restart drops waiting requests, and nothing dropped is ever sent. The first room proposal after a restart declines the agent's own proposals they left collecting in Muster
 - run one logos-mcp per agent Muster. A second one would decline the first one's proposals when it starts proposing
+- leave these calls off Muster's own execute allowlist (`MUSTER_INVOKE_ALLOWLIST`, empty unless you set it). Listed there, a member could run an approved card from their Muster as well, and pay twice
 - the first proposal waits up to 90 s for Muster's delivery node, because Muster loses sends made while it starts ([corpetty/muster#373](https://github.com/corpetty/muster/issues/373))
 - inside Basecamp the agent's seat is a second Logos runtime next to Basecamp's, since one Basecamp has one Muster identity ([corpetty/muster#376](https://github.com/corpetty/muster/issues/376))
 
