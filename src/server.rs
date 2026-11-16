@@ -3268,6 +3268,14 @@ impl LogosServer {
         {
             return Err("this amount needs the Muster room's approval: nothing was sent".into());
         }
+        // The funds checks above take a while: the deadline again, last.
+        if p.call
+            .as_ref()
+            .and_then(|call| call.send_by_ms)
+            .is_some_and(|t| now_ms() >= t)
+        {
+            return Err("too late to send this payment: nothing was sent".into());
+        }
         let reply = match &p.call {
             None => {
                 let args = [Arg::str(&from), Arg::str(&to), Arg::str(&amount)];
