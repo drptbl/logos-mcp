@@ -1153,3 +1153,137 @@ async fn the_app_cannot_cancel_a_request_the_user_answers() {
         .to_string();
     assert!(s.cancel_room_request(&id).is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_whose_tier_no_longer_asks_the_room_is_cancelled() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The room stays set, but this amount now goes to the user instead.
+    policy.send_modify(|p| p.agent.above = policy::Approver::Ask);
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(status_of(&s, &id).await["state"], "cancelled");
+    assert_eq!(runner.sends(), 0);
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_user_cannot_approve_a_request_the_room_now_decides() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let mut asking = cli_policy(&[HUMAN]);
+    asking.agent.up_to = policy::Approver::Ask;
+    let (s, _dir, policy) = policy_server(runner.clone(), asking, true);
+    let agent = s.clone();
+    let _small = tokio::spawn(async move {
+        agent
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1000"),
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..200 {
+        if !s.approvals()["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let id = s.approvals()["waiting"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    policy.send_modify(|p| p.agent.up_to = policy::Approver::Room);
+    let e = s.approve_transfer(&id).await.unwrap_err();
+    assert!(e.contains("room approves"), "{e}");
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_seat_lists_a_rooms_members_with_the_agent_marked() {
+    let runner = RoomRunner::new(vec![]);
+    runner.always(
+        "coordinate_conversations",
+        json!([{"topic": TOPIC, "active": false}]),
+    );
+    let (s, _dir, _policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), true);
+    let members = s.room_members(TOPIC).await.unwrap();
+    assert_eq!(
+        runner.muster_calls("coordinate_join")[0][4],
+        format!("str:{TOPIC}")
+    );
+    assert_eq!(members[0]["key"], format!("ed:{HUMAN}"));
+    assert_eq!(members[0]["agent"], false);
+    assert_eq!(members[1]["key"], format!("ed:{AGENT_KEY}"));
+    assert_eq!(members[1]["agent"], true);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_wallet_set_to_send_sends_without_asking() {
+    let mut replies = chain_checks();
+    replies.extend(chain_checks());
+    replies.push(chain_reply("wallet_transfer_funds", json!(CHAIN_TX)));
+    let runner = RoomRunner::new(replies);
+    let mut sending = cli_policy(&[HUMAN]);
+    sending.node.up_to = policy::Approver::Send;
+    sending.node.above = policy::Approver::Send;
+    let (s, _dir, _policy) = policy_server(runner.clone(), sending, true);
+    let r = s
+        .chain_transfer(
+            CancellationToken::new(),
+            Parameters(ChainTransferParams {
+                from: CHAIN_A.into(),
+                to: CHAIN_B.into(),
+                amount_lepta: "1500".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["tx_hash"], CHAIN_TX, "{}", text(&r));
+    assert!(runner.muster_calls("coordinate_propose").is_empty());
+    assert!(s.approvals()["waiting"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_direct_chain_transfer_cancelled_before_sending_is_never_sent() {
+    let runner = RoomRunner::new(chain_checks().into_iter().chain(chain_checks()).collect());
+    let mut sending = cli_policy(&[HUMAN]);
+    sending.node.up_to = policy::Approver::Send;
+    sending.node.above = policy::Approver::Send;
+    let (s, _dir, _policy) = policy_server(runner.clone(), sending, true);
+    let ct = CancellationToken::new();
+    ct.cancel();
+    let r = s
+        .chain_transfer(
+            ct,
+            Parameters(ChainTransferParams {
+                from: CHAIN_A.into(),
+                to: CHAIN_B.into(),
+                amount_lepta: "1500".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(text(&r).contains("cancelled"), "{}", text(&r));
+    assert!(
+        !runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.get(3).map(String::as_str) == Some("wallet_transfer_funds"))
+    );
+}

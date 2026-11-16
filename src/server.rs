@@ -1152,6 +1152,16 @@ impl LogosServer {
         json!({ "waiting": self.approvals.waiting(), "room": self.approvals.room_waiting() })
     }
 
+    /// The members of `topic` as the agent's seat sees them, for the app.
+    pub async fn room_members(&self, topic: &str) -> Result<Vec<Value>, String> {
+        self.room.members(self.muster_node()?, topic).await
+    }
+
+    /// The agent's seat joins `topic`, accepting an invite, for the app.
+    pub async fn seat_join(&self, topic: &str) -> Result<(), String> {
+        self.room.join(self.muster_node()?, topic).await
+    }
+
     /// The user cancels a transfer waiting for the room: never sent, and the
     /// agent declines its own proposal so the room sees it closed.
     pub fn cancel_room_request(&self, id: &str) -> Result<Value, String> {
@@ -1164,6 +1174,24 @@ impl LogosServer {
     /// server's runtime, so a slow send never holds up the app; the agent hears
     /// the outcome, from its waiting call or from wallet_transfer_status.
     pub async fn approve_transfer(&self, id: &str) -> Result<Value, String> {
+        // A tier switched to the room since it was asked: only the room may
+        // approve it now.
+        if let Some(waiting) = self.approvals.waiting().into_iter().find(|r| r.id == id) {
+            let wallet = if waiting.chain {
+                Wallet::Node
+            } else {
+                Wallet::Agent
+            };
+            if self
+                .approval_policy()
+                .approver(wallet, &waiting.amount_lepta)
+                == policy::Approver::Room
+            {
+                return Err(
+                    "a Muster room approves this transfer now: deny it, and the agent can ask again".into(),
+                );
+            }
+        }
         let request = self.approvals.approve(id)?;
         self.record_decision("approve_transfer", id);
         let server = self.clone();
@@ -1172,7 +1200,7 @@ impl LogosServer {
         tokio::spawn(async move {
             if request.chain {
                 let outcome = match server
-                    .chain_send(&request.from, &request.to, &request.amount_lepta)
+                    .chain_send(&request.from, &request.to, &request.amount_lepta, None)
                     .await
                 {
                     Ok(tx_hash) => Decision::Sent { tx_hash },
@@ -2829,10 +2857,18 @@ impl LogosServer {
             p.intent_id = Some(intent.clone());
             p.muster_state = "collecting".into();
         });
-        tokio::spawn(
-            self.clone()
-                .follow_room(id.clone(), intent, call, room.topic.clone()),
-        );
+        let wallet = if filing.chain {
+            Wallet::Node
+        } else {
+            Wallet::Agent
+        };
+        tokio::spawn(self.clone().follow_room(
+            id.clone(),
+            intent,
+            call,
+            room.topic.clone(),
+            (wallet, filing.amount.clone()),
+        ));
         let minutes = filing.expires.as_secs().div_ceil(60);
         self.await_approval(ct, &id, decision, Approver::Room(minutes), sent)
             .await
@@ -2845,7 +2881,14 @@ impl LogosServer {
     /// off is cancelled. A Muster that can't be read is tried again, never
     /// taken as an approval. A request that ends unsent takes the agent's
     /// approval back, so the room sees it closed.
-    async fn follow_room(self, id: String, intent: String, call: RoomCall, topic: String) {
+    async fn follow_room(
+        self,
+        id: String,
+        intent: String,
+        call: RoomCall,
+        topic: String,
+        (wallet, amount): (Wallet, String),
+    ) {
         let room = self.room.clone();
         // It proposed through the seat, so the seat is there.
         let Ok(seat) = self.muster_node() else {
@@ -2861,15 +2904,13 @@ impl LogosServer {
                 }
                 Some(_) => return,
             }
-            let settings = match self.approval_policy().room_approval() {
-                Ok(Some(settings)) if settings.topic == topic => settings,
-                _ => {
-                    // Its room was changed or turned off: no one may approve it now.
-                    if self.approvals.room_answer(&id, Decision::Cancelled).is_ok() {
-                        room.withdraw(seat, &topic, &intent).await;
-                    }
-                    return;
+            let Some(settings) = self.room_settings_for(&topic, wallet, &amount) else {
+                // Its room was changed or turned off, or its tier no longer asks
+                // the room: no one may approve it now.
+                if self.approvals.room_answer(&id, Decision::Cancelled).is_ok() {
+                    room.withdraw(seat, &topic, &intent).await;
                 }
+                return;
             };
             let now = crate::control::unix_now();
             let verdict = match room.look(seat, &settings, &intent, &call, now).await {
@@ -2892,6 +2933,13 @@ impl LogosServer {
                 Verdict::Refused(reason) => Decision::Failed {
                     reason: format!("{reason}: nothing was sent"),
                 },
+                // The settings may have changed while Muster was read: judge
+                // again by the ones in force now.
+                Verdict::Send
+                    if self.room_settings_for(&topic, wallet, &amount) != Some(settings) =>
+                {
+                    continue;
+                }
                 Verdict::Send => {
                     if !room.use_once(&intent) {
                         Decision::Failed {
@@ -2904,7 +2952,9 @@ impl LogosServer {
             };
             let approved = ending == Decision::Approved;
             let Ok(request) = self.approvals.room_answer(&id, ending.clone()) else {
-                return; // cancelled or expired meanwhile: never sent
+                // Cancelled or expired meanwhile: never sent, and the card closes.
+                room.withdraw(seat, &topic, &intent).await;
+                return;
             };
             self.record_activity(
                 "room_decision",
@@ -2918,9 +2968,20 @@ impl LogosServer {
             if approved {
                 self.approvals
                     .room_progress(&id, |p| p.muster_state = "executable".into());
-                // Sent from the request the room's call was built from.
-                let sent = if request.chain {
-                    self.chain_send(&request.from, &request.to, &request.amount_lepta)
+                // Sent from the request the room's call was built from, only
+                // while its approval still stands: not after its expiry, and
+                // not once its settings changed.
+                let expired = request
+                    .room
+                    .as_ref()
+                    .is_none_or(|r| crate::control::unix_now() >= r.expires_at);
+                let unchanged = self.room_settings_for(&topic, wallet, &amount).is_some();
+                let sent = if expired || !unchanged {
+                    Err(SendError::NotSent(
+                        "the room's approval lapsed before sending: nothing was sent".into(),
+                    ))
+                } else if request.chain {
+                    self.chain_send(&request.from, &request.to, &request.amount_lepta, None)
                         .await
                 } else {
                     let p = TransferParams {
@@ -2947,6 +3008,21 @@ impl LogosServer {
             }
             return;
         }
+    }
+
+    /// The room settings a room request in `topic` for `amount` from `wallet`
+    /// is judged by now: none once its room changed or was turned off, or its
+    /// tier no longer asks the room.
+    fn room_settings_for(&self, topic: &str, wallet: Wallet, amount: &str) -> Option<RoomApproval> {
+        let policy = self.approval_policy();
+        if policy.approver(wallet, amount) != policy::Approver::Room {
+            return None;
+        }
+        policy
+            .room_approval()
+            .ok()
+            .flatten()
+            .filter(|r| r.topic == topic)
     }
 
     /// Wait for the answer to request `id`, by the user or the room, up to
@@ -3031,7 +3107,7 @@ impl LogosServer {
         }
         let sent = |tx_hash: &str| chain_submitted(&from, &to, &amount, tx_hash);
         match approver {
-            policy::Approver::Send => match self.chain_send(&from, &to, &amount).await {
+            policy::Approver::Send => match self.chain_send(&from, &to, &amount, Some(&ct)).await {
                 Ok(tx_hash) => ok(sent(&tx_hash)),
                 Err(e) => fail(e.message()),
             },
@@ -3104,10 +3180,32 @@ impl LogosServer {
     }
 
     /// Send an approved chain transfer, checking it again first.
-    async fn chain_send(&self, from: &str, to: &str, amount: &str) -> Result<String, SendError> {
+    /// Send a chain transfer, checking it again first. `direct` is the
+    /// agent's own call when no one approves it: then it must still be
+    /// uncancelled, and still sent without approval, right before it goes.
+    async fn chain_send(
+        &self,
+        from: &str,
+        to: &str,
+        amount: &str,
+        direct: Option<&CancellationToken>,
+    ) -> Result<String, SendError> {
         self.chain_sendable(from, amount)
             .await
             .map_err(SendError::NotSent)?;
+        if let Some(ct) = direct {
+            if ct.is_cancelled() {
+                return Err(SendError::NotSent(
+                    "transfer cancelled before sending: nothing was sent".into(),
+                ));
+            }
+            if self.approval_policy().approver(Wallet::Node, amount) != policy::Approver::Send {
+                return Err(SendError::NotSent(
+                    "this chain transfer now needs approval: call chain_transfer again to ask; nothing was sent"
+                        .into(),
+                ));
+            }
+        }
         // Last look before sending: the user may have turned transfers off while it waited.
         if !self.allows("chain_transfer") {
             return Err(SendError::NotSent(
