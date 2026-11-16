@@ -250,18 +250,20 @@ impl Approvals {
         self.file(request, APPROVAL_EXPIRES)
     }
 
-    /// File a transfer the room decides, waiting up to `expires`.
+    /// File a transfer, or a program call that moves the amount, that the room
+    /// decides, waiting up to `expires`.
     pub fn request_room(
         &self,
         from: &str,
         to: &str,
         amount_lepta: &str,
+        call: Option<ProgramCall>,
         progress: RoomProgress,
         expires: Duration,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
         let request = TransferRequest {
             room: Some(progress),
-            ..Self::new_request(from, to, amount_lepta, None)
+            ..Self::new_request(from, to, amount_lepta, call)
         };
         self.file(request, expires)
     }

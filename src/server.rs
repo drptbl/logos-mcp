@@ -25,7 +25,7 @@ use crate::{
     guard::{self, FilesRoot},
     logosctl::{Arg, LogosError, embedded_json},
     node::Node,
-    room::{Room, RoomApproval, Verdict},
+    room::{Room, RoomApproval, RoomCall, Verdict},
 };
 
 const DELIVERY: &str = "delivery_module";
@@ -70,6 +70,8 @@ const TX_BYTES: u128 = 8 * 1024;
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often a room proposal's progress is read from the agent's Muster.
 const ROOM_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+/// The least time a room proposal is given: one with less is refused.
+const ROOM_MIN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
 const WATCH_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -765,6 +767,30 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// lez_core.send_generic_public_transaction's arguments for a call `signer`
+/// signs: the signer then `accounts`, only the signer signing, the
+/// instruction, the program, no deposit and no private accounts.
+fn generic_call_args(
+    signer: &str,
+    accounts: &[String],
+    instruction: &[u8],
+    program_id_hex: &str,
+) -> [Arg; 6] {
+    let mut ids = vec![signer.to_string()];
+    ids.extend(accounts.iter().cloned());
+    let signs: Vec<bool> = std::iter::once(true)
+        .chain(accounts.iter().map(|_| false))
+        .collect();
+    [
+        Arg::Json(json!(ids)),
+        Arg::Json(json!(signs)),
+        Arg::Bytes(instruction.to_vec()),
+        Arg::str(program_id_hex),
+        Arg::str(""),
+        Arg::Json(json!([])),
+    ]
+}
+
 /// A submitted transfer, as wallet_transfer reports it.
 fn submitted(p: &TransferParams, tx_hash: &str) -> Value {
     json!({
@@ -1273,19 +1299,7 @@ impl LogosServer {
         if !w.is_agent(signer) {
             return Err("the signing account must be one of the agent accounts".into());
         }
-        let mut ids = vec![signer.to_string()];
-        ids.extend(accounts.iter().cloned());
-        let signs: Vec<bool> = std::iter::once(true)
-            .chain(accounts.iter().map(|_| false))
-            .collect();
-        let args = [
-            Arg::Json(json!(ids)),
-            Arg::Json(json!(signs)),
-            Arg::Bytes(instruction),
-            Arg::str(program_id_hex),
-            Arg::str(""),
-            Arg::Json(json!([])),
-        ];
+        let args = generic_call_args(signer, accounts, &instruction, program_id_hex);
         let reply = self
             .node
             .call(LEZ, "send_generic_public_transaction", &args)
@@ -2588,11 +2602,6 @@ impl LogosServer {
         room: Arc<Room>,
         p: &TransferParams,
     ) -> Result<CallToolResult, McpError> {
-        if p.call.is_some() {
-            return fail(
-                "this amount needs the Muster room's approval, which covers only plain transfers: nothing was sent",
-            );
-        }
         // Check now, so a hopeless request never reaches the room. Sending
         // checks everything again.
         if let Err(e) = self.send_checked(ct, p, SendMode::CheckOnly).await {
@@ -2600,21 +2609,49 @@ impl LogosServer {
         }
         // What the room approves and what is sent, built once: the accounts as
         // Public/<base58> and the amount in plain digits, as people read them.
-        let shown = |account: &str| {
-            guard::public_account_hex(account)
-                .ok()
-                .and_then(|hex| guard::account_id_base58(&hex))
-                .map(|b58| format!("Public/{b58}"))
-        };
-        let (Some(from), Some(to), Ok(amount)) = (
-            shown(&p.from),
-            shown(&p.to),
+        let shown = |hex: &str| guard::account_id_base58(hex).map(|b58| format!("Public/{b58}"));
+        let (Ok(from_hex), Ok(to_hex), Ok(amount)) = (
+            guard::public_account_hex(&p.from),
+            guard::public_account_hex(&p.to),
             p.amount_lepta.trim().parse::<u128>(),
         ) else {
             return fail("the transfer's accounts or amount can't be put to the room");
         };
+        let (Some(from), Some(to)) = (shown(&from_hex), shown(&to_hex)) else {
+            return fail("the transfer's accounts can't be put to the room");
+        };
         let amount = amount.to_string();
-        let args = json!([from, to, amount]);
+        let mut expires = room.config.expires;
+        let call = match &p.call {
+            None => RoomCall {
+                method: "transfer_public",
+                args: json!([from, to, amount]),
+                note: format!("Pay {amount} lepta from {from} to {to}"),
+            },
+            // The room approves the call exactly as it is sent, and reads what
+            // it does in the note.
+            Some(program) => {
+                if let Some(send_by) = program.send_by_ms {
+                    expires = expires.min(Duration::from_millis(send_by.saturating_sub(now_ms())));
+                    if expires < ROOM_MIN_WAIT {
+                        return fail(
+                            "this payment is too close to its deadline for the room to approve it: nothing was sent",
+                        );
+                    }
+                }
+                let args = generic_call_args(
+                    &from_hex,
+                    &program.accounts,
+                    &program.instruction,
+                    &program.program_id_hex,
+                );
+                RoomCall {
+                    method: "send_generic_public_transaction",
+                    args: Value::Array(args.iter().map(Arg::to_json).collect()),
+                    note: format!("Pay {amount} lepta from {from} {}", program.description),
+                }
+            }
+        };
         let progress = RoomProgress {
             topic: room.config.topic.clone(),
             intent_id: None,
@@ -2622,18 +2659,21 @@ impl LogosServer {
             approvals: 0,
             required: room.config.approvals,
         };
-        let (id, decision) =
-            match self
-                .approvals
-                .request_room(&from, &to, &amount, progress, room.config.expires)
-            {
-                Ok(filed) => filed,
-                Err(e) => return fail(e),
-            };
+        let (id, decision) = match self.approvals.request_room(
+            &from,
+            &to,
+            &amount,
+            p.call.clone(),
+            progress,
+            expires,
+        ) {
+            Ok(filed) => filed,
+            Err(e) => return fail(e),
+        };
         let intent = match room
             .propose(
                 self.node.as_ref(),
-                &args,
+                &call,
                 &format!("{}{id}", crate::room::REF_PREFIX),
             )
             .await
@@ -2656,9 +2696,9 @@ impl LogosServer {
         });
         tokio::spawn(
             self.clone()
-                .follow_room(room.clone(), id.clone(), intent, args),
+                .follow_room(room.clone(), id.clone(), intent, call),
         );
-        let minutes = room.config.expires.as_secs() / 60;
+        let minutes = expires.as_secs().div_ceil(60);
         let sent = TransferParams {
             from,
             to,
@@ -2672,11 +2712,11 @@ impl LogosServer {
     }
 
     /// Follow room request `id` in the agent's Muster until it is settled:
-    /// send it once trusted humans approved exactly `args`, end it if the room
+    /// send it once trusted humans approved exactly `call`, end it if the room
     /// declines it or it can never be sent. A Muster that can't be read is
     /// tried again, never taken as an approval. A request that ends unsent
     /// takes the agent's approval back, so the room sees it closed.
-    async fn follow_room(self, room: Arc<Room>, id: String, intent: String, args: Value) {
+    async fn follow_room(self, room: Arc<Room>, id: String, intent: String, call: RoomCall) {
         loop {
             tokio::time::sleep(ROOM_POLL).await;
             match self.approvals.decision(&id) {
@@ -2688,7 +2728,7 @@ impl LogosServer {
                 Some(_) => return,
             }
             let now = crate::control::unix_now();
-            let verdict = match room.look(self.node.as_ref(), &intent, &args, now).await {
+            let verdict = match room.look(self.node.as_ref(), &intent, &call, now).await {
                 Ok(verdict) => verdict,
                 Err(e) => {
                     tracing::warn!(request = %id, %intent, "could not read the room: {e}");
@@ -2733,11 +2773,12 @@ impl LogosServer {
             if approved {
                 self.approvals
                     .room_progress(&id, |p| p.muster_state = "executable".into());
+                // Sent from the request the room's call was built from.
                 let p = TransferParams {
                     from: request.from,
                     to: request.to,
                     amount_lepta: request.amount_lepta,
-                    call: None,
+                    call: request.call,
                 };
                 let outcome = match self
                     .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
@@ -2749,7 +2790,12 @@ impl LogosServer {
                     Err(SendError::NotSent(reason)) => Decision::Failed { reason },
                     Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
                 };
+                // Surely not sent: close the card. One that may have gone out stays.
+                let unsent = matches!(outcome, Decision::Failed { .. });
                 self.finish_approved(&id, outcome);
+                if unsent {
+                    room.withdraw(self.node.as_ref(), &intent).await;
+                }
             }
             return;
         }
@@ -3228,19 +3274,12 @@ impl LogosServer {
                 self.node.call(LEZ, "transfer_public", &args).await
             }
             Some(call) => {
-                let mut ids = vec![from.clone()];
-                ids.extend(call.accounts.iter().cloned());
-                let signs: Vec<bool> = std::iter::once(true)
-                    .chain(call.accounts.iter().map(|_| false))
-                    .collect();
-                let open = [
-                    Arg::Json(json!(ids)),
-                    Arg::Json(json!(signs)),
-                    Arg::Bytes(call.instruction.clone()),
-                    Arg::str(&call.program_id_hex),
-                    Arg::str(""),
-                    Arg::Json(json!([])),
-                ];
+                let open = generic_call_args(
+                    &from,
+                    &call.accounts,
+                    &call.instruction,
+                    &call.program_id_hex,
+                );
                 self.node
                     .call(LEZ, "send_generic_public_transaction", &open)
                     .await

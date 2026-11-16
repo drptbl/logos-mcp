@@ -401,6 +401,7 @@ async fn only_the_room_answers_a_room_request() {
             "Public/a",
             "Public/b",
             "9",
+            None,
             room_progress(),
             Duration::from_secs(3600),
         )
@@ -428,6 +429,7 @@ async fn a_room_request_expires_after_its_own_window() {
             "Public/a",
             "Public/b",
             "9",
+            None,
             room_progress(),
             Duration::from_secs(3600),
         )
@@ -447,6 +449,7 @@ async fn the_agent_can_cancel_its_room_request() {
             "Public/a",
             "Public/b",
             "9",
+            None,
             room_progress(),
             Duration::from_secs(3600),
         )

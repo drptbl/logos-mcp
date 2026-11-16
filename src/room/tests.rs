@@ -127,7 +127,12 @@ fn muster(
 }
 
 fn verdict(room: &RoomApproval, args: Value, (intents, provenance): (Value, Value)) -> Verdict {
-    judge(room, ID, &args, &intents, &provenance, NOW)
+    let call = RoomCall {
+        method: "transfer_public",
+        args,
+        note: String::new(),
+    };
+    judge(room, ID, &call, &intents, &provenance, NOW)
 }
 
 fn the_call() -> Value {
@@ -360,7 +365,12 @@ async fn a_room_approval_is_used_once() {
     let room = Room::new(config(&[HUMAN], 1));
     assert!(room.use_once(ID));
     assert!(!room.use_once(ID));
-    let seen = room.look(&node, ID, &the_call(), NOW).await.unwrap();
+    let call = RoomCall {
+        method: "transfer_public",
+        args: the_call(),
+        note: String::new(),
+    };
+    let seen = room.look(&node, ID, &call, NOW).await.unwrap();
     assert!(
         matches!(seen, Verdict::Refused(ref r) if r.contains("already used")),
         "{seen:?}"
@@ -410,4 +420,104 @@ fn a_trusted_human_who_declined_never_counts_even_after_approving() {
         verdict(&room, the_call(), seen),
         Verdict::Wait { approvals: 0, .. }
     ));
+}
+
+// ---- program calls ------------------------------------------------------------
+
+/// CBOR text, as Muster's dCBOR writes it.
+fn cbor_text(out: &mut Vec<u8>, s: &str) {
+    let n = s.len();
+    match n {
+        0..=23 => out.push(0x60 | n as u8),
+        24..=255 => out.extend([0x78, n as u8]),
+        _ => out.extend([0x79, (n >> 8) as u8, n as u8]),
+    }
+    out.extend(s.as_bytes());
+}
+
+/// The txhash Muster folds for an invoke of lez_core.`method`(`args`).
+pub(crate) fn invoke_txhash(method: &str, args: &Value) -> String {
+    let mut b = vec![0x83];
+    cbor_text(&mut b, "muster.invoke.v1");
+    cbor_text(&mut b, &format!("muster.invoke.lez_core.{method}.v1"));
+    b.push(0xa3);
+    for (k, v) in [
+        ("args", args.to_string()),
+        ("method", method.to_string()),
+        ("module", "lez_core".to_string()),
+    ] {
+        cbor_text(&mut b, k);
+        cbor_text(&mut b, &v);
+    }
+    format!(
+        "0x{}",
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    )
+}
+
+#[test]
+fn the_test_encoder_matches_what_muster_folded() {
+    assert_eq!(invoke_txhash("transfer_public", &the_call()), TXHASH_7M);
+}
+
+const PROGRAM: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const ESCROW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// An escrow open as logos-mcp sends it: signer and escrow account, who signs,
+/// the instruction, the program, then nothing.
+fn program_args(program: &str, accounts: &[&str], signs: &[bool], instruction: &str) -> Value {
+    json!([accounts, signs, {"_bytes": instruction}, program, "", []])
+}
+
+#[test]
+fn a_program_call_passes_only_when_the_room_signed_exactly_it() {
+    let room = config(&[HUMAN], 1);
+    let signer = "f44f59079d950ccb7ad230e5fa6e0668adf83eab47785d1bb0b9bab746b0cd64";
+    let sent = program_args(PROGRAM, &[signer, ESCROW], &[true, false], "AQID");
+    let call = RoomCall {
+        method: "send_generic_public_transaction",
+        args: sent.clone(),
+        note: String::new(),
+    };
+    let folded = |method: &str, args: &Value| {
+        let (mut intents, provenance) = muster(
+            "executable",
+            &[Sig(AGENT, COMMITTED), Sig(HUMAN, COMMITTED)],
+            &[],
+            TOPIC,
+            EXPIRY,
+        );
+        intents[0]["txhash"] = json!(invoke_txhash(method, args));
+        (intents, provenance)
+    };
+    let judged =
+        |(intents, provenance): (Value, Value)| judge(&room, ID, &call, &intents, &provenance, NOW);
+    assert_eq!(
+        judged(folded("send_generic_public_transaction", &sent)),
+        Verdict::Send
+    );
+    for (method, other) in [
+        (
+            "send_generic_public_transaction",
+            program_args(PROGRAM, &[signer, ESCROW], &[true, false], "AQIE"),
+        ),
+        (
+            "send_generic_public_transaction",
+            program_args(ESCROW, &[signer, ESCROW], &[true, false], "AQID"),
+        ),
+        (
+            "send_generic_public_transaction",
+            program_args(PROGRAM, &[signer, PROGRAM], &[true, false], "AQID"),
+        ),
+        (
+            "send_generic_public_transaction",
+            program_args(PROGRAM, &[signer, ESCROW], &[true, true], "AQID"),
+        ),
+        ("transfer_public", sent.clone()),
+    ] {
+        assert!(
+            matches!(judged(folded(method, &other)), Verdict::Refused(ref r) if r.contains("not this transfer")),
+            "{method} {other}"
+        );
+    }
 }

@@ -229,8 +229,17 @@ pub fn signed_call(txhash: &str) -> Result<SignedCall, String> {
     })
 }
 
-/// The schema Muster gives an invoke of lez_core.transfer_public.
-const TRANSFER_SCHEMA: &str = "muster.invoke.lez_core.transfer_public.v1";
+/// A lez_core call put to the room: what the room signs. logos-mcp sends the
+/// same call, built from the same request, once the room approves it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomCall {
+    pub method: &'static str,
+    /// The call's arguments, as the room signs them.
+    pub args: Value,
+    /// What the call does, in words, for the people approving it. Code builds
+    /// it from the same terms as the call, never the agent.
+    pub note: String,
+}
 
 /// What the agent's Muster says about a proposed transfer.
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +258,7 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-/// Judge proposal `intent_id` for the transfer `args` from the agent's own
+/// Judge proposal `intent_id` for `call` from the agent's own
 /// Muster: `intents` from `coordinate_intents`, `provenance` from
 /// `coordinate_provenance`, at `now` (Unix seconds).
 ///
@@ -262,7 +271,7 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 pub fn judge(
     room: &RoomApproval,
     intent_id: &str,
-    args: &Value,
+    call: &RoomCall,
     intents: &Value,
     provenance: &Value,
     now: u64,
@@ -302,15 +311,15 @@ pub fn judge(
         return Verdict::Declined;
     }
     match signed_call(text(intent, "txhash")) {
-        Ok(call)
-            if call.schema_id == TRANSFER_SCHEMA
-                && call.module == "lez_core"
-                && call.method == "transfer_public"
-                && call.args == *args => {}
-        Ok(call) => {
+        Ok(signed)
+            if signed.schema_id == format!("muster.invoke.lez_core.{}.v1", call.method)
+                && signed.module == "lez_core"
+                && signed.method == call.method
+                && signed.args == call.args => {}
+        Ok(signed) => {
             return Verdict::Refused(format!(
                 "the room's proposal is not this transfer: it calls {}.{}{}",
-                call.module, call.method, call.args
+                signed.module, signed.method, signed.args
             ));
         }
         Err(e) => {
@@ -478,15 +487,17 @@ impl Room {
         Ok(())
     }
 
-    /// Propose lez_core.transfer_public(`args`) to the room and endorse it as
-    /// the agent, which only counts toward Muster's own threshold, never toward
-    /// the trusted approvals. `reference` makes the proposal new: Muster names
+    /// Propose `call` to the room, say in the room's chat what it does (Muster's
+    /// card shows only the method), then endorse it as the agent, which only
+    /// counts toward Muster's own threshold, never toward the trusted
+    /// approvals. A proposal the room can't be told about is withdrawn
+    /// unendorsed. `reference` makes the proposal new: Muster names
     /// a proposal by its effect, so a repeated payment would otherwise land on
     /// an old one. Returns the proposal's id.
     pub async fn propose(
         &self,
         node: &dyn Node,
-        args: &Value,
+        call: &RoomCall,
         reference: &str,
     ) -> Result<String, String> {
         let mut ready = self.ready.lock().await;
@@ -500,9 +511,10 @@ impl Room {
         let effect = json!({
             "effect": "invoke",
             "module": "lez_core",
-            "method": "transfer_public",
-            "args": args,
+            "method": call.method,
+            "args": call.args,
             "ref": reference,
+            "note": call.note,
         });
         let id = muster(node, "coordinate_propose", &[&effect.to_string()]).await?;
         let id = id
@@ -524,17 +536,23 @@ impl Room {
                 "the room proposal {id} already had approvals before this one: nothing was proposed"
             ));
         }
+        let said = format!("[logos-mcp] proposal {id}: {}", call.note);
+        if let Err(e) = muster(node, "coordinate_post_message", &[&said]).await {
+            self.withdraw(node, &id).await;
+            return Err(format!(
+                "couldn't say in the room what the proposal does, so it was withdrawn: nothing was sent ({e})"
+            ));
+        }
         muster(node, "coordinate_contribute", &[&id, "", ""]).await?;
         Ok(id)
     }
 
-    /// Where proposal `intent_id` for the transfer `args` stands, at `now`
-    /// (Unix seconds).
+    /// Where proposal `intent_id` for `call` stands, at `now` (Unix seconds).
     pub async fn look(
         &self,
         node: &dyn Node,
         intent_id: &str,
-        args: &Value,
+        call: &RoomCall,
         now: u64,
     ) -> Result<Verdict, String> {
         if self
@@ -552,7 +570,7 @@ impl Room {
         Ok(judge(
             &self.config,
             intent_id,
-            args,
+            call,
             &intents,
             &provenance,
             now,
@@ -615,4 +633,4 @@ impl Room {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

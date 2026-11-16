@@ -154,42 +154,23 @@ fn room_server(runner: Arc<RoomRunner>, approvers: &[&str]) -> (LogosServer, tem
     (server, dir)
 }
 
-/// CBOR text, as Muster's dCBOR writes it.
-fn cbor_text(out: &mut Vec<u8>, s: &str) {
-    let n = s.len();
-    match n {
-        0..=23 => out.push(0x60 | n as u8),
-        24..=255 => out.extend([0x78, n as u8]),
-        _ => out.extend([0x79, (n >> 8) as u8, n as u8]),
-    }
-    out.extend(s.as_bytes());
-}
-
-/// The txhash Muster folds for an invoke of lez_core.transfer_public(`args`).
-fn txhash(args: &Value) -> String {
-    let mut b = vec![0x83];
-    cbor_text(&mut b, "muster.invoke.v1");
-    cbor_text(&mut b, "muster.invoke.lez_core.transfer_public.v1");
-    b.push(0xa3);
-    for (k, v) in [
-        ("args", args.to_string()),
-        ("method", "transfer_public".into()),
-        ("module", "lez_core".into()),
-    ] {
-        cbor_text(&mut b, k);
-        cbor_text(&mut b, &v);
-    }
-    format!(
-        "0x{}",
-        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-    )
-}
-
-/// The agent's Muster after the room folded the proposal of `args` to `state`
-/// with these approvers' committed approvals and these decliners.
+/// The agent's Muster after the room folded the transfer proposal of `args`
+/// to `state` with these approvers' committed approvals and these decliners.
 fn room_folded(
     runner: &RoomRunner,
     state: &str,
+    args: Value,
+    approvers: &[&str],
+    decliners: &[&str],
+) {
+    room_folded_call(runner, state, "transfer_public", args, approvers, decliners);
+}
+
+/// The same, for a proposal of lez_core.`method`(`args`).
+fn room_folded_call(
+    runner: &RoomRunner,
+    state: &str,
+    method: &str,
     args: Value,
     approvers: &[&str],
     decliners: &[&str],
@@ -204,7 +185,7 @@ fn room_folded(
             "id": INTENT,
             "state": state,
             "approvals": approvers.len(),
-            "txhash": txhash(&args),
+            "txhash": crate::room::tests::invoke_txhash(method, &args),
             "decliners": decliners.iter().map(|d| format!("{d}{X25519}")).collect::<Vec<_>>(),
             "provenance": record,
         }]),
@@ -225,13 +206,19 @@ fn the_call(amount: &str) -> Value {
 
 /// Start an over-limit transfer; returns its call once the room has its proposal.
 async fn propose(s: &LogosServer, runner: &RoomRunner) -> tokio::task::JoinHandle<CallToolResult> {
+    propose_this(s, runner, transfer(AGENT_FROM, RLN_PAYER, OVER)).await
+}
+
+/// Start `p`; returns its call once the room has its proposal.
+async fn propose_this(
+    s: &LogosServer,
+    runner: &RoomRunner,
+    p: Parameters<TransferParams>,
+) -> tokio::task::JoinHandle<CallToolResult> {
     let agent = s.clone();
     let call = tokio::spawn(async move {
         agent
-            .wallet_transfer(
-                CancellationToken::new(),
-                transfer(AGENT_FROM, RLN_PAYER, OVER),
-            )
+            .wallet_transfer(CancellationToken::new(), p)
             .await
             .unwrap()
     });
@@ -274,6 +261,16 @@ async fn an_over_limit_transfer_becomes_a_room_proposal_and_waits() {
     assert_eq!(effect["method"], "transfer_public");
     assert_eq!(effect["args"], the_call(OVER));
     assert_eq!(effect["ref"], format!("logos-mcp/{id}"));
+    assert_eq!(
+        effect["note"],
+        format!("Pay {OVER} lepta from {AGENT_FROM} to {RLN_PAYER}")
+    );
+    assert_eq!(
+        runner.muster_calls("coordinate_post_message")[0][4],
+        format!(
+            "str:[logos-mcp] proposal {INTENT}: Pay {OVER} lepta from {AGENT_FROM} to {RLN_PAYER}"
+        )
+    );
     assert_eq!(
         runner.muster_calls("coordinate_contribute")[0][4..],
         [format!("str:{INTENT}"), "str:".into(), "str:".into()]
@@ -446,26 +443,133 @@ async fn the_first_proposal_waits_for_musters_delivery_node() {
     assert!(at("coordinate_propose") > at("identity"));
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_program_call_over_the_limit_is_refused() {
-    let runner = RoomRunner::new(wallet_open().to_vec());
-    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
-    let mut p = transfer(AGENT_FROM, RLN_PAYER, OVER);
+const ESCROW_NOTE: &str =
+    "into escrow for Public/p, refunded if nothing is delivered by 2026-11-16 12:00 UTC";
+
+/// An over-limit escrow open, as logos-agents builds one.
+fn escrow_payment(send_by_ms: Option<u64>) -> Parameters<TransferParams> {
+    let mut p = transfer(AGENT_FROM, CALL_TO, OVER);
     p.0.call = Some(crate::control::ProgramCall {
-        program_id_hex: "11".repeat(32),
-        accounts: vec![guard::public_account_hex(RLN_PAYER).unwrap()],
-        instruction: vec![1],
-        description: "into escrow".into(),
-        send_by_ms: None,
+        program_id_hex: TEST_PROGRAM.into(),
+        accounts: vec![CALL_TO.into()],
+        instruction: vec![1, 2, 3],
+        description: ESCROW_NOTE.into(),
+        send_by_ms,
     });
-    let r = s
-        .wallet_transfer(CancellationToken::new(), p)
-        .await
-        .unwrap();
-    assert!(is_error(&r));
-    assert!(text(&r).contains("room"), "{}", text(&r));
-    assert_eq!(runner.sends(), 0);
-    assert!(runner.muster_calls("coordinate_propose").is_empty());
+    p
+}
+
+/// The escrow open exactly as logos-mcp sends it, in-process form.
+fn escrow_args(instruction: &str) -> Value {
+    json!([[AGENT_ACCOUNT, CALL_TO], [true, false], {"_bytes": instruction}, TEST_PROGRAM, "", []])
+}
+
+/// The checks a program call passes before it is proposed, and again before
+/// it is sent: the wallet, the sender's balance, and the fee reserve.
+fn call_checks() -> Vec<RawOutput> {
+    let mut replies = wallet_open().to_vec();
+    replies.push(lez("get_balance", r#""100000000000""#));
+    replies.push(lez("wallet_dir", r#""""#));
+    replies
+}
+
+fn generic_sent(hash: &str) -> RawOutput {
+    lez(
+        "send_generic_public_transaction",
+        &format!(r#""{{\"error\":\"\",\"success\":true,\"tx_hash\":\"{hash}\"}}""#),
+    )
+}
+
+fn generic_sends(runner: &RoomRunner) -> Vec<Vec<String>> {
+    runner
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("send_generic_public_transaction"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_escrowed_payment_waits_for_the_room_and_sends_exactly_the_approved_call() {
+    let mut replies = call_checks();
+    replies.extend(call_checks());
+    replies.push(generic_sent("bb22"));
+    let runner = RoomRunner::new(replies);
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let call = propose_this(&s, &runner, escrow_payment(None)).await;
+
+    let proposed = runner.muster_calls("coordinate_propose");
+    let effect: Value = serde_json::from_str(proposed[0][4].strip_prefix("str:").unwrap()).unwrap();
+    assert_eq!(effect["method"], "send_generic_public_transaction");
+    assert_eq!(effect["args"], escrow_args("AQID"));
+    let note = effect["note"].as_str().unwrap();
+    assert!(note.contains(OVER) && note.contains(ESCROW_NOTE), "{note}");
+    // The room reads what it does in its chat too.
+    let posted = runner.muster_calls("coordinate_post_message");
+    assert!(
+        posted[0][4].contains(INTENT) && posted[0][4].contains(ESCROW_NOTE),
+        "{posted:?}"
+    );
+    assert!(generic_sends(&runner).is_empty());
+
+    room_folded_call(
+        &runner,
+        "executable",
+        "send_generic_public_transaction",
+        escrow_args("AQID"),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    let r = call.await.unwrap();
+    assert_eq!(body(&r)["tx_hash"], "bb22", "{}", text(&r));
+    let sends = generic_sends(&runner);
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0][4..],
+        [
+            format!(r#"json:["{AGENT_ACCOUNT}","{CALL_TO}"]"#),
+            "json:[true,false]".into(),
+            r#"json:{"_bytes":"AQID"}"#.into(),
+            format!("str:{TEST_PROGRAM}"),
+            "str:".into(),
+            "json:[]".into(),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_approval_of_another_instruction_is_refused() {
+    let runner = RoomRunner::new(call_checks());
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let call = propose_this(&s, &runner, escrow_payment(None)).await;
+    room_folded_call(
+        &runner,
+        "executable",
+        "send_generic_public_transaction",
+        escrow_args("AQIE"),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    let r = call.await.unwrap();
+    assert!(text(&r).contains("not this transfer"), "{}", text(&r));
+    assert!(generic_sends(&runner).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_escrowed_payment_waits_no_longer_than_its_send_by_time() {
+    let runner = RoomRunner::new(call_checks());
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let send_by = now_ms() + 10 * 60 * 1000;
+    let call = propose_this(&s, &runner, escrow_payment(Some(send_by))).await;
+    let id = body(&call.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(std::time::Duration::from_secs(11 * 60)).await;
+    assert_eq!(status_of(&s, &id).await["state"], "expired");
+    assert!(generic_sends(&runner).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -641,4 +745,73 @@ async fn the_first_proposal_after_a_restart_declines_the_cards_left_open() {
             .unwrap()
     };
     assert!(at("coordinate_decline") < at("coordinate_propose"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_proposal_whose_explanation_cant_be_posted_is_withdrawn_unapproved() {
+    let runner = RoomRunner::new(call_checks());
+    runner.always("coordinate_post_message", json!({"error": "not delivered"}));
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let r = s
+        .wallet_transfer(CancellationToken::new(), escrow_payment(None))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(
+        text(&r).contains("couldn't say in the room"),
+        "{}",
+        text(&r)
+    );
+    assert!(runner.muster_calls("coordinate_contribute").is_empty());
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_payment_too_close_to_its_deadline_is_refused_before_proposing() {
+    let runner = RoomRunner::new(call_checks());
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            escrow_payment(Some(now_ms() + 30_000)),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(
+        text(&r).contains("too close to its deadline"),
+        "{}",
+        text(&r)
+    );
+    assert!(runner.muster_calls("coordinate_propose").is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_transfer_the_wallet_refuses_withdraws_its_proposal() {
+    let mut replies = wallet_open().to_vec();
+    replies.extend(wallet_open());
+    replies.push(lez(
+        "transfer_public",
+        r#""{\"error\":\"insufficient funds\",\"success\":false}""#,
+    ));
+    let runner = RoomRunner::new(replies);
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let call = propose(&s, &runner).await;
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    let r = call.await.unwrap();
+    assert!(text(&r).contains("not sent"), "{}", text(&r));
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
 }
