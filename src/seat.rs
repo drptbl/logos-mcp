@@ -30,6 +30,13 @@ pub fn find_logosctl() -> Option<PathBuf> {
     })
 }
 
+/// `mutex`, even if a panic poisoned it: its state is always whole.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// How long installing Muster may take: it downloads seven packages.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -52,7 +59,7 @@ struct SetupClaim {
 
 impl SetupClaim {
     fn take(seat: &'static Seat) -> Result<Self, String> {
-        let mut setup = seat.setup.lock().unwrap();
+        let mut setup = seat.setup();
         if matches!(*setup, Setup::Running) {
             return Err("the agent seat is already being set up".into());
         }
@@ -72,7 +79,7 @@ impl Drop for SetupClaim {
             Some(Err(e)) => Setup::Failed(e),
             None => Setup::Failed("setting the seat up stopped before it finished".into()),
         };
-        *self.seat.setup.lock().unwrap_or_else(|e| e.into_inner()) = ended;
+        *self.seat.setup() = ended;
     }
 }
 
@@ -83,6 +90,8 @@ pub struct Seat {
     /// For installing, which takes far longer than any other call.
     slow: Logosctl,
     setup: std::sync::Mutex<Setup>,
+    /// The setup under way, for `stop` to end first.
+    setup_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Seat {
@@ -92,6 +101,7 @@ impl Seat {
             slow: Logosctl::new(runner.clone()),
             runner,
             setup: Default::default(),
+            setup_task: Default::default(),
         }
     }
 
@@ -111,6 +121,7 @@ impl Seat {
             slow: Logosctl::new(runner(INSTALL_TIMEOUT)),
             runner: ctl,
             setup: Default::default(),
+            setup_task: Default::default(),
         }
     }
 
@@ -168,14 +179,19 @@ impl Seat {
         remember: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
         let claim = SetupClaim::take(self)?;
-        runtime.spawn(async move {
+        let task = runtime.spawn(async move {
             let result = match self.prepare_session().await {
                 Ok(()) => remember(),
                 Err(e) => Err(e),
             };
             claim.finish(result);
         });
+        *lock(&self.setup_task) = Some(task);
         Ok(())
+    }
+
+    fn setup(&self) -> std::sync::MutexGuard<'_, Setup> {
+        lock(&self.setup)
     }
 
     /// Make the session: add Muster's catalogue, install Muster without its
@@ -203,8 +219,14 @@ impl Seat {
         self.load_muster().await
     }
 
-    /// Stop the session's daemon. Room invites wait in the store meanwhile.
+    /// Stop the session's daemon, ending any setup under way first so it
+    /// can't start the daemon again. Room invites wait in the store meanwhile.
     pub async fn stop(&self) {
+        let setup = lock(&self.setup_task).take();
+        if let Some(setup) = setup {
+            setup.abort();
+            let _ = setup.await;
+        }
         if let Err(e) = self.ctl.command(&["daemon", "stop"]).await {
             tracing::warn!("could not stop the agent seat: {e}");
         }
@@ -219,7 +241,7 @@ impl Seat {
     /// set up or why that failed.
     pub async fn status(&self) -> Value {
         let mut status = self.session_status().await;
-        match &*self.setup.lock().unwrap() {
+        match &*self.setup() {
             Setup::Idle => {}
             Setup::Running => status["setting_up"] = json!(true),
             Setup::Failed(e) => status["setup_error"] = json!(e),

@@ -270,3 +270,25 @@ fn a_setup_stopped_midway_can_be_started_again() {
     assert!(!setting_up(seat));
     assert!(matches!(*seat.setup.lock().unwrap(), Setup::Failed(_)));
 }
+
+#[tokio::test]
+async fn stopping_mid_setup_ends_the_setup_before_the_daemon() {
+    let fake = FakeRunner::with(vec![
+        out(NO_DAEMON),
+        out("Daemon started (pid 4242)"),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+        out(r#"{"status":"ok"}"#), // install: never answered
+        out(r#"{"message":"Daemon shutting down.","status":"ok"}"#),
+    ]);
+    let seat = seat(Arc::new(SlowInstall {
+        fake: fake.clone(),
+        gate: Arc::new(tokio::sync::Notify::new()), // never opens
+    }));
+    set_up(seat, || panic!("a stopped setup is never remembered")).unwrap();
+    while !argv(&fake).iter().any(|c| c.contains("install")) {
+        tokio::task::yield_now().await;
+    }
+    seat.stop().await;
+    assert_eq!(argv(&fake).last().unwrap(), "--json daemon stop");
+    assert!(matches!(*seat.setup.lock().unwrap(), Setup::Failed(_)));
+}
