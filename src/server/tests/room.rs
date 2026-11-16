@@ -1107,6 +1107,7 @@ async fn settings_changed_while_an_approved_transfer_waits_for_the_wallet_stop_i
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     let status = status_of(&s, &id).await;
     assert_eq!(status["state"], "failed", "{status}");
+    assert!(status.to_string().contains("lapsed"), "{status}");
     assert_eq!(runner.sends(), 0);
     assert_eq!(
         runner.muster_calls("coordinate_decline")[0][4],
