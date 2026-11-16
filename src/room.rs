@@ -394,6 +394,29 @@ pub(crate) async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Resu
     }
 }
 
+/// Wait until Muster's delivery node is up, up to DELIVERY_WAIT.
+async fn wait_for_delivery(node: &dyn Node) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + DELIVERY_WAIT;
+    loop {
+        let up = muster(node, "connectivity", &[]).await.is_ok_and(|c| {
+            c["rows"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .any(|r| text(r, "key") == "delivery" && text(r, "level") == "ok")
+            })
+        });
+        if up {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "Muster's delivery node isn't up yet: nothing was proposed, try again shortly"
+                    .into(),
+            );
+        }
+        tokio::time::sleep(DELIVERY_POLL).await;
+    }
+}
+
 /// Decline proposal `intent_id` in `topic` as the agent, best effort: for
 /// callers that already hold the seat.
 async fn withdraw_now(node: &dyn Node, topic: &str, intent_id: &str) {
@@ -458,22 +481,6 @@ impl Room {
                 .and_then(Value::as_str)
                 .and_then(ed_key)
                 .ok_or("Muster gave no Ed25519 identity")?;
-            let deadline = tokio::time::Instant::now() + DELIVERY_WAIT;
-            loop {
-                let up = muster(node, "connectivity", &[]).await.is_ok_and(|c| {
-                    c["rows"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .any(|r| text(r, "key") == "delivery" && text(r, "level") == "ok")
-                    })
-                });
-                if up {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("Muster's delivery node isn't up yet: nothing was proposed, try again shortly".into());
-                }
-                tokio::time::sleep(DELIVERY_POLL).await;
-            }
             *agent = Some(key);
         }
         if let Some(key) = agent.as_deref()
@@ -483,7 +490,10 @@ impl Room {
                 "the agent's own Muster key ed:{key} is listed as a room approver: it must never approve its own transfers"
             ));
         }
+        // A seat starts its delivery node only once a room is active, and
+        // loses what it sends while that node starts (corpetty/muster#373).
         activate(node, &room.topic).await?;
+        wait_for_delivery(node).await?;
         let first_look = self
             .swept
             .lock()

@@ -1287,3 +1287,23 @@ async fn a_direct_chain_transfer_cancelled_before_sending_is_never_sent() {
             .any(|c| c.get(3).map(String::as_str) == Some("wallet_transfer_funds"))
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_restarted_seat_joins_its_room_before_waiting_for_delivery() {
+    // A seat starts its delivery node only once a room is active.
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    runner.always(
+        "coordinate_conversations",
+        json!([{"topic": TOPIC, "active": false}]),
+    );
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let _call = propose(&s, &runner).await;
+    let calls = runner.calls.lock().unwrap().clone();
+    let at = |m: &str| {
+        calls
+            .iter()
+            .position(|c| c.get(3).map(String::as_str) == Some(m))
+            .unwrap()
+    };
+    assert!(at("coordinate_join") < at("connectivity"), "{calls:?}");
+}
