@@ -663,14 +663,38 @@ fn ok(value: Value) -> Result<CallToolResult, McpError> {
 
 /// Tool-level failure: reported to the agent as an error result it can act on.
 /// How far `send_checked` goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SendMode {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SendMode<'a> {
     /// Every check, no send: before asking the user.
     CheckOnly,
     /// Sent as the agent asked, which only stands while approvals are off.
     Direct,
     /// Sent because the user approved it.
     Approved,
+    /// Sent because the room approved it, which only stands as it was judged.
+    Room(&'a RoomStanding),
+}
+
+/// What a room approval was judged by. It stands only until it expires, and
+/// only while the settings in force for its transfer are still these.
+#[derive(Debug, PartialEq)]
+struct RoomStanding {
+    topic: String,
+    wallet: Wallet,
+    amount: String,
+    settings: RoomApproval,
+    expires_at: u64,
+}
+
+/// What allows a chain transfer, checked last before it goes.
+enum ChainSend<'a> {
+    /// The agent's own call, sent without approval: it must still be
+    /// uncancelled, and still need none.
+    Direct(&'a CancellationToken),
+    /// The user approved it.
+    Approved,
+    /// The room approved it.
+    Room(&'a RoomStanding),
 }
 
 /// Why a transfer didn't clearly go through.
@@ -1200,7 +1224,12 @@ impl LogosServer {
         tokio::spawn(async move {
             if request.chain {
                 let outcome = match server
-                    .chain_send(&request.from, &request.to, &request.amount_lepta, None)
+                    .chain_send(
+                        &request.from,
+                        &request.to,
+                        &request.amount_lepta,
+                        ChainSend::Approved,
+                    )
                     .await
                 {
                     Ok(tx_hash) => Decision::Sent { tx_hash },
@@ -2936,7 +2965,8 @@ impl LogosServer {
                 // The settings may have changed while Muster was read: judge
                 // again by the ones in force now.
                 Verdict::Send { .. }
-                    if self.room_settings_for(&topic, wallet, &amount) != Some(settings) =>
+                    if self.room_settings_for(&topic, wallet, &amount).as_ref()
+                        != Some(&settings) =>
                 {
                     continue;
                 }
@@ -2971,20 +3001,23 @@ impl LogosServer {
                 self.approvals
                     .room_progress(&id, |p| p.muster_state = "executable".into());
                 // Sent from the request the room's call was built from, only
-                // while its approval still stands: not after its expiry, and
-                // not once its settings changed.
-                let expired = request
-                    .room
-                    .as_ref()
-                    .is_none_or(|r| crate::control::unix_now() >= r.expires_at);
-                let unchanged = self.room_settings_for(&topic, wallet, &amount).is_some();
-                let sent = if expired || !unchanged {
-                    Err(SendError::NotSent(
-                        "the room's approval lapsed before sending: nothing was sent".into(),
-                    ))
-                } else if request.chain {
-                    self.chain_send(&request.from, &request.to, &request.amount_lepta, None)
-                        .await
+                // while its approval still stands, checked last before sending:
+                // not after its expiry, and not once its settings changed.
+                let standing = RoomStanding {
+                    topic: topic.clone(),
+                    wallet,
+                    amount: amount.clone(),
+                    settings,
+                    expires_at: request.room.as_ref().map_or(0, |r| r.expires_at),
+                };
+                let sent = if request.chain {
+                    self.chain_send(
+                        &request.from,
+                        &request.to,
+                        &request.amount_lepta,
+                        ChainSend::Room(&standing),
+                    )
+                    .await
                 } else {
                     let p = TransferParams {
                         from: request.from,
@@ -2992,7 +3025,7 @@ impl LogosServer {
                         amount_lepta: request.amount_lepta,
                         call: request.call,
                     };
-                    self.send_checked(&CancellationToken::new(), &p, SendMode::Approved)
+                    self.send_checked(&CancellationToken::new(), &p, SendMode::Room(&standing))
                         .await
                         .map(|sent| sent["tx_hash"].as_str().unwrap_or_default().to_string())
                 };
@@ -3010,6 +3043,18 @@ impl LogosServer {
             }
             return;
         }
+    }
+
+    /// Whether a room approval still stands, right before its transfer goes.
+    fn room_stands(&self, standing: &RoomStanding) -> Result<(), SendError> {
+        let expired = crate::control::unix_now() >= standing.expires_at;
+        let now = self.room_settings_for(&standing.topic, standing.wallet, &standing.amount);
+        if expired || now.as_ref() != Some(&standing.settings) {
+            return Err(SendError::NotSent(
+                "the room's approval lapsed before sending: ask again; nothing was sent".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The room settings a room request in `topic` for `amount` from `wallet`
@@ -3109,7 +3154,10 @@ impl LogosServer {
         }
         let sent = |tx_hash: &str| chain_submitted(&from, &to, &amount, tx_hash);
         match approver {
-            policy::Approver::Send => match self.chain_send(&from, &to, &amount, Some(&ct)).await {
+            policy::Approver::Send => match self
+                .chain_send(&from, &to, &amount, ChainSend::Direct(&ct))
+                .await
+            {
                 Ok(tx_hash) => ok(sent(&tx_hash)),
                 Err(e) => fail(e.message()),
             },
@@ -3181,32 +3229,34 @@ impl LogosServer {
         }
     }
 
-    /// Send an approved chain transfer, checking it again first.
-    /// Send a chain transfer, checking it again first. `direct` is the
-    /// agent's own call when no one approves it: then it must still be
-    /// uncancelled, and still sent without approval, right before it goes.
+    /// Send a chain transfer, checking it again first, and last whether what
+    /// allowed it still stands.
     async fn chain_send(
         &self,
         from: &str,
         to: &str,
         amount: &str,
-        direct: Option<&CancellationToken>,
+        allowed: ChainSend<'_>,
     ) -> Result<String, SendError> {
         self.chain_sendable(from, amount)
             .await
             .map_err(SendError::NotSent)?;
-        if let Some(ct) = direct {
-            if ct.is_cancelled() {
-                return Err(SendError::NotSent(
-                    "transfer cancelled before sending: nothing was sent".into(),
-                ));
+        match allowed {
+            ChainSend::Direct(ct) => {
+                if ct.is_cancelled() {
+                    return Err(SendError::NotSent(
+                        "transfer cancelled before sending: nothing was sent".into(),
+                    ));
+                }
+                if self.approval_policy().approver(Wallet::Node, amount) != policy::Approver::Send {
+                    return Err(SendError::NotSent(
+                        "this chain transfer now needs approval: call chain_transfer again to ask; nothing was sent"
+                            .into(),
+                    ));
+                }
             }
-            if self.approval_policy().approver(Wallet::Node, amount) != policy::Approver::Send {
-                return Err(SendError::NotSent(
-                    "this chain transfer now needs approval: call chain_transfer again to ask; nothing was sent"
-                        .into(),
-                ));
-            }
+            ChainSend::Approved => {}
+            ChainSend::Room(standing) => self.room_stands(standing)?,
         }
         // Last look before sending: the user may have turned transfers off while it waited.
         if !self.allows("chain_transfer") {
@@ -3469,7 +3519,7 @@ impl LogosServer {
         &self,
         ct: &CancellationToken,
         p: &TransferParams,
-        mode: SendMode,
+        mode: SendMode<'_>,
     ) -> Result<Value, SendError> {
         let to = guard::public_account_hex(&p.to).map_err(|e| format!("recipient: {e}"))?;
         let amount = guard::amount_le16_hex(&p.amount_lepta)?;
@@ -3542,6 +3592,9 @@ impl LogosServer {
                 "this transfer now needs approval: call wallet_transfer again to ask; nothing was sent"
                     .into(),
             );
+        }
+        if let SendMode::Room(standing) = mode {
+            self.room_stands(standing)?;
         }
         // The funds checks above take a while: the deadline again, last.
         if p.call

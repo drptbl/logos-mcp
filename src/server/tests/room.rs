@@ -1054,6 +1054,40 @@ async fn a_sent_room_request_reports_the_approvals_that_sent_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn settings_changed_while_an_approved_transfer_waits_for_the_wallet_stop_it() {
+    let mut replies = wallet_open().to_vec(); // checks before proposing
+    replies.extend(wallet_open()); // checks again before sending
+    replies.push(sent("cd34"));
+    let runner = RoomRunner::new(replies);
+    let other = "7a1c000000000000000000000000000000000000000000000000000000e0f2aa";
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Another transfer holds the wallet while the room approves this one.
+    let wallet = s.agent_accounts.lock().await;
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    policy.send_modify(|p| p.room.as_mut().unwrap().approvers = vec![format!("ed:{other}")]);
+    drop(wallet);
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    let status = status_of(&s, &id).await;
+    assert_eq!(status["state"], "failed", "{status}");
+    assert_eq!(runner.sends(), 0);
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_unticked_approver_stops_counting_for_a_waiting_request() {
     let runner = RoomRunner::new(wallet_open().to_vec());
     let other = "7a1c000000000000000000000000000000000000000000000000000000e0f2aa";
