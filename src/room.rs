@@ -43,7 +43,7 @@ fn ed_key(input: &str) -> Option<String> {
 
 /// The Ed25519 key in an account as Muster names it: `ed:<hex>`, the bare hex,
 /// or a 128-hex roster identity, whose first half is the Ed25519 key.
-fn member_key(account: &str) -> Option<String> {
+pub(crate) fn member_key(account: &str) -> Option<String> {
     let account = account.trim();
     match account.len() {
         128 => account.get(..64).and_then(ed_key),
@@ -242,7 +242,7 @@ pub enum Verdict {
     Refused(String),
 }
 
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
@@ -381,7 +381,7 @@ pub struct Room {
 
 /// One Muster call, its JSON-in-a-string result decoded. Muster reports a
 /// refusal as `{"error": …}` inside a successful call.
-async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, String> {
+pub(crate) async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, String> {
     let args: Vec<Arg> = args.iter().map(|a| Arg::str(*a)).collect();
     let value = node
         .call(MUSTER, method, &args)
@@ -397,7 +397,7 @@ async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, S
 /// Make `topic` the agent Muster's active room: Muster reads and writes only
 /// its active room, and only that room takes in new messages. The seat is the
 /// agent's own, so this disturbs nobody.
-async fn activate(node: &dyn Node, topic: &str) -> Result<(), String> {
+pub(crate) async fn activate(node: &dyn Node, topic: &str) -> Result<(), String> {
     let rooms = muster(node, "coordinate_conversations", &[]).await?;
     let joined = rooms
         .as_array()

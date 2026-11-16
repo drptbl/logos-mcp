@@ -1091,8 +1091,18 @@ impl LogosServer {
         }
     }
 
-    fn muster_node(&self) -> &dyn Node {
-        self.muster.as_deref().unwrap_or(self.node.as_ref())
+    /// Where Muster calls go: the agent's seat. Inside Basecamp this
+    /// server's own node holds the user's Muster, which must never propose or
+    /// endorse for the agent, so there it is only ever the seat.
+    fn muster_node(&self) -> Result<&dyn Node, String> {
+        match (&self.muster, self.settings.host_owns_messaging) {
+            (Some(seat), _) => Ok(seat.as_ref()),
+            (None, false) => Ok(self.node.as_ref()),
+            (None, true) => Err(
+                "room approval needs the agent's own seat in Muster: set it up in the AI Agent app first: nothing was sent"
+                    .into(),
+            ),
+        }
     }
 
     /// Record every tool call in `log`.
@@ -2780,16 +2790,20 @@ impl LogosServer {
             Ok(filed) => filed,
             Err(e) => return fail(e),
         };
-        let intent = match self
-            .room
-            .propose(
-                self.muster_node(),
-                room,
-                &call,
-                &format!("{}{id}", crate::room::REF_PREFIX),
-            )
-            .await
-        {
+        let proposed = match self.muster_node() {
+            Ok(seat) => {
+                self.room
+                    .propose(
+                        seat,
+                        room,
+                        &call,
+                        &format!("{}{id}", crate::room::REF_PREFIX),
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let intent = match proposed {
             Ok(intent) => intent,
             Err(reason) => {
                 let _ = self.approvals.room_answer(
@@ -2824,12 +2838,16 @@ impl LogosServer {
     /// approval back, so the room sees it closed.
     async fn follow_room(self, id: String, intent: String, call: RoomCall, topic: String) {
         let room = self.room.clone();
+        // It proposed through the seat, so the seat is there.
+        let Ok(seat) = self.muster_node() else {
+            return;
+        };
         loop {
             tokio::time::sleep(ROOM_POLL).await;
             match self.approvals.decision(&id) {
                 Some(Decision::Waiting) => {}
                 Some(Decision::Expired | Decision::Cancelled) | None => {
-                    room.withdraw(self.muster_node(), &topic, &intent).await;
+                    room.withdraw(seat, &topic, &intent).await;
                     return;
                 }
                 Some(_) => return,
@@ -2839,16 +2857,13 @@ impl LogosServer {
                 _ => {
                     // Its room was changed or turned off: no one may approve it now.
                     if self.approvals.room_answer(&id, Decision::Cancelled).is_ok() {
-                        room.withdraw(self.muster_node(), &topic, &intent).await;
+                        room.withdraw(seat, &topic, &intent).await;
                     }
                     return;
                 }
             };
             let now = crate::control::unix_now();
-            let verdict = match room
-                .look(self.muster_node(), &settings, &intent, &call, now)
-                .await
-            {
+            let verdict = match room.look(seat, &settings, &intent, &call, now).await {
                 Ok(verdict) => verdict,
                 Err(e) => {
                     tracing::warn!(request = %id, %intent, "could not read the room: {e}");
@@ -2889,7 +2904,7 @@ impl LogosServer {
                 &serde_json::to_string(&ending).unwrap_or_default(),
             );
             if matches!(ending, Decision::Failed { .. }) {
-                room.withdraw(self.muster_node(), &topic, &intent).await;
+                room.withdraw(seat, &topic, &intent).await;
             }
             if approved {
                 self.approvals
@@ -2918,7 +2933,7 @@ impl LogosServer {
                 let unsent = matches!(outcome, Decision::Failed { .. });
                 self.finish_approved(&id, outcome);
                 if unsent {
-                    room.withdraw(self.muster_node(), &topic, &intent).await;
+                    room.withdraw(seat, &topic, &intent).await;
                 }
             }
             return;

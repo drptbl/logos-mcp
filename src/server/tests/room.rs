@@ -163,8 +163,9 @@ fn policy_server(
     let file = dir.path().join("agent-accounts.json");
     std::fs::write(&file, serde_json::to_string(&[AGENT_ACCOUNT]).unwrap()).unwrap();
     let (tx, rx) = tokio::sync::watch::channel(policy);
+    let node: Arc<dyn Node> = Arc::new(Logosctl::new(runner));
     let server = LogosServer::new(
-        Arc::new(Logosctl::new(runner)),
+        node.clone(),
         Arc::new(EventStore::default()),
         None,
         NodeSettings {
@@ -180,6 +181,12 @@ fn policy_server(
         },
     )
     .with_approval_policy(rx);
+    // In Basecamp the agent's Muster is its own seat, here the same fake.
+    let server = if in_basecamp {
+        server.with_muster(node)
+    } else {
+        server
+    };
     (server, dir, tx)
 }
 
@@ -1075,4 +1082,23 @@ async fn transfers_may_wait_whenever_a_tier_asks_or_the_room_approves() {
     assert!(!s.asks_before_transfer());
     policy.send_modify(|p| *p = cli_policy(&[HUMAN]));
     assert!(s.asks_before_transfer());
+}
+
+#[tokio::test(start_paused = true)]
+async fn basecamp_without_the_agent_seat_never_proposes_through_the_users_muster() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir, _policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), true);
+    // The same server without its seat: Basecamp's own node is the user's Muster.
+    let s = LogosServer {
+        muster: None,
+        ..s
+    };
+    let r = s
+        .wallet_transfer(CancellationToken::new(), transfer(AGENT_FROM, RLN_PAYER, OVER))
+        .await
+        .unwrap();
+    assert!(text(&r).contains("agent's own seat"), "{}", text(&r));
+    for method in ["coordinate_propose", "coordinate_contribute", "identity"] {
+        assert!(runner.muster_calls(method).is_empty(), "{method}");
+    }
 }
