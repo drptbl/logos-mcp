@@ -390,6 +390,7 @@ fn room_progress() -> RoomProgress {
         muster_state: "proposing".into(),
         approvals: 0,
         required: 1,
+        expires_at: unix_now() + 3600,
     }
 }
 
@@ -397,14 +398,7 @@ fn room_progress() -> RoomProgress {
 async fn only_the_room_answers_a_room_request() {
     let approvals = Approvals::default();
     let (id, _) = approvals
-        .request_room(
-            "Public/a",
-            "Public/b",
-            "9",
-            None,
-            room_progress(),
-            Duration::from_secs(3600),
-        )
+        .request_room("Public/a", "Public/b", "9", None, false, room_progress())
         .unwrap();
     assert!(approvals.waiting().is_empty(), "the user isn't asked");
     assert!(approvals.approve(&id).unwrap_err().contains("room"));
@@ -425,14 +419,7 @@ async fn only_the_room_answers_a_room_request() {
 async fn a_room_request_expires_after_its_own_window() {
     let approvals = Approvals::default();
     let (id, _) = approvals
-        .request_room(
-            "Public/a",
-            "Public/b",
-            "9",
-            None,
-            room_progress(),
-            Duration::from_secs(3600),
-        )
+        .request_room("Public/a", "Public/b", "9", None, false, room_progress())
         .unwrap();
     tokio::time::advance(APPROVAL_EXPIRES + Duration::from_secs(1)).await;
     assert_eq!(approvals.status(&id).unwrap()["state"], "waiting");
@@ -445,14 +432,7 @@ async fn a_room_request_expires_after_its_own_window() {
 async fn the_agent_can_cancel_its_room_request() {
     let approvals = Approvals::default();
     let (id, _) = approvals
-        .request_room(
-            "Public/a",
-            "Public/b",
-            "9",
-            None,
-            room_progress(),
-            Duration::from_secs(3600),
-        )
+        .request_room("Public/a", "Public/b", "9", None, false, room_progress())
         .unwrap();
     assert_eq!(approvals.cancel(&id), Decision::Cancelled);
     assert!(approvals.room_answer(&id, Decision::Approved).is_err());

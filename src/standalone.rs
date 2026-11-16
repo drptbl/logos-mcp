@@ -13,7 +13,7 @@ use crate::{
     guard::FilesRoot,
     logosctl::{Logosctl, ProcessRunner},
     node::Node,
-    room::RoomApproval,
+    policy::{ApprovalPolicy, Approver, RoomSettings, Tiers},
     server::{DeliveryConfig, LogosServer, NodeSettings, WalletMode, WalletPaths},
 };
 
@@ -115,20 +115,34 @@ struct Cli {
     timeout_secs: u64,
 }
 
-/// The room approval the options set up, if any.
-fn room_approval(cli: &Cli) -> anyhow::Result<Option<RoomApproval>> {
+/// The approval policy the room options set up, if any: the agent wallet
+/// sends up to the limit and asks the room above it. Chain transfers, which
+/// spend the node's own wallet, always go to the room: the CLI has no app to
+/// ask the user in.
+fn approval_policy(cli: &Cli) -> anyhow::Result<Option<ApprovalPolicy>> {
     let Some(topic) = &cli.room_topic else {
         return Ok(None);
     };
-    RoomApproval::new(
-        topic,
-        &cli.room_approvers,
-        cli.room_approvals,
-        cli.room_above_lepta,
-        cli.room_expires_mins,
-    )
-    .map(Some)
-    .map_err(anyhow::Error::msg)
+    let policy = ApprovalPolicy {
+        agent: Tiers {
+            limit_lepta: cli.room_above_lepta,
+            up_to: Approver::Send,
+            above: Approver::Room,
+        },
+        node: Tiers {
+            limit_lepta: 0,
+            up_to: Approver::Room,
+            above: Approver::Room,
+        },
+        room: Some(RoomSettings {
+            topic: topic.clone(),
+            approvers: cli.room_approvers.clone(),
+            approvals: cli.room_approvals,
+            expires_mins: cli.room_expires_mins,
+        }),
+    };
+    policy.check().map_err(anyhow::Error::msg)?;
+    Ok(Some(policy))
 }
 
 fn find_logosctl() -> Option<PathBuf> {
@@ -171,7 +185,7 @@ where
         .about(app.about)
         .get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches)?;
-    let room = room_approval(&cli)?;
+    let policy = approval_policy(&cli)?;
     let bin = match cli.logosctl.or_else(find_logosctl) {
         Some(b) if b.is_file() => b,
         Some(b) => bail!("logosctl not found at {}", b.display()),
@@ -241,10 +255,10 @@ where
     node.watch("storage_module", events.clone());
 
     let server = LogosServer::new(node, events, files, settings);
-    Ok(match room {
-        Some(room) => {
-            tracing::info!(topic = %room.topic, approvals = room.approvals, above_lepta = %room.above_lepta, "room approval on");
-            server.with_room_approval(room)
+    Ok(match policy {
+        Some(policy) => {
+            tracing::info!(?policy, "room approval on");
+            server.with_approval_policy(tokio::sync::watch::channel(policy).1)
         }
         None => server,
     })
@@ -304,6 +318,8 @@ mod tests {
         logosctl.into_os_string()
     }
 
+    use crate::policy::Wallet;
+
     #[tokio::test]
     async fn room_approval_needs_the_agent_wallet_and_a_sound_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -345,11 +361,14 @@ mod tests {
             "3000000",
         ])
         .unwrap();
-        let config = room_approval(&cli).unwrap().unwrap();
-        assert_eq!(config.approvals, 1);
-        assert_eq!(config.expires, Duration::from_secs(3600));
-        assert!(!config.needs_room("3000000"));
-        assert!(config.needs_room("3000001"));
+        // Exactly as 0.9.0 routed them.
+        let policy = approval_policy(&cli).unwrap().unwrap();
+        let settings = policy.room_approval().unwrap().unwrap();
+        assert_eq!(settings.approvals, 1);
+        assert_eq!(settings.expires, Duration::from_secs(3600));
+        assert_eq!(policy.approver(Wallet::Agent, "3000000"), Approver::Send);
+        assert_eq!(policy.approver(Wallet::Agent, "3000001"), Approver::Room);
+        assert_eq!(policy.approver(Wallet::Node, "1"), Approver::Room);
         let too_many = room(&[
             "--wallet-config",
             wallet,
@@ -363,7 +382,7 @@ mod tests {
             "2",
         ])
         .unwrap();
-        assert!(room_approval(&too_many).is_err());
+        assert!(approval_policy(&too_many).is_err());
         // A limit without a room would leave transfers ungated: refused.
         for flag in [
             ["--room-above-lepta", "5"],
@@ -383,7 +402,7 @@ mod tests {
             );
         }
         let none = room(&[]).unwrap();
-        assert!(room_approval(&none).unwrap().is_none());
+        assert!(approval_policy(&none).unwrap().is_none());
     }
 
     #[tokio::test]

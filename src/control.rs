@@ -176,6 +176,8 @@ pub struct RoomProgress {
     pub approvals: usize,
     /// Trusted approvals it needs.
     pub required: usize,
+    /// Unix seconds: not sent at or after this.
+    pub expires_at: u64,
 }
 
 /// A program call that moves the amount out of `from` in place of a plain
@@ -250,19 +252,22 @@ impl Approvals {
         self.file(request, APPROVAL_EXPIRES)
     }
 
-    /// File a transfer, or a program call that moves the amount, that the room
-    /// decides, waiting up to `expires`.
+    /// File a transfer the room decides: a LEZ transfer, a program call that
+    /// moves the amount, or with `chain` a Logos chain transfer from the node's
+    /// wallet. It waits until the progress's `expires_at`.
     pub fn request_room(
         &self,
         from: &str,
         to: &str,
         amount_lepta: &str,
         call: Option<ProgramCall>,
+        chain: bool,
         progress: RoomProgress,
-        expires: Duration,
     ) -> Result<(String, tokio::sync::watch::Receiver<Decision>), String> {
+        let expires = Duration::from_secs(progress.expires_at.saturating_sub(unix_now()));
         let request = TransferRequest {
             room: Some(progress),
+            chain,
             ..Self::new_request(from, to, amount_lepta, call)
         };
         self.file(request, expires)

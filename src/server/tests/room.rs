@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::logosctl::{RawOutput, RunFuture, Runner};
-use crate::room::RoomApproval;
+use crate::policy::{self, ApprovalPolicy, RoomSettings, Tiers};
 use std::collections::{BTreeMap, VecDeque};
 
 const HUMAN: &str = "0b00086682a0d169f90095b9d58e6c003ee591531ccf8b59c712c1cb70603269";
@@ -119,21 +119,50 @@ impl Runner for RoomRunner {
     }
 }
 
+/// The policy the CLI builds from `--room-*` flags with a 3,000,000 limit:
+/// the agent wallet sends up to it and asks the room above it, and chain
+/// transfers always ask the room.
+fn cli_policy(approvers: &[&str]) -> ApprovalPolicy {
+    ApprovalPolicy {
+        agent: Tiers {
+            limit_lepta: 3_000_000,
+            up_to: policy::Approver::Send,
+            above: policy::Approver::Room,
+        },
+        node: Tiers {
+            limit_lepta: 0,
+            up_to: policy::Approver::Room,
+            above: policy::Approver::Room,
+        },
+        room: Some(RoomSettings {
+            topic: TOPIC.into(),
+            approvers: approvers.iter().map(|a| format!("ed:{a}")).collect(),
+            approvals: 1,
+            expires_mins: 60,
+        }),
+    }
+}
+
 fn room_server(runner: Arc<RoomRunner>, approvers: &[&str]) -> (LogosServer, tempfile::TempDir) {
+    let (server, dir, _policy) = policy_server(runner, cli_policy(approvers), false);
+    (server, dir)
+}
+
+/// A shared-wallet server following `policy`, which the returned sender
+/// changes live. `in_basecamp` says whether there is an app to ask the user in.
+fn policy_server(
+    runner: Arc<RoomRunner>,
+    policy: ApprovalPolicy,
+    in_basecamp: bool,
+) -> (
+    LogosServer,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<ApprovalPolicy>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("agent-accounts.json");
     std::fs::write(&file, serde_json::to_string(&[AGENT_ACCOUNT]).unwrap()).unwrap();
-    let room = RoomApproval::new(
-        TOPIC,
-        &approvers
-            .iter()
-            .map(|a| format!("ed:{a}"))
-            .collect::<Vec<_>>(),
-        1,
-        3_000_000,
-        60,
-    )
-    .unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(policy);
     let server = LogosServer::new(
         Arc::new(Logosctl::new(runner)),
         Arc::new(EventStore::default()),
@@ -146,12 +175,12 @@ fn room_server(runner: Arc<RoomRunner>, approvers: &[&str]) -> (LogosServer, tem
                 agent_accounts_file: file,
             }),
             discovery_bootstrap: vec![],
-            host_owns_messaging: false,
+            host_owns_messaging: in_basecamp,
             delivery_config: None,
         },
     )
-    .with_room_approval(room);
-    (server, dir)
+    .with_approval_policy(rx);
+    (server, dir, tx)
 }
 
 /// The agent's Muster after the room folded the transfer proposal of `args`
@@ -175,6 +204,21 @@ fn room_folded_call(
     approvers: &[&str],
     decliners: &[&str],
 ) {
+    room_folded_in(
+        runner, state, "lez_core", method, args, approvers, decliners,
+    );
+}
+
+/// The same, for a proposal of `module`.`method`(`args`).
+fn room_folded_in(
+    runner: &RoomRunner,
+    state: &str,
+    module: &str,
+    method: &str,
+    args: Value,
+    approvers: &[&str],
+    decliners: &[&str],
+) {
     let record: Vec<Value> = approvers
         .iter()
         .map(|a| json!({"class": "driver-contribution", "account": format!("ed:{a}"), "attestation": "committed"}))
@@ -185,7 +229,7 @@ fn room_folded_call(
             "id": INTENT,
             "state": state,
             "approvals": approvers.len(),
-            "txhash": crate::room::tests::invoke_txhash(method, &args),
+            "txhash": crate::room::tests::invoke_txhash_in(module, method, &args),
             "decliners": decliners.iter().map(|d| format!("{d}{X25519}")).collect::<Vec<_>>(),
             "provenance": record,
         }]),
@@ -632,7 +676,7 @@ async fn a_proposal_that_already_had_approvals_is_refused() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_room_without_enough_trusted_members_or_not_active_is_refused() {
+async fn a_room_short_of_trusted_members_is_refused_and_an_inactive_one_is_joined() {
     let runner = RoomRunner::new(wallet_open().to_vec());
     runner.always(
         "coordinate_members",
@@ -665,9 +709,16 @@ async fn a_room_without_enough_trusted_members_or_not_active_is_refused() {
         )
         .await
         .unwrap();
-    assert!(text(&r).contains("isn't the active room"), "{}", text(&r));
-    assert!(runner.muster_calls("coordinate_join").is_empty());
-    assert!(runner.muster_calls("coordinate_propose").is_empty());
+    // The seat is the agent's own Muster: it makes its room active and goes on.
+    assert_eq!(
+        runner.muster_calls("coordinate_join")[0][4],
+        format!("str:{TOPIC}")
+    );
+    assert!(
+        !runner.muster_calls("coordinate_propose").is_empty(),
+        "{}",
+        text(&r)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -814,4 +865,214 @@ async fn an_approved_transfer_the_wallet_refuses_withdraws_its_proposal() {
         runner.muster_calls("coordinate_decline")[0][4],
         format!("str:{INTENT}")
     );
+}
+
+// ---- the approval policy --------------------------------------------------
+
+const CHAIN_A: &str = "3e2acc3dacb83036f111df8fa65df19d897a7022aa42fbd51dc52d8f79117e09";
+const CHAIN_B: &str = "84f956ec0d63f5f7dac2eb85171c0b64fa2191d16d96515ba6f16ec89c78c61e";
+const CHAIN_TX: &str = "1f0f6eafe1e058d5d657cd26972de2a0ea3de547eae66b758f6531a516deae1c";
+
+fn chain_reply(method: &str, value: Value) -> RawOutput {
+    out(&json!({
+        "method": method,
+        "module": "blockchain_module",
+        "result": { "error": null, "success": true, "value": value },
+        "status": "ok",
+    })
+    .to_string())
+}
+
+/// What a chain transfer's checks read: the sender is the node's and holds 5000.
+fn chain_checks() -> Vec<RawOutput> {
+    vec![
+        chain_reply(
+            "wallet_get_known_addresses",
+            json!(format!("[\"{CHAIN_A}\",\"{CHAIN_B}\"]")),
+        ),
+        chain_reply("wallet_get_balance", json!("5000")),
+    ]
+}
+
+fn chain_args() -> Value {
+    json!([CHAIN_A, [CHAIN_A], CHAIN_B, "1500", ""])
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cli_chain_transfer_goes_to_the_room_and_sends_exactly_that_call() {
+    let mut replies = chain_checks(); // before proposing
+    replies.extend(chain_checks()); // again before sending
+    replies.push(chain_reply("wallet_transfer_funds", json!(CHAIN_TX)));
+    let runner = RoomRunner::new(replies);
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let agent = s.clone();
+    let call = tokio::spawn(async move {
+        agent
+            .chain_transfer(
+                CancellationToken::new(),
+                Parameters(ChainTransferParams {
+                    from: CHAIN_A.into(),
+                    to: CHAIN_B.into(),
+                    amount_lepta: "1500".into(),
+                }),
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..12_000 {
+        if !runner.muster_calls("coordinate_contribute").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let proposed = runner.muster_calls("coordinate_propose");
+    let effect: Value = serde_json::from_str(proposed[0][4].strip_prefix("str:").unwrap()).unwrap();
+    assert_eq!(effect["module"], "blockchain_module");
+    assert_eq!(effect["method"], "wallet_transfer_funds");
+    assert_eq!(effect["args"], chain_args());
+    assert!(effect["note"].as_str().unwrap().contains("Logos chain"));
+    room_folded_in(
+        &runner,
+        "executable",
+        "blockchain_module",
+        "wallet_transfer_funds",
+        chain_args(),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    let r = call.await.unwrap();
+    assert_eq!(body(&r)["tx_hash"], CHAIN_TX, "{}", text(&r));
+    let sent: Vec<Vec<String>> = runner
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get(3).map(String::as_str) == Some("wallet_transfer_funds"))
+        .cloned()
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0][4..],
+        [
+            format!("str:{CHAIN_A}"),
+            format!("json:[\"{CHAIN_A}\"]"),
+            format!("str:{CHAIN_B}"),
+            "str:1500".into(),
+            "str:".into(),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_tier_routes_the_agents_transfers_in_basecamp() {
+    let mut replies = wallet_open().to_vec(); // the small one, checked before asking
+    replies.extend(wallet_open()); // the big one, checked before proposing
+    let runner = RoomRunner::new(replies);
+    let mut policy = cli_policy(&[HUMAN]);
+    policy.agent.up_to = policy::Approver::Ask;
+    let (s, _dir, _tx) = policy_server(runner.clone(), policy, true);
+    let agent = s.clone();
+    let small = tokio::spawn(async move {
+        agent
+            .wallet_transfer(
+                CancellationToken::new(),
+                transfer(AGENT_FROM, RLN_PAYER, "1000"),
+            )
+            .await
+            .unwrap()
+    });
+    for _ in 0..200 {
+        if !s.approvals()["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        s.approvals()["waiting"][0]["amount_lepta"],
+        "1000",
+        "the user is asked"
+    );
+    assert!(runner.muster_calls("coordinate_propose").is_empty());
+    let _big = propose(&s, &runner).await;
+    assert_eq!(
+        runner.muster_calls("coordinate_propose").len(),
+        1,
+        "the room is asked"
+    );
+    drop(small);
+}
+
+#[tokio::test(start_paused = true)]
+async fn changing_the_room_cancels_a_waiting_request_and_closes_its_card() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    policy.send_modify(|p| {
+        p.room.as_mut().unwrap().topic = "/muster/1/another-room/proto".into();
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(status_of(&s, &id).await["state"], "cancelled");
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unticked_approver_stops_counting_for_a_waiting_request() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let other = "7a1c000000000000000000000000000000000000000000000000000000e0f2aa";
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN, other]), false);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    policy.send_modify(|p| p.room.as_mut().unwrap().approvers = vec![format!("ed:{other}")]);
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    assert_eq!(status_of(&s, &id).await["state"], "waiting");
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agents_own_key_made_an_approver_mid_request_ends_it_unsent() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir, policy) = policy_server(runner.clone(), cli_policy(&[HUMAN]), false);
+    let call = propose(&s, &runner).await;
+    policy.send_modify(|p| {
+        p.room
+            .as_mut()
+            .unwrap()
+            .approvers
+            .push(format!("ed:{AGENT_KEY}"))
+    });
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    let r = call.await.unwrap();
+    assert!(text(&r).contains("own Muster key"), "{}", text(&r));
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test]
+async fn transfers_may_wait_whenever_a_tier_asks_or_the_room_approves() {
+    let runner = RoomRunner::new(vec![]);
+    let (s, _dir, policy) = policy_server(runner, ApprovalPolicy::default(), true);
+    assert!(!s.asks_before_transfer());
+    policy.send_modify(|p| *p = cli_policy(&[HUMAN]));
+    assert!(s.asks_before_transfer());
 }
