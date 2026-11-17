@@ -242,16 +242,30 @@ impl Seat {
     pub async fn status(&self) -> Value {
         // Read first: a setup that ends meanwhile then shows as still running
         // for one more look, never as not set up.
-        let setup = match &*self.setup() {
-            Setup::Idle => None,
-            Setup::Running => Some(("setting_up", json!(true))),
-            Setup::Failed(e) => Some(("setup_error", json!(e))),
-        };
+        let setup = self.setup_progress();
         let mut status = self.session_status().await;
         if let Some((key, value)) = setup {
             status[key] = value;
         }
         status
+    }
+
+    /// The status of a seat room approval doesn't use: only how its setup
+    /// goes. It asks nothing of logosctl or Muster.
+    pub fn setup_status(&self) -> Value {
+        let mut status = json!({ "running": false });
+        if let Some((key, value)) = self.setup_progress() {
+            status[key] = value;
+        }
+        status
+    }
+
+    fn setup_progress(&self) -> Option<(&'static str, Value)> {
+        match &*self.setup() {
+            Setup::Idle => None,
+            Setup::Running => Some(("setting_up", json!(true))),
+            Setup::Failed(e) => Some(("setup_error", json!(e))),
+        }
     }
 
     async fn session_status(&self) -> Value {

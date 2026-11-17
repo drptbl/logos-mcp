@@ -292,3 +292,18 @@ async fn stopping_mid_setup_ends_the_setup_before_the_daemon() {
     assert_eq!(argv(&fake).last().unwrap(), "--json daemon stop");
     assert!(matches!(*seat.setup.lock().unwrap(), Setup::Failed(_)));
 }
+
+#[tokio::test]
+async fn a_seat_room_approval_doesnt_use_reports_its_setup_and_asks_nothing() {
+    let fake = FakeRunner::with(vec![]); // every logosctl call fails
+    let seat = seat(fake.clone());
+    assert_eq!(seat.setup_status(), serde_json::json!({"running": false}));
+    assert!(argv(&fake).is_empty());
+    set_up(seat, || Ok(())).unwrap();
+    settled(seat).await;
+    let calls = argv(&fake).len();
+    let status = seat.setup_status();
+    assert_eq!(status["running"], false);
+    assert!(status["setup_error"].is_string(), "{status}");
+    assert_eq!(argv(&fake).len(), calls);
+}

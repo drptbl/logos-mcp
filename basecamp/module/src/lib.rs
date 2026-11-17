@@ -410,13 +410,24 @@ impl LogosMcpModule for ModuleImpl {
         for_app(|c| c.set_approval_policy(&policy))
     }
 
+    /// The seat's status. While room approval is off it asks nothing of
+    /// logosctl or Muster: only how a setup goes.
     fn seat_status(&self) -> String {
         for_app(|c| {
-            let mut status = on_seat(|seat| async move { Ok(seat.status().await) })?;
-            // After the seat's own status: a setup it saw finish is remembered by now.
-            status["set_up"] = json!(c.agent_seat());
+            let (seat, _) = seat()?;
+            // Before reading whether it is set up: a setup that finishes in
+            // between then shows as set up, never as not set up.
+            let setup = seat.setup_status();
+            let set_up = c.agent_seat();
+            let mut status = if set_up {
+                let mut status = on_seat(|seat| async move { Ok(seat.status().await) })?;
+                status["you"] = json!(users_muster_key());
+                status
+            } else {
+                setup
+            };
+            status["set_up"] = json!(set_up);
             status["logosctl"] = json!(find_logosctl());
-            status["you"] = json!(users_muster_key());
             Ok(status)
         })
     }
