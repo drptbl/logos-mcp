@@ -597,24 +597,36 @@ Item {
                                 }
                                 LogosText { text: qsTr("Up to it") }
                                 ComboBox {
+                                    // Room only while room approval is on.
                                     model: root.roomOn ? root.approverNames : root.approverNames.slice(0, 2)
-                                    currentIndex: modelData.node ? root.nodeUpTo : root.agentUpTo
+                                    function bind() {
+                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeUpTo : root.agentUpTo })
+                                    }
+                                    Component.onCompleted: bind()
+                                    // A new list resets the choice: show the draft's again.
+                                    onModelChanged: Qt.callLater(bind)
                                     onActivated: function (index) {
                                         if (modelData.node) root.nodeUpTo = index
                                         else root.agentUpTo = index
                                         root.draftDirty = true
-                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeUpTo : root.agentUpTo })
+                                        bind()
                                     }
                                 }
                                 LogosText { text: qsTr("Above it") }
                                 ComboBox {
+                                    // Room only while room approval is on.
                                     model: root.roomOn ? root.approverNames : root.approverNames.slice(0, 2)
-                                    currentIndex: modelData.node ? root.nodeAbove : root.agentAbove
+                                    function bind() {
+                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeAbove : root.agentAbove })
+                                    }
+                                    Component.onCompleted: bind()
+                                    // A new list resets the choice: show the draft's again.
+                                    onModelChanged: Qt.callLater(bind)
                                     onActivated: function (index) {
                                         if (modelData.node) root.nodeAbove = index
                                         else root.agentAbove = index
                                         root.draftDirty = true
-                                        currentIndex = Qt.binding(function () { return modelData.node ? root.nodeAbove : root.agentAbove })
+                                        bind()
                                     }
                                 }
                             }
