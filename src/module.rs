@@ -360,7 +360,8 @@ impl Control {
         let config = ModuleConfig::load_or_create(&self.dir)?;
         if policy.uses_room() && !config.agent_seat {
             return Err(
-                "room approval is off: set up the agent seat before a tier asks the room".into(),
+                "room approval is off: turn it on in the AI Agent app before a tier asks the room"
+                    .into(),
             );
         }
         self.apply_policy(config, policy)
