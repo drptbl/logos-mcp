@@ -129,8 +129,8 @@ Item {
         root.nodeUpTo = tier(p.node.up_to)
         root.nodeAbove = tier(p.node.above)
         const room = p.room || {}
-        if (room.topic && room.topic !== root.roomTopic) loadMembers(room.topic)
         root.roomTopic = room.topic || ""
+        loadMembers(root.roomTopic)
         root.roomApprovers = room.approvers || []
         root.roomApprovals = room.approvals || 1
         root.roomExpires = room.expires_mins || 60
@@ -157,15 +157,22 @@ Item {
     }
 
     // The room's members; with none trusted yet, you are ticked by default.
+    // They come from the agent's seat, so they load once it runs: after
+    // Basecamp starts, the seat may still be starting.
+    property string membersOf: ""
     function loadMembers(topic) {
+        if (topic === root.membersOf) return
         root.members = []
-        if (!topic) return
+        root.membersOf = ""
+        if (!topic || !root.seat.running) return
+        root.membersOf = topic
         call(backend.roomMembers(topic), function (reply) {
             root.members = reply.members || []
             const you = root.members.filter(function (m) { return m.you && !m.agent })
             if (root.roomApprovers.length === 0 && you.length > 0) root.roomApprovers = [you[0].key]
-        })
+        }, function () { root.membersOf = "" })
     }
+    onSeatChanged: loadMembers(root.roomTopic)
 
     function toggleApprover(key, on) {
         const now = root.roomApprovers.filter(function (k) { return k !== key })
