@@ -23,6 +23,7 @@ public:
     QString cancelRoomRequest(QString requestId) override;
     QString saveApprovalPolicy(QString policy) override;
     QString seatSetUp() override;
+    QString seatTurnOff() override;
     QString seatJoin(QString topic) override;
     QString roomMembers(QString topic) override;
     void refreshSeat() override;

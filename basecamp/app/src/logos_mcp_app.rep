@@ -23,6 +23,7 @@ class LogosMcpApp
     SLOT(QString cancelRoomRequest(QString requestId))
     SLOT(QString saveApprovalPolicy(QString policy))
     SLOT(QString seatSetUp())
+    SLOT(QString seatTurnOff())
     SLOT(QString seatJoin(QString topic))
     SLOT(QString roomMembers(QString topic))
     SLOT(void refreshSeat())

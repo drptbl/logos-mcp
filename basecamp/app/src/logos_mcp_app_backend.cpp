@@ -97,6 +97,18 @@ QString LogosMcpAppBackend::seatSetUp()
     return reply;
 }
 
+// Room tiers ask the user from now on, waiting room requests are cancelled, and
+// the seat stops. The reply is the policy now in force.
+QString LogosMcpAppBackend::seatTurnOff()
+{
+    const QString reply = checked(modules().logos_mcp.seat_turn_off());
+    if (!isError(reply))
+        setApprovalPolicy(reply);
+    setApprovals(checked(modules().logos_mcp.approvals()));
+    QTimer::singleShot(0, [this]() { refreshSeat(); });
+    return reply;
+}
+
 QString LogosMcpAppBackend::seatJoin(QString topic)
 {
     const QString reply = checked(modules().logos_mcp.seat_join(topic));

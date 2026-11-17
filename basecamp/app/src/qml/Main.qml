@@ -37,6 +37,9 @@ Item {
     // The chosen room's members, as the agent's seat sees them.
     property var members: []
     property bool settingUpSeat: false
+    // Room approval is on once the agent's seat is set up: until then the
+    // tiers offer Send and Ask me only, and nothing asks Muster anything.
+    readonly property bool roomOn: !!root.seat.set_up
     readonly property var approverKeys: ["send", "ask", "room"]
     readonly property var approverNames: [qsTr("Send"), qsTr("Ask me"), qsTr("Room")]
     // The account waiting for the user to confirm handing it over.
@@ -561,7 +564,10 @@ Item {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         color: Theme.palette.textSecondary
-                        text: qsTr("For each wallet, a limit splits transfers in two. Each side is sent by the agent, waits for your OK in the Wallet tab, or waits for trusted people in a Muster room. The side above the limit can't be looser than the one under it. A limit of 0 puts every transfer above it.")
+                        text: (root.roomOn
+                            ? qsTr("For each wallet, a limit splits transfers in two. Each side is sent by the agent, waits for your OK in the Wallet tab, or waits for trusted people in a Muster room.")
+                            : qsTr("For each wallet, a limit splits transfers in two. Each side is sent by the agent, or waits for your OK in the Wallet tab."))
+                            + " " + qsTr("The side above the limit can't be looser than the one under it. A limit of 0 puts every transfer above it.")
                     }
 
                     Repeater {
@@ -591,7 +597,7 @@ Item {
                                 }
                                 LogosText { text: qsTr("Up to it") }
                                 ComboBox {
-                                    model: root.approverNames
+                                    model: root.roomOn ? root.approverNames : root.approverNames.slice(0, 2)
                                     currentIndex: modelData.node ? root.nodeUpTo : root.agentUpTo
                                     onActivated: function (index) {
                                         if (modelData.node) root.nodeUpTo = index
@@ -602,7 +608,7 @@ Item {
                                 }
                                 LogosText { text: qsTr("Above it") }
                                 ComboBox {
-                                    model: root.approverNames
+                                    model: root.roomOn ? root.approverNames : root.approverNames.slice(0, 2)
                                     currentIndex: modelData.node ? root.nodeAbove : root.agentAbove
                                     onActivated: function (index) {
                                         if (modelData.node) root.nodeAbove = index
@@ -622,32 +628,32 @@ Item {
                         }
                     }
 
-                    LogosText { text: qsTr("The agent's seat in Muster"); font.weight: Theme.typography.weightMedium }
+                    LogosText { text: qsTr("Room approval with Muster"); font.weight: Theme.typography.weightMedium }
                     LogosText {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         color: Theme.palette.textSecondary
-                        text: qsTr("A room approves with the agent as its own member, never as you. Its seat is a logosctl session the module runs in its data folder.")
+                        text: qsTr("Trusted people approve big transfers in a Muster room. The agent joins the room as its own member, never as you, from a logosctl session this module runs in its data folder.")
                     }
                     LogosText {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        visible: !root.seat.logosctl
+                        visible: !root.roomOn && !root.seat.logosctl
                         color: Theme.palette.warning
                         text: qsTr("logosctl isn't installed: install it first, then come back here.")
                     }
                     RowLayout {
-                        visible: !!root.seat.logosctl && !root.seat.set_up
+                        visible: !root.roomOn && !!root.seat.logosctl
                         Layout.fillWidth: true
                         LogosText {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: qsTr("Sets up the seat: installs Muster and the six modules it needs from Muster's catalogue (github.com/corpetty/muster) into its own session, and runs it while this module runs.")
+                            text: qsTr("Off. Turning it on installs Muster and the six modules it needs from Muster's catalogue (github.com/corpetty/muster) into that session, and runs it while this module runs.")
                         }
                         LogosButton {
                             // The module sets the seat up in the background; its status follows.
                             readonly property bool busy: root.settingUpSeat || !!root.seat.setting_up
-                            text: busy ? qsTr("Setting up…") : qsTr("Set up agent seat")
+                            text: busy ? qsTr("Turning on…") : qsTr("Turn on room approval")
                             enabled: root.ready && !busy
                             onClicked: {
                                 root.settingUpSeat = true
@@ -660,128 +666,154 @@ Item {
                     LogosText {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        visible: !root.seat.set_up && !root.seat.setting_up && !!root.seat.setup_error
+                        visible: !root.roomOn && !root.seat.setting_up && !!root.seat.setup_error
                         color: Theme.palette.warning
-                        text: qsTr("Setting up the seat failed: %1").arg(root.seat.setup_error || "")
+                        text: qsTr("Turning room approval on failed: %1").arg(root.seat.setup_error || "")
                     }
-                    LogosText {
+
+                    // On: the seat, its room and whose approval counts.
+                    ColumnLayout {
+                        visible: root.roomOn
                         Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        visible: !!root.seat.set_up
-                        color: root.seat.running ? Theme.palette.success : Theme.palette.warning
-                        text: root.seat.running ? qsTr("The seat is running as %1.").arg(root.seat.key || "")
-                            : qsTr("The seat isn't running: %1").arg(root.seat.error || qsTr("starting"))
-                    }
-                    RowLayout {
-                        visible: !!root.seat.invite_id
-                        Layout.fillWidth: true
+                        spacing: Theme.spacing.small
                         LogosText {
                             Layout.fillWidth: true
-                            elide: Text.ElideMiddle
-                            font.family: "monospace"
-                            text: qsTr("Invite id: %1").arg(root.seat.invite_id || "")
+                            wrapMode: Text.WordWrap
+                            visible: !!root.seat.set_up
+                            color: root.seat.running ? Theme.palette.success : Theme.palette.warning
+                            text: root.seat.running ? qsTr("The seat is running as %1.").arg(root.seat.key || "")
+                                : qsTr("The seat isn't running: %1").arg(root.seat.error || qsTr("starting"))
                         }
-                        LogosButton { text: qsTr("Copy"); onClicked: root.copy(root.seat.invite_id) }
-                    }
-                    LogosText {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        visible: !!root.seat.invite_id && !(root.seat.rooms || []).length && !(root.seat.invites || []).length
-                        color: Theme.palette.textSecondary
-                        text: qsTr("Invite the agent into your room from Muster with this id, then join here.")
-                    }
-                    Repeater {
-                        model: root.seat.invites || []
-                        delegate: RowLayout {
-                            required property var modelData
+                        RowLayout {
+                            visible: !!root.seat.invite_id
+                            Layout.fillWidth: true
+                            LogosText {
+                                Layout.fillWidth: true
+                                elide: Text.ElideMiddle
+                                font.family: "monospace"
+                                text: qsTr("Invite id: %1").arg(root.seat.invite_id || "")
+                            }
+                            LogosButton { text: qsTr("Copy"); onClicked: root.copy(root.seat.invite_id) }
+                        }
+                        LogosText {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            visible: !!root.seat.invite_id && !(root.seat.rooms || []).length && !(root.seat.invites || []).length
+                            color: Theme.palette.textSecondary
+                            text: qsTr("Invite the agent into your room from Muster with this id, then join here.")
+                        }
+                        Repeater {
+                            model: root.seat.invites || []
+                            delegate: RowLayout {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                LogosText {
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.WordWrap
+                                    text: qsTr("Invited to %1 by %2").arg(modelData.topic).arg(modelData.from_alias || modelData.from)
+                                }
+                                LogosButton {
+                                    text: qsTr("Join")
+                                    enabled: root.ready
+                                    onClicked: root.call(root.backend.seatJoin(modelData.topic), function () {
+                                        root.notice = qsTr("The agent joined the room. Its members show up within a minute.")
+                                    })
+                                }
+                            }
+                        }
+
+                        LogosText { text: qsTr("Room"); font.weight: Theme.typography.weightMedium }
+                        ComboBox {
+                            id: roomPicker
+                            Layout.fillWidth: true
+                            // First "No room": a room tier then can't be saved, and requests waiting for a room are cancelled.
+                            model: [qsTr("No room")].concat((root.seat.rooms || []).map(function (r) { return r.title ? r.title + "  " + r.topic : r.topic }))
+                            currentIndex: 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
+                            onActivated: function (index) {
+                                root.roomTopic = index === 0 ? "" : root.seat.rooms[index - 1].topic
+                                root.roomApprovers = []
+                                root.roomApprovals = 1
+                                root.draftDirty = true
+                                root.loadMembers(root.roomTopic)
+                                currentIndex = Qt.binding(function () {
+                                    return 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
+                                })
+                            }
+                        }
+                        Repeater {
+                            model: root.members
+                            // The label is LogosText: CheckBox's own text takes the style's
+                            // dark colour, unreadable on Basecamp's dark background.
+                            delegate: RowLayout {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                CheckBox {
+                                    id: box
+                                    Accessible.name: label.text
+                                    enabled: !modelData.agent
+                                    checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
+                                    onToggled: {
+                                        root.toggleApprover(modelData.key, checked)
+                                        checked = Qt.binding(function () { return !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0 })
+                                    }
+                                }
+                                LogosText {
+                                    id: label
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    // Like a CheckBox's own text, the name ticks it too.
+                                    TapHandler {
+                                        enabled: box.enabled
+                                        onTapped: root.toggleApprover(modelData.key, !box.checked)
+                                    }
+                                    color: modelData.agent ? Theme.palette.textTertiary : Theme.palette.text
+                                    text: (modelData.agent ? qsTr("The agent (never trusted)")
+                                        : modelData.you ? qsTr("You")
+                                        : modelData.alias || modelData.key)
+                                }
+                            }
+                        }
+                        RowLayout {
+                            LogosText { text: qsTr("Approvals needed") }
+                            SpinBox {
+                                from: 1
+                                to: Math.max(1, root.roomApprovers.length)
+                                value: root.roomApprovals
+                                onValueModified: {
+                                    root.roomApprovals = value
+                                    root.draftDirty = true
+                                    value = Qt.binding(function () { return root.roomApprovals })
+                                }
+                            }
+                            LogosText { text: qsTr("Waits up to (minutes)") }
+                            SpinBox {
+                                from: 1
+                                to: 10080
+                                value: root.roomExpires
+                                onValueModified: {
+                                    root.roomExpires = value
+                                    root.draftDirty = true
+                                    value = Qt.binding(function () { return root.roomExpires })
+                                }
+                            }
+                        }
+
+                        RowLayout {
                             Layout.fillWidth: true
                             LogosText {
                                 Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
-                                text: qsTr("Invited to %1 by %2").arg(modelData.topic).arg(modelData.from_alias || modelData.from)
+                                color: Theme.palette.textSecondary
+                                text: qsTr("Turning it off makes room tiers ask you, cancels transfers waiting for the room, and stops the seat. Its key and rooms are kept for next time.")
                             }
                             LogosButton {
-                                text: qsTr("Join")
+                                text: qsTr("Turn off room approval")
                                 enabled: root.ready
-                                onClicked: root.call(root.backend.seatJoin(modelData.topic), function () {
-                                    root.notice = qsTr("The agent joined the room. Its members show up within a minute.")
+                                onClicked: root.call(root.backend.seatTurnOff(), function () {
+                                    root.draftDirty = false
+                                    root.loadDraft()
+                                    root.notice = qsTr("Room approval is off: room tiers ask you now.")
                                 })
-                            }
-                        }
-                    }
-
-                    LogosText { text: qsTr("Room"); font.weight: Theme.typography.weightMedium }
-                    ComboBox {
-                        id: roomPicker
-                        Layout.fillWidth: true
-                        // First "No room": a room tier then can't be saved, and requests waiting for a room are cancelled.
-                        model: [qsTr("No room")].concat((root.seat.rooms || []).map(function (r) { return r.title ? r.title + "  " + r.topic : r.topic }))
-                        currentIndex: 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
-                        onActivated: function (index) {
-                            root.roomTopic = index === 0 ? "" : root.seat.rooms[index - 1].topic
-                            root.roomApprovers = []
-                            root.roomApprovals = 1
-                            root.draftDirty = true
-                            root.loadMembers(root.roomTopic)
-                            currentIndex = Qt.binding(function () {
-                                return 1 + (root.seat.rooms || []).findIndex(function (r) { return r.topic === root.roomTopic })
-                            })
-                        }
-                    }
-                    Repeater {
-                        model: root.members
-                        // The label is LogosText: CheckBox's own text takes the style's
-                        // dark colour, unreadable on Basecamp's dark background.
-                        delegate: RowLayout {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            CheckBox {
-                                id: box
-                                Accessible.name: label.text
-                                enabled: !modelData.agent
-                                checked: !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0
-                                onToggled: {
-                                    root.toggleApprover(modelData.key, checked)
-                                    checked = Qt.binding(function () { return !modelData.agent && root.roomApprovers.indexOf(modelData.key) >= 0 })
-                                }
-                            }
-                            LogosText {
-                                id: label
-                                Layout.fillWidth: true
-                                elide: Text.ElideMiddle
-                                // Like a CheckBox's own text, the name ticks it too.
-                                TapHandler {
-                                    enabled: box.enabled
-                                    onTapped: root.toggleApprover(modelData.key, !box.checked)
-                                }
-                                color: modelData.agent ? Theme.palette.textTertiary : Theme.palette.text
-                                text: (modelData.agent ? qsTr("The agent (never trusted)")
-                                    : modelData.you ? qsTr("You")
-                                    : modelData.alias || modelData.key)
-                            }
-                        }
-                    }
-                    RowLayout {
-                        LogosText { text: qsTr("Approvals needed") }
-                        SpinBox {
-                            from: 1
-                            to: Math.max(1, root.roomApprovers.length)
-                            value: root.roomApprovals
-                            onValueModified: {
-                                root.roomApprovals = value
-                                root.draftDirty = true
-                                value = Qt.binding(function () { return root.roomApprovals })
-                            }
-                        }
-                        LogosText { text: qsTr("Waits up to (minutes)") }
-                        SpinBox {
-                            from: 1
-                            to: 10080
-                            value: root.roomExpires
-                            onValueModified: {
-                                root.roomExpires = value
-                                root.draftDirty = true
-                                value = Qt.binding(function () { return root.roomExpires })
                             }
                         }
                     }
