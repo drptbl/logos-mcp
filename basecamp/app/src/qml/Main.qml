@@ -640,33 +640,25 @@ Item {
                         }
                     }
 
-                    LogosText { text: qsTr("Room approval with Muster"); font.weight: Theme.typography.weightMedium }
-                    LogosText {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        color: Theme.palette.textSecondary
-                        text: qsTr("Trusted people approve big transfers in a Muster room. The agent joins the room as its own member, never as you, from a logosctl session this module runs in its data folder.")
-                    }
-                    LogosText {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        visible: !root.roomOn && !root.seat.logosctl
-                        color: Theme.palette.warning
-                        text: qsTr("logosctl isn't installed: install it first, then come back here.")
-                    }
+                    // Off: one line to turn it on, and nothing asks Muster anything.
                     RowLayout {
-                        visible: !root.roomOn && !!root.seat.logosctl
+                        visible: !root.roomOn
                         Layout.fillWidth: true
                         LogosText {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: qsTr("Off. Turning it on installs Muster and the six modules it needs from Muster's catalogue (github.com/corpetty/muster) into that session, and runs it while this module runs.")
+                            color: Theme.palette.textSecondary
+                            text: root.seat.setup_error && !root.seat.setting_up
+                                ? qsTr("Turning room approval on failed: %1").arg(root.seat.setup_error)
+                                : root.seat.logosctl
+                                    ? qsTr("Have trusted people approve big transfers in a Muster room. Turning it on installs Muster into a logosctl session this module runs.")
+                                    : qsTr("Have trusted people approve big transfers in a Muster room: it needs logosctl installed.")
                         }
                         LogosButton {
                             // The module sets the seat up in the background; its status follows.
                             readonly property bool busy: root.settingUpSeat || !!root.seat.setting_up
                             text: busy ? qsTr("Turning on…") : qsTr("Turn on room approval")
-                            enabled: root.ready && !busy
+                            enabled: root.ready && !busy && !!root.seat.logosctl
                             onClicked: {
                                 root.settingUpSeat = true
                                 root.call(root.backend.seatSetUp(), function () {
@@ -675,19 +667,19 @@ Item {
                             }
                         }
                     }
-                    LogosText {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        visible: !root.roomOn && !root.seat.setting_up && !!root.seat.setup_error
-                        color: Theme.palette.warning
-                        text: qsTr("Turning room approval on failed: %1").arg(root.seat.setup_error || "")
-                    }
 
                     // On: the seat, its room and whose approval counts.
                     ColumnLayout {
                         visible: root.roomOn
                         Layout.fillWidth: true
                         spacing: Theme.spacing.small
+                        LogosText { text: qsTr("Room approval with Muster"); font.weight: Theme.typography.weightMedium }
+                        LogosText {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: Theme.palette.textSecondary
+                            text: qsTr("Trusted people approve big transfers in a Muster room. The agent joins the room as its own member, never as you, from a logosctl session this module runs in its data folder (github.com/corpetty/muster).")
+                        }
                         LogosText {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
