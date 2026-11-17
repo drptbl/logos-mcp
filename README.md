@@ -234,11 +234,15 @@ The room approves with the agent as its own member, never as you. The agent prop
 
 ### In Basecamp
 
-Open the AI Agent app's Approvals tab. It needs `logosctl` installed.
+Room approval is off until you turn it on, and Muster is never touched while it's off. The AI Agent app's Approvals tab then offers Send and Ask me only.
 
-1. Set up agent seat => the module makes a `logosctl` session in its data folder, installs Muster and the six modules it needs from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`), and runs it while the module runs
+Turning it on needs `logosctl` installed:
+
+1. Turn on room approval => the module makes a `logosctl` session in its data folder, installs Muster and the six modules it needs from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`), and runs it while the module runs
 2. Copy the invite id and invite the agent into your room from Muster's app, then press Join next to the invite
 3. Pick the room, tick who's trusted (you by default), set how many approvals are needed and the tiers, then Save
+
+Turn off room approval makes every Room tier Ask me, cancels the transfers waiting for the room and closes their cards, and stops the seat. The seat's folder, `agent-seat` in the module's data folder, keeps its key and rooms, so turning it on again needs no new invite. Delete that folder to drop the seat for good.
 
 A change applies to the next transfer, and to requests still waiting: an unticked person stops counting, and a different room, No room, or a tier that no longer asks the room cancels them. A request waiting for you that the room now decides can only be denied.
 
