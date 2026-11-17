@@ -448,6 +448,21 @@ impl LogosMcpModule for ModuleImpl {
         })
     }
 
+    /// Starts setting the seat up and returns: installing Muster outlasts
+    /// Basecamp's call limit. `seat_status` says how it goes.
+    fn seat_set_up(&self) -> String {
+        for_app(|_| {
+            let (seat, runtime) = seat()?;
+            seat.set_up_in_background(runtime, || {
+                CONTROL
+                    .get()
+                    .ok_or("the data folder was not opened")?
+                    .remember_agent_seat()
+            })?;
+            Ok(json!({ "setting_up": true }))
+        })
+    }
+
     fn seat_join(&self, topic: String) -> String {
         for_app(|_| on_server(|s| async move { s.seat_join(&topic).await.map(|()| json!({ "joined": topic })) }))
     }
