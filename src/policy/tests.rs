@@ -140,3 +140,19 @@ fn the_policy_reads_and_writes_the_app_shape() {
         serde_json::from_value::<ApprovalPolicy>(json!({"agent": {"limit_lepta": "3e6"}})).is_err()
     );
 }
+
+#[test]
+fn without_the_room_its_tiers_ask_and_the_rest_stays() {
+    let policy = ApprovalPolicy {
+        agent: tiers(1000, Approver::Send, Approver::Room),
+        node: tiers(0, Approver::Room, Approver::Room),
+        room: Some(room()),
+    };
+    let off = policy.without_room();
+    assert_eq!(off.agent, tiers(1000, Approver::Send, Approver::Ask));
+    assert_eq!(off.node, tiers(0, Approver::Ask, Approver::Ask));
+    assert_eq!(off.room, None);
+    assert!(off.check().is_ok());
+    assert!(!off.uses_room());
+    assert!(policy.uses_room());
+}

@@ -1194,6 +1194,26 @@ impl LogosServer {
         Ok(json!({ "request_id": id, "state": "cancelled" }))
     }
 
+    /// Room approval is being turned off: every room request still waiting is
+    /// cancelled, never sent, and the agent declines its proposal now, while
+    /// its seat still runs, rather than at its watcher's next look.
+    pub async fn end_room_requests(&self) {
+        let Ok(seat) = self.muster_node() else {
+            return;
+        };
+        for request in self.approvals.room_waiting() {
+            if self.approvals.cancel_room(&request.id).is_err() {
+                continue; // answered meanwhile
+            }
+            self.record_decision("cancel_room_request", &request.id);
+            if let Some(room) = &request.room
+                && let Some(intent) = &room.intent_id
+            {
+                self.room.withdraw(seat, &room.topic, intent).await;
+            }
+        }
+    }
+
     /// The user approves a waiting transfer. It is checked again and sent on the
     /// server's runtime, so a slow send never holds up the app; the agent hears
     /// the outcome, from its waiting call or from wallet_transfer_status.

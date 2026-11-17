@@ -303,6 +303,7 @@ fn an_old_config_carries_its_ask_switch_over_and_keeps_the_node_wallet_asking() 
 fn a_policy_change_is_checked_saved_and_applied_live() {
     let dir = tempfile::tempdir().unwrap();
     let control = Control::open(dir.path()).unwrap();
+    control.remember_agent_seat().unwrap();
     let live = control.approval_policy_watch();
     control
         .set_approval_policy(&room_policy().to_string())
@@ -326,6 +327,7 @@ fn a_policy_change_is_checked_saved_and_applied_live() {
 fn a_policy_that_cant_be_followed_is_refused_and_not_saved() {
     let dir = tempfile::tempdir().unwrap();
     let control = Control::open(dir.path()).unwrap();
+    control.remember_agent_seat().unwrap();
     let mut looser = room_policy();
     looser["agent"]["above"] = "send".into();
     assert!(control.set_approval_policy(&looser.to_string()).is_err());
@@ -343,6 +345,7 @@ fn a_policy_that_cant_be_followed_is_refused_and_not_saved() {
 fn the_old_ask_switch_writes_through_and_keeps_the_room_tier() {
     let dir = tempfile::tempdir().unwrap();
     let control = Control::open(dir.path()).unwrap();
+    control.remember_agent_seat().unwrap();
     control
         .set_approval_policy(&room_policy().to_string())
         .unwrap();
@@ -385,6 +388,7 @@ fn a_saved_policy_that_cant_be_followed_fails_closed() {
 fn a_policy_missing_a_wallet_or_misspelt_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let control = Control::open(dir.path()).unwrap();
+    control.remember_agent_seat().unwrap();
     assert!(control.set_approval_policy("{}").is_err());
     let mut only_agent = room_policy();
     only_agent.as_object_mut().unwrap().remove("node");
@@ -396,4 +400,45 @@ fn a_policy_missing_a_wallet_or_misspelt_is_refused() {
     let mut misspelt = room_policy();
     misspelt["agent"]["abvoe"] = "room".into();
     assert!(control.set_approval_policy(&misspelt.to_string()).is_err());
+}
+
+#[test]
+fn a_room_tier_is_refused_until_room_approval_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    let refused = control
+        .set_approval_policy(&room_policy().to_string())
+        .unwrap_err();
+    assert!(refused.contains("room approval is off"), "{refused}");
+    // Send and Ask need no room.
+    let mut asks = room_policy();
+    asks["agent"]["above"] = "ask".into();
+    asks["room"] = serde_json::Value::Null;
+    control.set_approval_policy(&asks.to_string()).unwrap();
+    control.remember_agent_seat().unwrap();
+    control
+        .set_approval_policy(&room_policy().to_string())
+        .unwrap();
+}
+
+#[test]
+fn turning_room_approval_off_asks_instead_and_forgets_the_seat() {
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::open(dir.path()).unwrap();
+    control.remember_agent_seat().unwrap();
+    control
+        .set_approval_policy(&room_policy().to_string())
+        .unwrap();
+    let live = control.approval_policy_watch();
+    control.turn_off_room_approval().unwrap();
+    let expected: ApprovalPolicy = serde_json::from_value(room_policy()).unwrap();
+    let expected = expected.without_room();
+    assert_eq!(*live.borrow(), expected);
+    let reopened = Control::open(dir.path()).unwrap();
+    assert!(!reopened.config().agent_seat);
+    assert_eq!(
+        reopened.approval_policy(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(reopened.permissions()["ask_before_transfer"], true);
 }

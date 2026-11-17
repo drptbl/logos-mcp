@@ -68,6 +68,22 @@ impl Tiers {
     pub fn uses(&self, approver: Approver) -> bool {
         self.up_to == approver || self.above == approver
     }
+
+    /// These tiers with the room's replaced by the user's.
+    fn without_room(&self) -> Self {
+        let ask = |a| {
+            if a == Approver::Room {
+                Approver::Ask
+            } else {
+                a
+            }
+        };
+        Self {
+            limit_lepta: self.limit_lepta,
+            up_to: ask(self.up_to),
+            above: ask(self.above),
+        }
+    }
 }
 
 /// The Muster room both wallets' room tiers use.
@@ -156,11 +172,25 @@ impl ApprovalPolicy {
     pub fn check(&self) -> Result<(), String> {
         self.agent.check("agent wallet")?;
         self.node.check("node wallet")?;
-        let needs_room = self.agent.uses(Approver::Room) || self.node.uses(Approver::Room);
-        match (&self.room, needs_room) {
+        match (&self.room, self.uses_room()) {
             (None, true) => Err("a tier asks the room, but no room is set".into()),
             (Some(room), _) => room.room_approval().map(|_| ()),
             (None, false) => Ok(()),
+        }
+    }
+
+    /// Whether a tier of either wallet asks the room.
+    pub fn uses_room(&self) -> bool {
+        self.agent.uses(Approver::Room) || self.node.uses(Approver::Room)
+    }
+
+    /// This policy with room approval off: every room tier asks the user
+    /// instead, which is never looser, and no room is set.
+    pub fn without_room(&self) -> Self {
+        Self {
+            agent: self.agent.without_room(),
+            node: self.node.without_room(),
+            room: None,
         }
     }
 

@@ -357,7 +357,33 @@ impl Control {
             serde_json::from_value(given).map_err(|e| format!("not an approval policy: {e}"))?;
         policy.check()?;
         let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let config = ModuleConfig::load_or_create(&self.dir)?;
+        if policy.uses_room() && !config.agent_seat {
+            return Err(
+                "room approval is off: set up the agent seat before a tier asks the room".into(),
+            );
+        }
+        self.apply_policy(config, policy)
+    }
+
+    /// Turn room approval off: every room tier asks the user instead, the
+    /// room is cleared, and the seat is no longer started. Its folder, with
+    /// its key and rooms, stays for when room approval is turned on again.
+    pub fn turn_off_room_approval(&self) -> Result<Value, String> {
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ModuleConfig::load_or_create(&self.dir)?;
+        config.agent_seat = false;
+        let policy = self.policy.borrow().without_room();
+        self.apply_policy(config, policy)
+    }
+
+    /// Save `policy` into `config` and apply it at once, keeping the old ask
+    /// switch in step for older apps. The caller holds `saving`.
+    fn apply_policy(
+        &self,
+        mut config: ModuleConfig,
+        policy: ApprovalPolicy,
+    ) -> Result<Value, String> {
         let asks = policy.agent.uses(Approver::Ask);
         config.tools.ask_before_transfer = asks;
         config.approvals = Some(policy.clone());

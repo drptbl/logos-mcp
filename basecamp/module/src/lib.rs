@@ -421,6 +421,25 @@ impl LogosMcpModule for ModuleImpl {
         })
     }
 
+    /// Turns room approval off: room tiers ask the user instead, waiting room
+    /// requests are cancelled with their cards closed, and the seat stops.
+    /// Its folder stays, so turning it on again reuses the same seat.
+    fn seat_turn_off(&self) -> String {
+        for_app(|c| {
+            // The policy first, so no new room request starts meanwhile.
+            let policy = c.turn_off_room_approval()?;
+            on_server(|s| async move {
+                s.end_room_requests().await;
+                Ok(Value::Null)
+            })?;
+            on_seat(|seat| async move {
+                seat.stop().await;
+                Ok(Value::Null)
+            })?;
+            Ok(policy)
+        })
+    }
+
     /// Starts setting the seat up and returns: installing Muster outlasts
     /// Basecamp's call limit. `seat_status` says how it goes.
     fn seat_set_up(&self) -> String {

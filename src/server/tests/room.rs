@@ -1212,6 +1212,25 @@ async fn the_app_lists_room_requests_and_can_cancel_one() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn ending_room_requests_cancels_them_and_closes_their_cards_at_once() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Before the request's watcher looks again: the seat may stop right after.
+    s.end_room_requests().await;
+    assert_eq!(status_of(&s, &id).await["state"], "cancelled");
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_app_cannot_cancel_a_request_the_user_answers() {
     let runner = RoomRunner::new(wallet_open().to_vec());
     let mut policy = cli_policy(&[HUMAN]);

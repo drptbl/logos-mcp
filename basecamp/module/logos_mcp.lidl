@@ -18,6 +18,7 @@ module logos_mcp {
   method set_approval_policy(policy: tstr) -> tstr
   method seat_status() -> tstr
   method seat_set_up() -> tstr
+  method seat_turn_off() -> tstr
   method seat_join(topic: tstr) -> tstr
   method room_members(topic: tstr) -> tstr
 }
