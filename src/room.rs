@@ -377,6 +377,8 @@ pub struct Room {
     used: std::sync::Mutex<BTreeSet<String>>,
     /// Rooms this server looked through for proposals a restart left open.
     swept: std::sync::Mutex<BTreeSet<String>>,
+    /// Proposals this seat made and hasn't withdrawn: their room by id.
+    open: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 /// One Muster call, its JSON-in-a-string result decoded. Muster reports a
@@ -560,6 +562,10 @@ impl Room {
             })
             .ok_or_else(|| format!("Muster gave no proposal id: {id}"))?
             .to_string();
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), room.topic.clone());
         let intents = muster(node, "coordinate_intents", &[]).await?;
         let approved_before = intents
             .as_array()
@@ -662,6 +668,34 @@ impl Room {
     pub async fn withdraw(&self, node: &dyn Node, topic: &str, intent_id: &str) {
         let _seat = self.agent.lock().await;
         withdraw_now(node, topic, intent_id).await;
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(intent_id);
+    }
+
+    /// End room approval: once no proposal is in flight, run `before`, take
+    /// back every proposal this seat made that was neither sent nor withdrawn,
+    /// and stop the seat with `stop`. A proposal started meanwhile waits, then
+    /// finds the seat gone.
+    pub async fn shut(
+        &self,
+        node: &dyn Node,
+        before: impl FnOnce(),
+        stop: impl std::future::Future<Output = ()>,
+    ) {
+        let mut agent = self.agent.lock().await;
+        before();
+        let open = std::mem::take(&mut *self.open.lock().unwrap_or_else(|e| e.into_inner()));
+        let used = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (intent_id, topic) in open {
+            if !used.contains(&intent_id) {
+                withdraw_now(node, &topic, &intent_id).await;
+            }
+        }
+        // Stopped, the seat must be checked again before it proposes.
+        *agent = None;
+        stop.await;
     }
 
     /// Join `topic`: accept an invite, or make a joined room active.

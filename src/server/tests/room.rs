@@ -1211,23 +1211,66 @@ async fn the_app_lists_room_requests_and_can_cancel_one() {
     assert_eq!(runner.sends(), 0);
 }
 
+/// A stop for the seat that counts the cards declined before it ran.
+fn stop_seat(
+    runner: &Arc<RoomRunner>,
+) -> (
+    impl std::future::Future<Output = ()> + use<>,
+    Arc<std::sync::Mutex<Option<usize>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (runner, at_stop) = (runner.clone(), seen.clone());
+    let stop = async move {
+        *at_stop.lock().unwrap() = Some(runner.muster_calls("coordinate_decline").len());
+    };
+    (stop, seen)
+}
+
 #[tokio::test(start_paused = true)]
-async fn ending_room_requests_cancels_them_and_closes_their_cards_at_once() {
+async fn ending_room_approval_cancels_requests_and_closes_cards_before_the_seat_stops() {
     let runner = RoomRunner::new(wallet_open().to_vec());
     let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
     let id = body(&propose(&s, &runner).await.await.unwrap())["request_id"]
         .as_str()
         .unwrap()
         .to_string();
-    // Before the request's watcher looks again: the seat may stop right after.
-    s.end_room_requests().await;
+    s.cancel_room_requests();
     assert_eq!(status_of(&s, &id).await["state"], "cancelled");
+    let (stop, declined_at_stop) = stop_seat(&runner);
+    // Before the request's watcher looks again: its card is closed all the same.
+    // Spawned, as the module runs it.
+    let server = s.clone();
+    tokio::spawn(async move { server.end_room_approval(stop).await })
+        .await
+        .unwrap();
     assert_eq!(
         runner.muster_calls("coordinate_decline")[0][4],
         format!("str:{INTENT}")
     );
+    assert_eq!(*declined_at_stop.lock().unwrap(), Some(1));
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     assert_eq!(runner.sends(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ending_room_approval_leaves_a_sent_transfers_card_alone() {
+    let mut replies = wallet_open().to_vec(); // checks before proposing
+    replies.extend(wallet_open()); // checks again before sending
+    replies.push(sent("cd34"));
+    let runner = RoomRunner::new(replies);
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let call = propose(&s, &runner).await;
+    room_folded(
+        &runner,
+        "executable",
+        the_call(OVER),
+        &[AGENT_KEY, HUMAN],
+        &[],
+    );
+    assert_eq!(body(&call.await.unwrap())["tx_hash"], "cd34");
+    let (stop, declined_at_stop) = stop_seat(&runner);
+    s.end_room_approval(stop).await;
+    assert_eq!(*declined_at_stop.lock().unwrap(), Some(0));
 }
 
 #[tokio::test(start_paused = true)]

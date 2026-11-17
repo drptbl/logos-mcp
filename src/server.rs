@@ -1195,21 +1195,28 @@ impl LogosServer {
     }
 
     /// Room approval is being turned off: every room request still waiting is
-    /// cancelled, never sent, and the agent declines its proposal now, while
-    /// its seat still runs, rather than at its watcher's next look.
-    pub async fn end_room_requests(&self) {
-        let Ok(seat) = self.muster_node() else {
-            return;
-        };
+    /// cancelled, never sent.
+    pub fn cancel_room_requests(&self) {
         for request in self.approvals.room_waiting() {
-            if self.approvals.cancel_room(&request.id).is_err() {
-                continue; // answered meanwhile
+            if self.approvals.cancel_room(&request.id).is_ok() {
+                self.record_decision("cancel_room_request", &request.id);
             }
-            self.record_decision("cancel_room_request", &request.id);
-            if let Some(room) = &request.room
-                && let Some(intent) = &room.intent_id
-            {
-                self.room.withdraw(seat, &room.topic, intent).await;
+        }
+    }
+
+    /// End room approval: once no proposal is in flight, cancel what still
+    /// waits, close every card the agent left open while its seat still runs,
+    /// then `stop` the seat.
+    pub async fn end_room_approval(&self, stop: impl std::future::Future<Output = ()>) {
+        match self.muster_node() {
+            Ok(seat) => {
+                self.room
+                    .shut(seat, || self.cancel_room_requests(), stop)
+                    .await
+            }
+            Err(_) => {
+                self.cancel_room_requests();
+                stop.await
             }
         }
     }

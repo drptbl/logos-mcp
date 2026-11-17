@@ -432,37 +432,19 @@ impl LogosMcpModule for ModuleImpl {
         })
     }
 
-    /// Turns room approval off: room tiers ask the user instead, waiting room
-    /// requests are cancelled with their cards closed, and the seat stops.
+    /// Turns room approval off: room tiers ask the user instead, and waiting
+    /// room requests are cancelled. Then, in the background, as the seat may
+    /// be busy proposing: the agent's open cards are closed and the seat stops.
     /// Its folder stays, so turning it on again reuses the same seat.
     fn seat_turn_off(&self) -> String {
         for_app(|c| {
-            // The policy first, so no new room request starts meanwhile.
-            let policy = c.turn_off_room_approval()?;
-            on_server(|s| async move {
-                s.end_room_requests().await;
-                Ok(Value::Null)
-            })?;
-            on_seat(|seat| async move {
-                seat.stop().await;
-                Ok(Value::Null)
-            })?;
-            Ok(policy)
-        })
-    }
-
-    /// Starts setting the seat up and returns: installing Muster outlasts
-    /// Basecamp's call limit. `seat_status` says how it goes.
-    fn seat_set_up(&self) -> String {
-        for_app(|_| {
             let (seat, runtime) = seat()?;
-            seat.set_up_in_background(runtime, || {
-                CONTROL
-                    .get()
-                    .ok_or("the data folder was not opened")?
-                    .remember_agent_seat()
-            })?;
-            Ok(json!({ "setting_up": true }))
+            let (server, _) = WALLET.get().ok_or("the MCP server isn't running")?;
+            let policy = c.turn_off_room_approval()?;
+            server.cancel_room_requests();
+            let server = server.clone();
+            runtime.spawn(async move { server.end_room_approval(seat.stop()).await });
+            Ok(policy)
         })
     }
 
