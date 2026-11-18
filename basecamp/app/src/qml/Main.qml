@@ -661,6 +661,7 @@ Item {
                             enabled: root.ready && !busy && !!root.seat.logosctl
                             onClicked: {
                                 root.settingUpSeat = true
+                                root.notice = "" // "Room approval is off" no longer holds.
                                 root.call(root.backend.seatSetUp(), function () {
                                     root.settingUpSeat = false
                                 }, function () { root.settingUpSeat = false })
