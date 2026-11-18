@@ -25,6 +25,7 @@ use crate::{
     guard::{self, FilesRoot},
     logosctl::{Arg, LogosError, embedded_json},
     node::Node,
+    policy::{self, ApprovalPolicy, Wallet},
     room::{Room, RoomApproval, RoomCall, Verdict},
 };
 
@@ -70,6 +71,8 @@ const TX_BYTES: u128 = 8 * 1024;
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often a room proposal's progress is read from the agent's Muster.
 const ROOM_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Refused when a tier asks a room that isn't set.
+const NO_ROOM: &str = "a Muster room approves this transfer, but no room is set: nothing was sent";
 /// The least time a room proposal is given: one with less is refused.
 const ROOM_MIN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often an idle tool-list watcher checks that its agent is still connected.
@@ -420,8 +423,13 @@ pub struct LogosServer {
     activity: Option<Arc<ActivityLog>>,
     /// Transfers waiting for the user, when they ask to approve each one.
     approvals: Arc<Approvals>,
-    /// Trusted humans in a Muster room approve transfers over a limit, when set.
-    room: Option<Arc<Room>>,
+    /// Who approves transfers, when the host sets it. Without it, the policy
+    /// follows the tool groups' "ask before transfer" switch.
+    policy: Option<tokio::sync::watch::Receiver<ApprovalPolicy>>,
+    /// The agent's seat in Muster, for transfers a room approves.
+    room: Arc<Room>,
+    /// Where Muster calls go, when not to `node`: the agent seat's own session.
+    muster: Option<Arc<dyn Node>>,
     /// Set once this session's tool-list watcher runs: one per session, however
     /// many `initialized` notifications a client sends. Not shared between sessions.
     watching: std::sync::OnceLock<()>,
@@ -655,14 +663,38 @@ fn ok(value: Value) -> Result<CallToolResult, McpError> {
 
 /// Tool-level failure: reported to the agent as an error result it can act on.
 /// How far `send_checked` goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SendMode {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SendMode<'a> {
     /// Every check, no send: before asking the user.
     CheckOnly,
     /// Sent as the agent asked, which only stands while approvals are off.
     Direct,
     /// Sent because the user approved it.
     Approved,
+    /// Sent because the room approved it, which only stands as it was judged.
+    Room(&'a RoomStanding),
+}
+
+/// What a room approval was judged by. It stands only until it expires, and
+/// only while the settings in force for its transfer are still these.
+#[derive(Debug, PartialEq)]
+struct RoomStanding {
+    topic: String,
+    wallet: Wallet,
+    amount: String,
+    settings: RoomApproval,
+    expires_at: u64,
+}
+
+/// What allows a chain transfer, checked last before it goes.
+enum ChainSend<'a> {
+    /// The agent's own call, sent without approval: it must still be
+    /// uncancelled, and still need none.
+    Direct(&'a CancellationToken),
+    /// The user approved it.
+    Approved,
+    /// The room approved it.
+    Room(&'a RoomStanding),
 }
 
 /// Why a transfer didn't clearly go through.
@@ -765,6 +797,41 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+/// blockchain_module.wallet_transfer_funds's arguments: `amount` from `from`,
+/// which also pays the change back, to `to`, with no memo.
+fn chain_transfer_args(from: &str, to: &str, amount: &str) -> [Arg; 5] {
+    [
+        Arg::str(from),
+        Arg::Json(json!([from])),
+        Arg::str(to),
+        Arg::str(amount),
+        Arg::str(""),
+    ]
+}
+
+/// A submitted chain transfer, as chain_transfer reports it.
+fn chain_submitted(from: &str, to: &str, amount: &str, tx_hash: &str) -> Value {
+    json!({
+        "submitted": true,
+        "tx_hash": tx_hash,
+        "from": from,
+        "to": to,
+        "amount_lepta": amount,
+        "note": "submitted, not yet confirmed: chain_wallet shows the new balance once it is in a block",
+    })
+}
+
+/// What a room request files: who pays whom how much, any program call that
+/// moves it, whether it spends the chain node's wallet, and how long it waits.
+struct RoomFiling {
+    from: String,
+    to: String,
+    amount: String,
+    program: Option<crate::control::ProgramCall>,
+    chain: bool,
+    expires: Duration,
 }
 
 /// lez_core.send_generic_public_transaction's arguments for a call `signer`
@@ -1000,7 +1067,9 @@ impl LogosServer {
             tool_groups: tokio::sync::watch::channel(ToolGroups::default()).1,
             activity: None,
             approvals: Arc::default(),
-            room: None,
+            policy: None,
+            room: Arc::default(),
+            muster: None,
             watching: std::sync::OnceLock::new(),
             tool_router: Self::tool_router(),
         }
@@ -1019,11 +1088,45 @@ impl LogosServer {
         self
     }
 
-    /// Send transfers over the room's limit only once trusted humans in its
-    /// Muster room approve exactly that call.
-    pub fn with_room_approval(mut self, room: RoomApproval) -> Self {
-        self.room = Some(Arc::new(Room::new(room)));
+    /// Follow `policy` for who approves each transfer: a change applies to the
+    /// next transfer, and to room requests still waiting.
+    pub fn with_approval_policy(
+        mut self,
+        policy: tokio::sync::watch::Receiver<ApprovalPolicy>,
+    ) -> Self {
+        self.policy = Some(policy);
         self
+    }
+
+    /// Send Muster calls to `node`, the agent seat's own session, instead of
+    /// this server's node.
+    pub fn with_muster(mut self, node: Arc<dyn Node>) -> Self {
+        self.muster = Some(node);
+        self
+    }
+
+    /// Who approves transfers now.
+    pub fn approval_policy(&self) -> ApprovalPolicy {
+        match &self.policy {
+            Some(policy) => policy.borrow().clone(),
+            None => ApprovalPolicy::from_ask_before_transfer(
+                self.tool_groups.borrow().ask_before_transfer,
+            ),
+        }
+    }
+
+    /// Where Muster calls go: the agent's seat. Inside Basecamp this
+    /// server's own node holds the user's Muster, which must never propose or
+    /// endorse for the agent, so there it is only ever the seat.
+    fn muster_node(&self) -> Result<&dyn Node, String> {
+        match (&self.muster, self.settings.host_owns_messaging) {
+            (Some(seat), _) => Ok(seat.as_ref()),
+            (None, false) => Ok(self.node.as_ref()),
+            (None, true) => Err(
+                "room approval needs the agent's own seat in Muster: set it up in the AI Agent app first: nothing was sent"
+                    .into(),
+            ),
+        }
     }
 
     /// Record every tool call in `log`.
@@ -1067,15 +1170,79 @@ impl LogosServer {
         }))
     }
 
-    /// Transfers waiting for the user, for the Agent app.
+    /// Transfers waiting for the user, and those waiting for the room, for
+    /// the Agent app.
     pub fn approvals(&self) -> Value {
-        json!({ "waiting": self.approvals.waiting() })
+        json!({ "waiting": self.approvals.waiting(), "room": self.approvals.room_waiting() })
+    }
+
+    /// The members of `topic` as the agent's seat sees them, for the app.
+    pub async fn room_members(&self, topic: &str) -> Result<Vec<Value>, String> {
+        self.room.members(self.muster_node()?, topic).await
+    }
+
+    /// The agent's seat joins `topic`, accepting an invite, for the app.
+    pub async fn seat_join(&self, topic: &str) -> Result<(), String> {
+        self.room.join(self.muster_node()?, topic).await
+    }
+
+    /// The user cancels a transfer waiting for the room: never sent, and the
+    /// agent declines its own proposal so the room sees it closed.
+    pub fn cancel_room_request(&self, id: &str) -> Result<Value, String> {
+        self.approvals.cancel_room(id)?;
+        self.record_decision("cancel_room_request", id);
+        Ok(json!({ "request_id": id, "state": "cancelled" }))
+    }
+
+    /// Room approval is being turned off: every room request still waiting is
+    /// cancelled, never sent.
+    pub fn cancel_room_requests(&self) {
+        for request in self.approvals.room_waiting() {
+            if self.approvals.cancel_room(&request.id).is_ok() {
+                self.record_decision("cancel_room_request", &request.id);
+            }
+        }
+    }
+
+    /// End room approval: once no proposal is in flight, cancel what still
+    /// waits, close every card the agent left open while its seat still runs,
+    /// then `stop` the seat.
+    pub async fn end_room_approval(&self, stop: impl std::future::Future<Output = ()>) {
+        match self.muster_node() {
+            Ok(seat) => {
+                self.room
+                    .shut(seat, || self.cancel_room_requests(), stop)
+                    .await
+            }
+            Err(_) => {
+                self.cancel_room_requests();
+                stop.await
+            }
+        }
     }
 
     /// The user approves a waiting transfer. It is checked again and sent on the
     /// server's runtime, so a slow send never holds up the app; the agent hears
     /// the outcome, from its waiting call or from wallet_transfer_status.
     pub async fn approve_transfer(&self, id: &str) -> Result<Value, String> {
+        // A tier switched to the room since it was asked: only the room may
+        // approve it now.
+        if let Some(waiting) = self.approvals.waiting().into_iter().find(|r| r.id == id) {
+            let wallet = if waiting.chain {
+                Wallet::Node
+            } else {
+                Wallet::Agent
+            };
+            if self
+                .approval_policy()
+                .approver(wallet, &waiting.amount_lepta)
+                == policy::Approver::Room
+            {
+                return Err(
+                    "a Muster room approves this transfer now: deny it, and the agent can ask again".into(),
+                );
+            }
+        }
         let request = self.approvals.approve(id)?;
         self.record_decision("approve_transfer", id);
         let server = self.clone();
@@ -1084,7 +1251,12 @@ impl LogosServer {
         tokio::spawn(async move {
             if request.chain {
                 let outcome = match server
-                    .chain_send(&request.from, &request.to, &request.amount_lepta)
+                    .chain_send(
+                        &request.from,
+                        &request.to,
+                        &request.amount_lepta,
+                        ChainSend::Approved,
+                    )
                     .await
                 {
                     Ok(tx_hash) => Decision::Sent { tx_hash },
@@ -1357,9 +1529,10 @@ impl LogosServer {
         response
     }
 
-    /// Whether the user approves each transfer.
+    /// Whether an agent wallet transfer may wait for approval, the user's or a
+    /// Muster room's.
     pub fn asks_before_transfer(&self) -> bool {
-        self.tool_groups.borrow().ask_before_transfer
+        self.approval_policy().asks_before_transfer()
     }
 
     /// Where a transfer that waited for the user's approval stands.
@@ -2564,20 +2737,29 @@ impl LogosServer {
         ct: CancellationToken,
         Parameters(p): Parameters<TransferParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(room) = self.room.clone()
-            && room.config.needs_room(&p.amount_lepta)
-        {
-            return self.room_transfer(&ct, room, &p).await;
-        }
-        if !self.tool_groups.borrow().ask_before_transfer {
-            return match self.send_checked(&ct, &p, SendMode::Direct).await {
+        let policy = self.approval_policy();
+        match policy.approver(Wallet::Agent, &p.amount_lepta) {
+            policy::Approver::Send => match self.send_checked(&ct, &p, SendMode::Direct).await {
                 Ok(sent) => ok(sent),
                 Err(e) => fail(e.message()),
-            };
+            },
+            policy::Approver::Ask => self.ask_transfer(&ct, &p).await,
+            policy::Approver::Room => match policy.room_approval() {
+                Ok(Some(room)) => self.room_transfer(&ct, &room, &p).await,
+                Ok(None) => fail(NO_ROOM),
+                Err(e) => fail(e),
+            },
         }
-        // The user approves each transfer: check now, so a hopeless request never
-        // bothers them, then wait. Approving checks everything again before sending.
-        if let Err(e) = self.send_checked(&ct, &p, SendMode::CheckOnly).await {
+    }
+
+    /// The user approves this transfer: check now, so a hopeless request never
+    /// bothers them, then wait. Approving checks everything again before sending.
+    async fn ask_transfer(
+        &self,
+        ct: &CancellationToken,
+        p: &TransferParams,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.send_checked(ct, p, SendMode::CheckOnly).await {
             return fail(e.message());
         }
         let (id, decision) =
@@ -2588,18 +2770,18 @@ impl LogosServer {
                 Ok(filed) => filed,
                 Err(e) => return fail(e),
             };
-        self.await_approval(&ct, &id, decision, Approver::User, |tx_hash| {
-            submitted(&p, tx_hash)
+        self.await_approval(ct, &id, decision, Approver::User, |tx_hash| {
+            submitted(p, tx_hash)
         })
         .await
     }
 
-    /// A transfer over the room's limit: proposed to the room, and sent once
-    /// trusted humans approve exactly it.
+    /// A transfer the room approves: proposed to it, and sent once trusted
+    /// humans approve exactly it.
     async fn room_transfer(
         &self,
         ct: &CancellationToken,
-        room: Arc<Room>,
+        room: &RoomApproval,
         p: &TransferParams,
     ) -> Result<CallToolResult, McpError> {
         // Check now, so a hopeless request never reaches the room. Sending
@@ -2621,9 +2803,10 @@ impl LogosServer {
             return fail("the transfer's accounts can't be put to the room");
         };
         let amount = amount.to_string();
-        let mut expires = room.config.expires;
+        let mut expires = room.expires;
         let call = match &p.call {
             None => RoomCall {
+                module: LEZ,
                 method: "transfer_public",
                 args: json!([from, to, amount]),
                 note: format!("Pay {amount} lepta from {from} to {to}"),
@@ -2646,38 +2829,74 @@ impl LogosServer {
                     &program.program_id_hex,
                 );
                 RoomCall {
+                    module: LEZ,
                     method: "send_generic_public_transaction",
                     args: Value::Array(args.iter().map(Arg::to_json).collect()),
                     note: format!("Pay {amount} lepta from {from} {}", program.description),
                 }
             }
         };
+        let filing = RoomFiling {
+            from: from.clone(),
+            to: to.clone(),
+            amount: amount.clone(),
+            program: p.call.clone(),
+            chain: false,
+            expires,
+        };
+        let sent = TransferParams {
+            from,
+            to,
+            amount_lepta: amount,
+            call: None,
+        };
+        self.room_request(ct, room, call, filing, |tx_hash| submitted(&sent, tx_hash))
+            .await
+    }
+
+    /// File `filing` as a request the room decides, propose `call` to the
+    /// room, follow it, and wait for it like any approval.
+    async fn room_request(
+        &self,
+        ct: &CancellationToken,
+        room: &RoomApproval,
+        call: RoomCall,
+        filing: RoomFiling,
+        sent: impl FnOnce(&str) -> Value,
+    ) -> Result<CallToolResult, McpError> {
         let progress = RoomProgress {
-            topic: room.config.topic.clone(),
+            topic: room.topic.clone(),
             intent_id: None,
             muster_state: "proposing".into(),
             approvals: 0,
-            required: room.config.approvals,
+            required: room.approvals,
+            expires_at: crate::control::unix_now().saturating_add(filing.expires.as_secs()),
         };
         let (id, decision) = match self.approvals.request_room(
-            &from,
-            &to,
-            &amount,
-            p.call.clone(),
+            &filing.from,
+            &filing.to,
+            &filing.amount,
+            filing.program,
+            filing.chain,
             progress,
-            expires,
         ) {
             Ok(filed) => filed,
             Err(e) => return fail(e),
         };
-        let intent = match room
-            .propose(
-                self.node.as_ref(),
-                &call,
-                &format!("{}{id}", crate::room::REF_PREFIX),
-            )
-            .await
-        {
+        let proposed = match self.muster_node() {
+            Ok(seat) => {
+                self.room
+                    .propose(
+                        seat,
+                        room,
+                        &call,
+                        &format!("{}{id}", crate::room::REF_PREFIX),
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let intent = match proposed {
             Ok(intent) => intent,
             Err(reason) => {
                 let _ = self.approvals.room_answer(
@@ -2689,46 +2908,68 @@ impl LogosServer {
                 return fail(reason);
             }
         };
-        tracing::info!(target: "logos_mcp::transfer", request = %id, %intent, topic = %room.config.topic, "proposed to the room");
+        tracing::info!(target: "logos_mcp::transfer", request = %id, %intent, topic = %room.topic, "proposed to the room");
         self.approvals.room_progress(&id, |p| {
             p.intent_id = Some(intent.clone());
             p.muster_state = "collecting".into();
         });
-        tokio::spawn(
-            self.clone()
-                .follow_room(room.clone(), id.clone(), intent, call),
-        );
-        let minutes = expires.as_secs().div_ceil(60);
-        let sent = TransferParams {
-            from,
-            to,
-            amount_lepta: amount,
-            call: None,
+        let wallet = if filing.chain {
+            Wallet::Node
+        } else {
+            Wallet::Agent
         };
-        self.await_approval(ct, &id, decision, Approver::Room(minutes), |tx_hash| {
-            submitted(&sent, tx_hash)
-        })
-        .await
+        tokio::spawn(self.clone().follow_room(
+            id.clone(),
+            intent,
+            call,
+            room.topic.clone(),
+            (wallet, filing.amount.clone()),
+        ));
+        let minutes = filing.expires.as_secs().div_ceil(60);
+        self.await_approval(ct, &id, decision, Approver::Room(minutes), sent)
+            .await
     }
 
     /// Follow room request `id` in the agent's Muster until it is settled:
     /// send it once trusted humans approved exactly `call`, end it if the room
-    /// declines it or it can never be sent. A Muster that can't be read is
-    /// tried again, never taken as an approval. A request that ends unsent
-    /// takes the agent's approval back, so the room sees it closed.
-    async fn follow_room(self, room: Arc<Room>, id: String, intent: String, call: RoomCall) {
+    /// declines it or it can never be sent. Each look judges it by the room
+    /// settings as they are now; a request whose room was changed or turned
+    /// off is cancelled. A Muster that can't be read is tried again, never
+    /// taken as an approval. A request that ends unsent takes the agent's
+    /// approval back, so the room sees it closed.
+    async fn follow_room(
+        self,
+        id: String,
+        intent: String,
+        call: RoomCall,
+        topic: String,
+        (wallet, amount): (Wallet, String),
+    ) {
+        let room = self.room.clone();
+        // It proposed through the seat, so the seat is there.
+        let Ok(seat) = self.muster_node() else {
+            return;
+        };
         loop {
             tokio::time::sleep(ROOM_POLL).await;
             match self.approvals.decision(&id) {
                 Some(Decision::Waiting) => {}
                 Some(Decision::Expired | Decision::Cancelled) | None => {
-                    room.withdraw(self.node.as_ref(), &intent).await;
+                    room.withdraw(seat, &topic, &intent).await;
                     return;
                 }
                 Some(_) => return,
             }
+            let Some(settings) = self.room_settings_for(&topic, wallet, &amount) else {
+                // Its room was changed or turned off, or its tier no longer asks
+                // the room: no one may approve it now.
+                if self.approvals.room_answer(&id, Decision::Cancelled).is_ok() {
+                    room.withdraw(seat, &topic, &intent).await;
+                }
+                return;
+            };
             let now = crate::control::unix_now();
-            let verdict = match room.look(self.node.as_ref(), &intent, &call, now).await {
+            let verdict = match room.look(seat, &settings, &intent, &call, now).await {
                 Ok(verdict) => verdict,
                 Err(e) => {
                     tracing::warn!(request = %id, %intent, "could not read the room: {e}");
@@ -2740,6 +2981,7 @@ impl LogosServer {
                     self.approvals.room_progress(&id, |p| {
                         p.muster_state = state;
                         p.approvals = approvals;
+                        p.required = settings.approvals;
                     });
                     continue;
                 }
@@ -2747,7 +2989,19 @@ impl LogosServer {
                 Verdict::Refused(reason) => Decision::Failed {
                     reason: format!("{reason}: nothing was sent"),
                 },
-                Verdict::Send => {
+                // The settings may have changed while Muster was read: judge
+                // again by the ones in force now.
+                Verdict::Send { .. }
+                    if self.room_settings_for(&topic, wallet, &amount).as_ref()
+                        != Some(&settings) =>
+                {
+                    continue;
+                }
+                Verdict::Send { approvals } => {
+                    self.approvals.room_progress(&id, |p| {
+                        p.approvals = approvals;
+                        p.required = settings.approvals;
+                    });
                     if !room.use_once(&intent) {
                         Decision::Failed {
                             reason: "this room approval was already used: nothing was sent".into(),
@@ -2759,7 +3013,9 @@ impl LogosServer {
             };
             let approved = ending == Decision::Approved;
             let Ok(request) = self.approvals.room_answer(&id, ending.clone()) else {
-                return; // cancelled or expired meanwhile: never sent
+                // Cancelled or expired meanwhile: never sent, and the card closes.
+                room.withdraw(seat, &topic, &intent).await;
+                return;
             };
             self.record_activity(
                 "room_decision",
@@ -2768,25 +3024,42 @@ impl LogosServer {
                 &serde_json::to_string(&ending).unwrap_or_default(),
             );
             if matches!(ending, Decision::Failed { .. }) {
-                room.withdraw(self.node.as_ref(), &intent).await;
+                room.withdraw(seat, &topic, &intent).await;
             }
             if approved {
                 self.approvals
                     .room_progress(&id, |p| p.muster_state = "executable".into());
-                // Sent from the request the room's call was built from.
-                let p = TransferParams {
-                    from: request.from,
-                    to: request.to,
-                    amount_lepta: request.amount_lepta,
-                    call: request.call,
+                // Sent from the request the room's call was built from, only
+                // while its approval still stands, checked last before sending:
+                // not after its expiry, and not once its settings changed.
+                let standing = RoomStanding {
+                    topic: topic.clone(),
+                    wallet,
+                    amount: amount.clone(),
+                    settings,
+                    expires_at: request.room.as_ref().map_or(0, |r| r.expires_at),
                 };
-                let outcome = match self
-                    .send_checked(&CancellationToken::new(), &p, SendMode::Approved)
+                let sent = if request.chain {
+                    self.chain_send(
+                        &request.from,
+                        &request.to,
+                        &request.amount_lepta,
+                        ChainSend::Room(&standing),
+                    )
                     .await
-                {
-                    Ok(sent) => Decision::Sent {
-                        tx_hash: sent["tx_hash"].as_str().unwrap_or_default().to_string(),
-                    },
+                } else {
+                    let p = TransferParams {
+                        from: request.from,
+                        to: request.to,
+                        amount_lepta: request.amount_lepta,
+                        call: request.call,
+                    };
+                    self.send_checked(&CancellationToken::new(), &p, SendMode::Room(&standing))
+                        .await
+                        .map(|sent| sent["tx_hash"].as_str().unwrap_or_default().to_string())
+                };
+                let outcome = match sent {
+                    Ok(tx_hash) => Decision::Sent { tx_hash },
                     Err(SendError::NotSent(reason)) => Decision::Failed { reason },
                     Err(SendError::MaybeSent(reason)) => Decision::Unknown { reason },
                 };
@@ -2794,11 +3067,38 @@ impl LogosServer {
                 let unsent = matches!(outcome, Decision::Failed { .. });
                 self.finish_approved(&id, outcome);
                 if unsent {
-                    room.withdraw(self.node.as_ref(), &intent).await;
+                    room.withdraw(seat, &topic, &intent).await;
                 }
             }
             return;
         }
+    }
+
+    /// Whether a room approval still stands, right before its transfer goes.
+    fn room_stands(&self, standing: &RoomStanding) -> Result<(), SendError> {
+        let expired = crate::control::unix_now() >= standing.expires_at;
+        let now = self.room_settings_for(&standing.topic, standing.wallet, &standing.amount);
+        if expired || now.as_ref() != Some(&standing.settings) {
+            return Err(SendError::NotSent(
+                "the room's approval lapsed before sending: ask again; nothing was sent".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The room settings a room request in `topic` for `amount` from `wallet`
+    /// is judged by now: none once its room changed or was turned off, or its
+    /// tier no longer asks the room.
+    fn room_settings_for(&self, topic: &str, wallet: Wallet, amount: &str) -> Option<RoomApproval> {
+        let policy = self.approval_policy();
+        if policy.approver(wallet, amount) != policy::Approver::Room {
+            return None;
+        }
+        policy
+            .room_approval()
+            .ok()
+            .flatten()
+            .filter(|r| r.topic == topic)
     }
 
     /// Wait for the answer to request `id`, by the user or the room, up to
@@ -2836,7 +3136,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so every chain transfer waits for the user's Approve in the AI Agent app, which only Basecamp has. Irreversible once sent.",
+        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so a chain transfer usually waits for approval, the user's in the AI Agent app or a Muster room's: then it returns awaiting_approval and a request_id for wallet_transfer_status. Outside Basecamp only a room can approve it. Irreversible once sent.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2848,9 +3148,13 @@ impl LogosServer {
         ct: CancellationToken,
         Parameters(p): Parameters<ChainTransferParams>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.settings.host_owns_messaging {
+        let policy = self.approval_policy();
+        let approver = policy.approver(Wallet::Node, &p.amount_lepta);
+        // Outside Basecamp there is no app: only a room can approve, and the
+        // node's own wallet is never spent unapproved.
+        if !self.settings.host_owns_messaging && approver != policy::Approver::Room {
             return fail(
-                "chain transfers wait for the user's Approve in the AI Agent app, so they only work inside Basecamp",
+                "chain transfers spend the node's own wallet, so they need the user's Approve in the AI Agent app, which only Basecamp has, or a Muster room (--room-topic)",
             );
         }
         let checked = (|| {
@@ -2872,26 +3176,58 @@ impl LogosServer {
             Ok(found) => found,
             Err(e) => return fail(e),
         };
-        // Check now, so a hopeless request never reaches the user. Approving
-        // checks again before sending.
+        // Check now, so a hopeless request never reaches anyone. Sending
+        // checks again.
         if let Err(e) = self.chain_sendable(&from, &amount).await {
             return fail(e);
         }
-        let (id, decision) = match self.approvals.request_chain(&from, &to, &amount) {
-            Ok(filed) => filed,
-            Err(e) => return fail(e),
-        };
-        self.await_approval(&ct, &id, decision, Approver::User, |tx_hash| {
-            json!({
-                "submitted": true,
-                "tx_hash": tx_hash,
-                "from": from,
-                "to": to,
-                "amount_lepta": amount,
-                "note": "submitted, not yet confirmed: chain_wallet shows the new balance once it is in a block",
-            })
-        })
-        .await
+        let sent = |tx_hash: &str| chain_submitted(&from, &to, &amount, tx_hash);
+        match approver {
+            policy::Approver::Send => match self
+                .chain_send(&from, &to, &amount, ChainSend::Direct(&ct))
+                .await
+            {
+                Ok(tx_hash) => ok(sent(&tx_hash)),
+                Err(e) => fail(e.message()),
+            },
+            policy::Approver::Ask => {
+                let (id, decision) = match self.approvals.request_chain(&from, &to, &amount) {
+                    Ok(filed) => filed,
+                    Err(e) => return fail(e),
+                };
+                self.await_approval(&ct, &id, decision, Approver::User, sent)
+                    .await
+            }
+            policy::Approver::Room => {
+                let room = match policy.room_approval() {
+                    Ok(Some(room)) => room,
+                    Ok(None) => return fail(NO_ROOM),
+                    Err(e) => return fail(e),
+                };
+                let call = RoomCall {
+                    module: BLOCKCHAIN,
+                    method: "wallet_transfer_funds",
+                    args: Value::Array(
+                        chain_transfer_args(&from, &to, &amount)
+                            .iter()
+                            .map(Arg::to_json)
+                            .collect(),
+                    ),
+                    note: format!(
+                        "Pay {amount} lepta of TestToken on the Logos chain from the node's own {from} to {to}"
+                    ),
+                };
+                let filing = RoomFiling {
+                    from: from.clone(),
+                    to: to.clone(),
+                    amount: amount.clone(),
+                    program: None,
+                    chain: true,
+                    expires: room.expires,
+                };
+                self.room_request(&ct, &room, call, filing, sent).await
+            }
+        }
     }
 
     /// Whether the chain node can send `amount` from `from`: it holds the key
@@ -2922,24 +3258,42 @@ impl LogosServer {
         }
     }
 
-    /// Send an approved chain transfer, checking it again first.
-    async fn chain_send(&self, from: &str, to: &str, amount: &str) -> Result<String, SendError> {
+    /// Send a chain transfer, checking it again first, and last whether what
+    /// allowed it still stands.
+    async fn chain_send(
+        &self,
+        from: &str,
+        to: &str,
+        amount: &str,
+        allowed: ChainSend<'_>,
+    ) -> Result<String, SendError> {
         self.chain_sendable(from, amount)
             .await
             .map_err(SendError::NotSent)?;
+        match allowed {
+            ChainSend::Direct(ct) => {
+                if ct.is_cancelled() {
+                    return Err(SendError::NotSent(
+                        "transfer cancelled before sending: nothing was sent".into(),
+                    ));
+                }
+                if self.approval_policy().approver(Wallet::Node, amount) != policy::Approver::Send {
+                    return Err(SendError::NotSent(
+                        "this chain transfer now needs approval: call chain_transfer again to ask; nothing was sent"
+                            .into(),
+                    ));
+                }
+            }
+            ChainSend::Approved => {}
+            ChainSend::Room(standing) => self.room_stands(standing)?,
+        }
         // Last look before sending: the user may have turned transfers off while it waited.
         if !self.allows("chain_transfer") {
             return Err(SendError::NotSent(
                 "transfer cancelled: the user turned off transfers; nothing was sent".into(),
             ));
         }
-        let args = [
-            Arg::str(from),
-            Arg::Json(json!([from])),
-            Arg::str(to),
-            Arg::str(amount),
-            Arg::str(""),
-        ];
+        let args = chain_transfer_args(from, to, amount);
         match self
             .node
             .call(BLOCKCHAIN, "wallet_transfer_funds", &args)
@@ -3194,7 +3548,7 @@ impl LogosServer {
         &self,
         ct: &CancellationToken,
         p: &TransferParams,
-        mode: SendMode,
+        mode: SendMode<'_>,
     ) -> Result<Value, SendError> {
         let to = guard::public_account_hex(&p.to).map_err(|e| format!("recipient: {e}"))?;
         let amount = guard::amount_le16_hex(&p.amount_lepta)?;
@@ -3257,16 +3611,19 @@ impl LogosServer {
                 "transfer cancelled: the user turned off transfers; nothing was sent".into(),
             );
         }
-        if mode == SendMode::Direct && self.tool_groups.borrow().ask_before_transfer {
-            return Err("the user now approves each transfer: call wallet_transfer again to ask; nothing was sent".into());
-        }
         if mode == SendMode::Direct
             && self
-                .room
-                .as_ref()
-                .is_some_and(|room| room.config.needs_room(&p.amount_lepta))
+                .approval_policy()
+                .approver(Wallet::Agent, &p.amount_lepta)
+                != policy::Approver::Send
         {
-            return Err("this amount needs the Muster room's approval: nothing was sent".into());
+            return Err(
+                "this transfer now needs approval: call wallet_transfer again to ask; nothing was sent"
+                    .into(),
+            );
+        }
+        if let SendMode::Room(standing) = mode {
+            self.room_stands(standing)?;
         }
         // The funds checks above take a while: the deadline again, last.
         if p.call

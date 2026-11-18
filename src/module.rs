@@ -29,6 +29,7 @@ use crate::{
     control::{ActivityLog, Approvals, ToolGroups},
     guard::FilesRoot,
     logosctl::LogosError,
+    policy::{ApprovalPolicy, Approver},
     server::LogosServer,
 };
 
@@ -37,6 +38,8 @@ pub const DEFAULT_PORT: u16 = 8765;
 pub const TOKEN_FILE: &str = "token";
 /// Settings the user (and later the Agent app) can edit, in the module's data folder.
 pub const CONFIG_FILE: &str = "config.json";
+/// The agent's own logosctl session for Muster, in the module's data folder.
+pub const AGENT_SEAT_DIR: &str = "agent-seat";
 /// The record of the agent's tool calls, in the module's data folder.
 pub const ACTIVITY_FILE: &str = "activity.jsonl";
 
@@ -147,6 +150,12 @@ pub struct ModuleConfig {
     pub discovery_bootstrap: Vec<String>,
     /// The tool groups the agent may use, switched from the Agent app.
     pub tools: ToolGroups,
+    /// Who approves each wallet's transfers. Missing from configs written
+    /// before 0.10: then the tools' "ask before transfer" switch decides.
+    pub approvals: Option<ApprovalPolicy>,
+    /// Whether the agent's own seat in Muster was set up, so it starts with
+    /// the module.
+    pub agent_seat: bool,
 }
 
 impl Default for ModuleConfig {
@@ -156,6 +165,8 @@ impl Default for ModuleConfig {
             files_root: None,
             discovery_bootstrap: Vec::new(),
             tools: ToolGroups::default(),
+            approvals: None,
+            agent_seat: false,
         }
     }
 }
@@ -205,6 +216,24 @@ impl ModuleConfig {
     }
 }
 
+/// The approval policy `config` saved, checked. One that can't be followed,
+/// such as a hand-edited file, fails closed: every transfer asks the user.
+/// A config from before approval tiers carries its ask switch over.
+fn saved_policy(config: &ModuleConfig) -> ApprovalPolicy {
+    match &config.approvals {
+        Some(policy) => match policy.check() {
+            Ok(()) => policy.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    "the saved approval policy can't be followed ({e}): every transfer asks the user"
+                );
+                ApprovalPolicy::ask_for_everything()
+            }
+        },
+        None => ApprovalPolicy::from_ask_before_transfer(config.tools.ask_before_transfer),
+    }
+}
+
 /// What the Agent app reads and changes: the endpoint and its token, the tool
 /// groups the agent may use, and the record of its calls.
 pub struct Control {
@@ -212,6 +241,8 @@ pub struct Control {
     config: ModuleConfig,
     tokens: Tokens,
     groups: tokio::sync::watch::Sender<ToolGroups>,
+    /// Who approves each wallet's transfers, read by every server live.
+    policy: tokio::sync::watch::Sender<ApprovalPolicy>,
     /// Held while a switch is saved, so two saves can't interleave.
     saving: std::sync::Mutex<()>,
     activity: Arc<ActivityLog>,
@@ -227,6 +258,7 @@ impl Control {
             dir: dir.to_path_buf(),
             tokens: Tokens::load_or_create(dir).map_err(|e| e.to_string())?,
             groups: tokio::sync::watch::Sender::new(config.tools.clone()),
+            policy: tokio::sync::watch::Sender::new(saved_policy(&config)),
             saving: std::sync::Mutex::new(()),
             activity: Arc::new(ActivityLog::open(dir.join(ACTIVITY_FILE))?),
             approvals: Arc::default(),
@@ -255,6 +287,7 @@ impl Control {
     pub fn attach(&self, server: LogosServer) -> LogosServer {
         server
             .with_tool_groups(self.tool_groups())
+            .with_approval_policy(self.approval_policy_watch())
             .with_activity(self.activity_log())
             .with_approvals(self.approvals.clone())
     }
@@ -277,11 +310,21 @@ impl Control {
 
     /// Switch one tool group and save it. Only that group changes in the file,
     /// so other edits there are kept, and the file's groups then apply live.
+    /// "ask_before_transfer" also sets the agent wallet's tiers, keeping any
+    /// room tier: older apps, such as logos-agents', still switch it.
     pub fn set_permission(&self, group: &str, on: bool) -> Result<Value, String> {
         let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ModuleConfig::load_or_create(&self.dir)?;
         config.tools.set(group, on)?;
-        config.save(&self.dir)?;
+        if group == "ask_before_transfer" {
+            let mut policy = self.policy.borrow().clone();
+            policy.set_ask_before_transfer(on);
+            config.approvals = Some(policy.clone());
+            config.save(&self.dir)?;
+            self.policy.send_replace(policy);
+        } else {
+            config.save(&self.dir)?;
+        }
         // Only a real change tells connected agents to re-list.
         self.groups.send_if_modified(|groups| {
             let changed = *groups != config.tools;
@@ -289,6 +332,88 @@ impl Control {
             changed
         });
         Ok(self.permissions())
+    }
+
+    /// Who approves each wallet's transfers now.
+    pub fn approval_policy(&self) -> Value {
+        serde_json::to_value(&*self.policy.borrow()).unwrap_or_default()
+    }
+
+    pub fn approval_policy_watch(&self) -> tokio::sync::watch::Receiver<ApprovalPolicy> {
+        self.policy.subscribe()
+    }
+
+    /// Replace the approval policy, from the Agent app's JSON: refused unless
+    /// it can be followed, then saved and applied at once, to waiting room
+    /// requests too. The old ask switch is kept in step for older apps.
+    pub fn set_approval_policy(&self, json: &str) -> Result<Value, String> {
+        let given: Value =
+            serde_json::from_str(json).map_err(|e| format!("not an approval policy: {e}"))?;
+        // Both wallets in full: a missing one would quietly take its default.
+        if given.get("agent").is_none() || given.get("node").is_none() {
+            return Err("an approval policy gives both the agent and the node wallet".into());
+        }
+        let policy: ApprovalPolicy =
+            serde_json::from_value(given).map_err(|e| format!("not an approval policy: {e}"))?;
+        policy.check()?;
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let config = ModuleConfig::load_or_create(&self.dir)?;
+        if policy.uses_room() && !config.agent_seat {
+            return Err(
+                "room approval is off: turn it on in the AI Agent app before a tier asks the room"
+                    .into(),
+            );
+        }
+        self.apply_policy(config, policy)
+    }
+
+    /// Turn room approval off: every room tier asks the user instead, the
+    /// room is cleared, and the seat is no longer started. Its folder, with
+    /// its key and rooms, stays for when room approval is turned on again.
+    pub fn turn_off_room_approval(&self) -> Result<Value, String> {
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let mut config = ModuleConfig::load_or_create(&self.dir)?;
+        config.agent_seat = false;
+        let policy = self.policy.borrow().without_room();
+        self.apply_policy(config, policy)
+    }
+
+    /// Save `policy` into `config` and apply it at once, keeping the old ask
+    /// switch in step for older apps. The caller holds `saving`.
+    fn apply_policy(
+        &self,
+        mut config: ModuleConfig,
+        policy: ApprovalPolicy,
+    ) -> Result<Value, String> {
+        let asks = policy.agent.uses(Approver::Ask);
+        config.tools.ask_before_transfer = asks;
+        config.approvals = Some(policy.clone());
+        config.save(&self.dir)?;
+        self.groups.send_if_modified(|groups| {
+            let changed = groups.ask_before_transfer != asks;
+            groups.ask_before_transfer = asks;
+            changed
+        });
+        self.policy.send_replace(policy);
+        Ok(self.approval_policy())
+    }
+
+    /// Whether the agent's seat was set up, as saved now.
+    pub fn agent_seat(&self) -> bool {
+        ModuleConfig::load_or_create(&self.dir).is_ok_and(|c| c.agent_seat)
+    }
+
+    /// Where the agent's seat keeps its logosctl session.
+    pub fn agent_seat_dir(&self) -> PathBuf {
+        self.dir.join(AGENT_SEAT_DIR)
+    }
+
+    /// Remember that the agent's seat was set up, so it starts with the module.
+    pub fn remember_agent_seat(&self) -> Result<(), String> {
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let mut config = ModuleConfig::load_or_create(&self.dir)?;
+        config.agent_seat = true;
+        config.save(&self.dir)
     }
 
     /// Calls after sequence number `after`, and the cursor to pass next time.

@@ -2106,7 +2106,7 @@ async fn switching_approvals_on_stops_a_transfer_already_on_its_way() {
     drop(held);
     let r = call.await.unwrap();
     assert!(is_error(&r));
-    assert!(text(&r).contains("approves each transfer"), "{}", text(&r));
+    assert!(text(&r).contains("now needs approval"), "{}", text(&r));
     assert_eq!(sends(&fake), 0);
 }
 

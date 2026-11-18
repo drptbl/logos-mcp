@@ -14,6 +14,7 @@ use logos_mcp::{
     logosctl::{unwrap_std_result, Arg, LogosError},
     module::{router, sdk_error, Control},
     node::{Node, NodeFuture, NodeStatus},
+    seat::{find_logosctl, Seat},
     server::{LogosServer, NodeSettings, WalletMode},
 };
 use logos_rust_sdk::LogosModuleSDK;
@@ -128,6 +129,11 @@ static WALLET: std::sync::OnceLock<(LogosServer, tokio::runtime::Handle)> =
     std::sync::OnceLock::new();
 /// Why the endpoint isn't serving, when it isn't.
 static ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The agent's own seat in Muster: Basecamp's one Muster is the user's.
+static SEAT: std::sync::OnceLock<Seat> = std::sync::OnceLock::new();
+/// How long one logosctl call to the agent's seat may take. Installing Muster
+/// has its own, longer limit.
+const SEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
 
 fn start(data_dir: PathBuf) -> Result<(), String> {
@@ -150,12 +156,23 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
     };
     let events = Arc::new(EventStore::default());
     let node: Arc<dyn Node> = Arc::new(InProcessNode);
-    let server = control.attach(LogosServer::new(
-        node.clone(),
-        events.clone(),
-        files,
-        settings,
-    ));
+    // Room approval goes only through the agent's own seat, never the user's
+    // Muster, even before the seat is set up: then it is refused.
+    let seat = SEAT.get_or_init(|| {
+        Seat::in_dir(
+            find_logosctl().unwrap_or_else(|| PathBuf::from("logosctl")),
+            control.agent_seat_dir(),
+            SEAT_TIMEOUT,
+        )
+    });
+    let server = control
+        .attach(LogosServer::new(
+            node.clone(),
+            events.clone(),
+            files,
+            settings,
+        ))
+        .with_muster(seat.node());
     let for_wallet = server.clone();
     let app = router(move || Ok(server.clone()), control.tokens());
 
@@ -203,6 +220,15 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
         }
     });
     rx.recv().map_err(|e| e.to_string())??;
+    if control.agent_seat() {
+        if let Some((_, runtime)) = WALLET.get() {
+            runtime.spawn(async move {
+                if let Err(e) = seat.start().await {
+                    eprintln!("logos_mcp: the agent's Muster seat didn't start: {e}");
+                }
+            });
+        }
+    }
     // Only once serving: a module that failed to start keeps no subscriptions.
     for (module, _) in WATCHED {
         node.watch(module, events.clone());
@@ -247,7 +273,39 @@ where
     runtime.block_on(f(server.clone()))
 }
 
-/// `f` on the control surface, or why there is none.
+/// The agent's seat and the runtime its calls run on, or why there are none.
+fn seat() -> Result<(&'static Seat, &'static tokio::runtime::Handle), String> {
+    let seat = SEAT.get().ok_or("the agent seat isn't ready")?;
+    let (_, runtime) = WALLET.get().ok_or("the MCP server isn't running")?;
+    Ok((seat, runtime))
+}
+
+/// `f` on the agent's seat, or why there is none.
+fn on_seat<F, Fut>(f: F) -> Result<Value, String>
+where
+    F: FnOnce(&'static Seat) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let (seat, runtime) = seat()?;
+    runtime.block_on(f(seat))
+}
+
+/// The user's own Ed25519 key in Basecamp's Muster, when Muster runs there.
+fn users_muster_key() -> Option<String> {
+    let raw = LogosModuleSDK::new()
+        .plugin("muster_module")
+        .call_json_with_timeout("identity", &json!([]), CALL_TIMEOUT)
+        .ok()?;
+    let identity: Value = match unwrap_std_result(raw).ok()? {
+        Value::String(text) => serde_json::from_str(&text).ok()?,
+        other => other,
+    };
+    identity
+        .get("ed25519")
+        .and_then(Value::as_str)
+        .map(|k| format!("ed:{}", k.to_ascii_lowercase()))
+}
+
 fn with_control(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     match CONTROL.get() {
         Some(control) => f(control).map_or_else(error_json, |v| v.to_string()),
@@ -281,6 +339,11 @@ impl LogosMcpModule for ModuleImpl {
     }
 
     fn about_to_unload(&self) -> logos_rust_sdk::Shutdown {
+        // The seat runs while the module does, stopped first, while the runtime
+        // still runs. Invites wait in the store meanwhile.
+        if let (Some(seat), Some((_, runtime))) = (SEAT.get(), WALLET.get()) {
+            runtime.block_on(seat.stop());
+        }
         if let Some(stop) = STOP.get() {
             stop.cancel();
         }
@@ -333,6 +396,93 @@ impl LogosMcpModule for ModuleImpl {
 
     fn deny(&self, request_id: String) -> String {
         for_app(|_| on_server(|s| async move { s.deny_transfer(&request_id) }))
+    }
+
+    fn cancel_room_request(&self, request_id: String) -> String {
+        for_app(|_| on_server(|s| async move { s.cancel_room_request(&request_id) }))
+    }
+
+    fn approval_policy(&self) -> String {
+        for_app(|c| Ok(c.approval_policy()))
+    }
+
+    fn set_approval_policy(&self, policy: String) -> String {
+        for_app(|c| c.set_approval_policy(&policy))
+    }
+
+    /// The seat's status. While room approval is off it asks nothing of
+    /// logosctl or Muster: only how a setup goes.
+    fn seat_status(&self) -> String {
+        for_app(|c| {
+            let (seat, _) = seat()?;
+            // Before reading whether it is set up: a setup that finishes in
+            // between then shows as set up, never as not set up.
+            let setup = seat.setup_status();
+            let set_up = c.agent_seat();
+            let mut status = if set_up {
+                let mut status = on_seat(|seat| async move { Ok(seat.status().await) })?;
+                status["you"] = json!(users_muster_key());
+                status
+            } else {
+                setup
+            };
+            status["set_up"] = json!(set_up);
+            status["logosctl"] = json!(find_logosctl());
+            Ok(status)
+        })
+    }
+
+    /// Turns room approval off: room tiers ask the user instead, and waiting
+    /// room requests are cancelled. Then, in the background, as the seat may
+    /// be busy proposing: the agent's open cards are closed and the seat stops.
+    /// Its folder stays, so turning it on again reuses the same seat.
+    fn seat_turn_off(&self) -> String {
+        for_app(|c| {
+            let (seat, runtime) = seat()?;
+            let (server, _) = WALLET.get().ok_or("the MCP server isn't running")?;
+            let policy = c.turn_off_room_approval()?;
+            server.cancel_room_requests();
+            let server = server.clone();
+            runtime.spawn(async move { server.end_room_approval(seat.stop()).await });
+            Ok(policy)
+        })
+    }
+
+    /// Starts setting the seat up and returns: installing Muster outlasts
+    /// Basecamp's call limit. `seat_status` says how it goes.
+    fn seat_set_up(&self) -> String {
+        for_app(|_| {
+            let (seat, runtime) = seat()?;
+            seat.set_up_in_background(runtime, || {
+                CONTROL
+                    .get()
+                    .ok_or("the data folder was not opened")?
+                    .remember_agent_seat()
+            })?;
+            Ok(json!({ "setting_up": true }))
+        })
+    }
+
+    fn seat_join(&self, topic: String) -> String {
+        for_app(|_| on_server(|s| async move { s.seat_join(&topic).await.map(|()| json!({ "joined": topic })) }))
+    }
+
+    fn room_members(&self, topic: String) -> String {
+        for_app(|_| {
+            let you = users_muster_key();
+            let members = on_server(|s| async move { s.room_members(&topic).await.map(Value::from) })?;
+            let marked: Vec<Value> = members
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut m| {
+                    m["you"] = json!(you.as_deref() == m["key"].as_str());
+                    m
+                })
+                .collect();
+            Ok(json!({ "members": marked }))
+        })
     }
 
     fn activity(&self, after: i64) -> String {

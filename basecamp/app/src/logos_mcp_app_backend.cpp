@@ -73,22 +73,79 @@ QString LogosMcpAppBackend::deny(QString requestId)
     return reply;
 }
 
+QString LogosMcpAppBackend::cancelRoomRequest(QString requestId)
+{
+    const QString reply = checked(modules().logos_mcp.cancel_room_request(requestId));
+    setApprovals(checked(modules().logos_mcp.approvals()));
+    return reply;
+}
+
+QString LogosMcpAppBackend::saveApprovalPolicy(QString policy)
+{
+    const QString reply = checked(modules().logos_mcp.set_approval_policy(policy));
+    if (!isError(reply))
+        setApprovalPolicy(reply);
+    return reply;
+}
+
+// Starts installing Muster into the agent's own logosctl session. That's a
+// download, so it runs on after this returns, and the seat's status follows it.
+QString LogosMcpAppBackend::seatSetUp()
+{
+    const QString reply = checked(modules().logos_mcp.seat_set_up());
+    QTimer::singleShot(0, [this]() { refreshSeat(); });
+    return reply;
+}
+
+// Room tiers ask the user from now on, waiting room requests are cancelled, and
+// the seat stops. The reply is the policy now in force.
+QString LogosMcpAppBackend::seatTurnOff()
+{
+    const QString reply = checked(modules().logos_mcp.seat_turn_off());
+    if (!isError(reply))
+        setApprovalPolicy(reply);
+    setApprovals(checked(modules().logos_mcp.approvals()));
+    QTimer::singleShot(0, [this]() { refreshSeat(); });
+    return reply;
+}
+
+QString LogosMcpAppBackend::seatJoin(QString topic)
+{
+    const QString reply = checked(modules().logos_mcp.seat_join(topic));
+    QTimer::singleShot(0, [this]() { refreshSeat(); });
+    return reply;
+}
+
+QString LogosMcpAppBackend::roomMembers(QString topic)
+{
+    return checked(modules().logos_mcp.room_members(topic));
+}
+
 void LogosMcpAppBackend::refreshWallet()
 {
     setWallet(checked(modules().logos_mcp.wallet()));
+}
+
+void LogosMcpAppBackend::refreshSeat()
+{
+    setSeat(checked(modules().logos_mcp.seat_status()));
 }
 
 void LogosMcpAppBackend::onContextReady()
 {
     QObject::connect(&m_poll, &QTimer::timeout, [this]() { refresh(); });
     m_poll.start(kPollMs);
-    QObject::connect(&m_walletPoll, &QTimer::timeout, [this]() { refreshWallet(); });
+    QObject::connect(&m_walletPoll, &QTimer::timeout, [this]() {
+        refreshWallet();
+        refreshSeat();
+    });
     m_walletPoll.start(kWalletPollMs);
     // Not from inside the hook: on Basecamp 0.4.0-rc.2 calls made this early are
     // refused because the backend's token isn't registered yet.
     QTimer::singleShot(kFirstPollMs, [this]() {
         refresh();
         refreshWallet();
+        refreshSeat();
     });
 }
 
@@ -100,6 +157,9 @@ void LogosMcpAppBackend::refresh()
         setPermissions(permissions);
     // Every poll: a waiting agent gives up after a minute.
     setApprovals(checked(modules().logos_mcp.approvals()));
+    const QString policy = checked(modules().logos_mcp.approval_policy());
+    if (!isError(policy))
+        setApprovalPolicy(policy);
 
     const QString reply = checked(modules().logos_mcp.activity(m_after));
     if (isError(reply))

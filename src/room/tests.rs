@@ -33,7 +33,6 @@ fn config(approvers: &[&str], approvals: usize) -> RoomApproval {
             .map(|a| format!("ed:{a}"))
             .collect::<Vec<_>>(),
         approvals,
-        3_000_000,
         60,
     )
     .unwrap()
@@ -45,7 +44,6 @@ fn approvers_are_ed25519_keys_with_or_without_the_ed_prefix() {
         TOPIC,
         &[format!("ed:{}", HUMAN.to_uppercase()), OTHER.into()],
         2,
-        0,
         60,
     )
     .unwrap();
@@ -56,28 +54,18 @@ fn approvers_are_ed25519_keys_with_or_without_the_ed_prefix() {
 
 #[test]
 fn a_config_that_could_never_approve_is_refused() {
-    let bad = |topic: &str, approvers: &[String], approvals: usize, above: u128, mins: u64| {
-        RoomApproval::new(topic, approvers, approvals, above, mins).unwrap_err()
+    let bad = |topic: &str, approvers: &[String], approvals: usize, mins: u64| {
+        RoomApproval::new(topic, approvers, approvals, mins).unwrap_err()
     };
     let one = [format!("ed:{HUMAN}")];
-    assert!(bad(TOPIC, &[], 1, 0, 60).contains("approver"));
-    assert!(bad(TOPIC, &["ed:1234".into()], 1, 0, 60).contains("64 hex"));
-    assert!(bad(TOPIC, &one, 2, 0, 60).contains("2 approvals"));
-    assert!(bad(TOPIC, &one, 0, 0, 60).contains("at least 1"));
-    assert!(bad("no-slash", &one, 1, 0, 60).contains("topic"));
-    assert!(bad(TOPIC, &one, 1, 0, 0).contains("minute"));
+    assert!(bad(TOPIC, &[], 1, 60).contains("approver"));
+    assert!(bad(TOPIC, &["ed:1234".into()], 1, 60).contains("64 hex"));
+    assert!(bad(TOPIC, &one, 2, 60).contains("2 approvals"));
+    assert!(bad(TOPIC, &one, 0, 60).contains("at least 1"));
+    assert!(bad("no-slash", &one, 1, 60).contains("topic"));
+    assert!(bad(TOPIC, &one, 1, 0).contains("minute"));
     // The same key twice is one approver, not two.
-    assert!(bad(TOPIC, &[one[0].clone(), HUMAN.into()], 2, 0, 60).contains("2 approvals"));
-}
-
-#[test]
-fn only_a_transfer_strictly_above_the_limit_needs_the_room() {
-    let room = config(&[HUMAN], 1);
-    assert!(!room.needs_room("3000000"));
-    assert!(room.needs_room("3000001"));
-    assert!(!room.needs_room("1"));
-    // Whatever the wallet would refuse anyway is left to its own checks.
-    assert!(room.needs_room("99999999999999999999999999999999999999999"));
+    assert!(bad(TOPIC, &[one[0].clone(), HUMAN.into()], 2, 60).contains("2 approvals"));
 }
 
 // ---- the gate --------------------------------------------------------------
@@ -128,6 +116,7 @@ fn muster(
 
 fn verdict(room: &RoomApproval, args: Value, (intents, provenance): (Value, Value)) -> Verdict {
     let call = RoomCall {
+        module: "lez_core",
         method: "transfer_public",
         args,
         note: String::new(),
@@ -151,7 +140,10 @@ fn a_trusted_humans_approval_of_exactly_this_call_passes() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), seen), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), seen),
+        Verdict::Send { approvals: 1 }
+    );
 }
 
 #[test]
@@ -219,7 +211,10 @@ fn every_required_approval_must_come_from_a_distinct_trusted_human() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), both), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), both),
+        Verdict::Send { approvals: 2 }
+    );
 }
 
 #[test]
@@ -294,7 +289,10 @@ fn a_declined_proposal_ends_unsent() {
         TOPIC,
         EXPIRY,
     );
-    assert_eq!(verdict(&room, the_call(), seen), Verdict::Send);
+    assert_eq!(
+        verdict(&room, the_call(), seen),
+        Verdict::Send { approvals: 1 }
+    );
 }
 
 #[test]
@@ -362,15 +360,17 @@ async fn a_room_approval_is_used_once() {
     // A used approval is refused before Muster is even asked.
     let fake = crate::logosctl::tests::FakeRunner::with(vec![]);
     let node = crate::logosctl::Logosctl::new(fake.clone());
-    let room = Room::new(config(&[HUMAN], 1));
+    let room = Room::new();
+    let settings = config(&[HUMAN], 1);
     assert!(room.use_once(ID));
     assert!(!room.use_once(ID));
     let call = RoomCall {
+        module: "lez_core",
         method: "transfer_public",
         args: the_call(),
         note: String::new(),
     };
-    let seen = room.look(&node, ID, &call, NOW).await.unwrap();
+    let seen = room.look(&node, &settings, ID, &call, NOW).await.unwrap();
     assert!(
         matches!(seen, Verdict::Refused(ref r) if r.contains("already used")),
         "{seen:?}"
@@ -401,7 +401,7 @@ fn an_approval_named_by_a_roster_identity_counts_like_its_key() {
     }
     assert_eq!(
         verdict(&room, the_call(), (intents, provenance)),
-        Verdict::Send
+        Verdict::Send { approvals: 1 }
     );
 }
 
@@ -437,14 +437,19 @@ fn cbor_text(out: &mut Vec<u8>, s: &str) {
 
 /// The txhash Muster folds for an invoke of lez_core.`method`(`args`).
 pub(crate) fn invoke_txhash(method: &str, args: &Value) -> String {
+    invoke_txhash_in("lez_core", method, args)
+}
+
+/// The txhash Muster folds for an invoke of `module`.`method`(`args`).
+pub(crate) fn invoke_txhash_in(module: &str, method: &str, args: &Value) -> String {
     let mut b = vec![0x83];
     cbor_text(&mut b, "muster.invoke.v1");
-    cbor_text(&mut b, &format!("muster.invoke.lez_core.{method}.v1"));
+    cbor_text(&mut b, &format!("muster.invoke.{module}.{method}.v1"));
     b.push(0xa3);
     for (k, v) in [
         ("args", args.to_string()),
         ("method", method.to_string()),
-        ("module", "lez_core".to_string()),
+        ("module", module.to_string()),
     ] {
         cbor_text(&mut b, k);
         cbor_text(&mut b, &v);
@@ -475,6 +480,7 @@ fn a_program_call_passes_only_when_the_room_signed_exactly_it() {
     let signer = "f44f59079d950ccb7ad230e5fa6e0668adf83eab47785d1bb0b9bab746b0cd64";
     let sent = program_args(PROGRAM, &[signer, ESCROW], &[true, false], "AQID");
     let call = RoomCall {
+        module: "lez_core",
         method: "send_generic_public_transaction",
         args: sent.clone(),
         note: String::new(),
@@ -494,7 +500,7 @@ fn a_program_call_passes_only_when_the_room_signed_exactly_it() {
         |(intents, provenance): (Value, Value)| judge(&room, ID, &call, &intents, &provenance, NOW);
     assert_eq!(
         judged(folded("send_generic_public_transaction", &sent)),
-        Verdict::Send
+        Verdict::Send { approvals: 1 }
     );
     for (method, other) in [
         (

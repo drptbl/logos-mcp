@@ -28,8 +28,6 @@ pub struct RoomApproval {
     approvers: BTreeSet<String>,
     /// Distinct trusted approvals a transfer needs.
     pub approvals: usize,
-    /// Transfers strictly above this many lepta need the room.
-    pub above_lepta: u128,
     /// How long a proposal waits for the room before it expires unsent.
     pub expires: Duration,
 }
@@ -45,7 +43,7 @@ fn ed_key(input: &str) -> Option<String> {
 
 /// The Ed25519 key in an account as Muster names it: `ed:<hex>`, the bare hex,
 /// or a 128-hex roster identity, whose first half is the Ed25519 key.
-fn member_key(account: &str) -> Option<String> {
+pub(crate) fn member_key(account: &str) -> Option<String> {
     let account = account.trim();
     match account.len() {
         128 => account.get(..64).and_then(ed_key),
@@ -58,7 +56,6 @@ impl RoomApproval {
         topic: &str,
         approvers: &[String],
         approvals: usize,
-        above_lepta: u128,
         expires_mins: u64,
     ) -> Result<Self, String> {
         crate::guard::validate_topic(topic).map_err(|e| format!("room topic: {e}"))?;
@@ -91,7 +88,6 @@ impl RoomApproval {
             topic: topic.to_string(),
             approvers,
             approvals,
-            above_lepta,
             expires: Duration::from_secs(expires_mins.saturating_mul(60)),
         })
     }
@@ -100,15 +96,6 @@ impl RoomApproval {
     /// identity, whose first half is the Ed25519 key) is a trusted approver.
     pub fn trusts(&self, account: &str) -> bool {
         member_key(account).is_some_and(|k| self.approvers.contains(&k))
-    }
-
-    /// Whether a transfer of `amount_lepta` needs the room: anything not shown
-    /// to be at or under the limit does.
-    pub fn needs_room(&self, amount_lepta: &str) -> bool {
-        amount_lepta
-            .trim()
-            .parse::<u128>()
-            .map_or(true, |amount| amount > self.above_lepta)
     }
 }
 
@@ -233,6 +220,7 @@ pub fn signed_call(txhash: &str) -> Result<SignedCall, String> {
 /// same call, built from the same request, once the room approves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomCall {
+    pub module: &'static str,
     pub method: &'static str,
     /// The call's arguments, as the room signs them.
     pub args: Value,
@@ -244,8 +232,8 @@ pub struct RoomCall {
 /// What the agent's Muster says about a proposed transfer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Trusted humans approved exactly this call: send it.
-    Send,
+    /// Trusted humans approved exactly this call: send it. How many did.
+    Send { approvals: usize },
     /// Not yet: Muster's state, and the trusted approvals counted so far.
     Wait { state: String, approvals: usize },
     /// The room declined it, or too many trusted humans did for it to pass.
@@ -254,7 +242,7 @@ pub enum Verdict {
     Refused(String),
 }
 
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
@@ -312,8 +300,8 @@ pub fn judge(
     }
     match signed_call(text(intent, "txhash")) {
         Ok(signed)
-            if signed.schema_id == format!("muster.invoke.lez_core.{}.v1", call.method)
-                && signed.module == "lez_core"
+            if signed.schema_id == format!("muster.invoke.{}.{}.v1", call.module, call.method)
+                && signed.module == call.module
                 && signed.method == call.method
                 && signed.args == call.args => {}
         Ok(signed) => {
@@ -368,7 +356,7 @@ pub fn judge(
         .filter(|k| room.approvers.contains(*k) && !declined.contains(*k))
         .count();
     if state == "executable" && approvals >= room.approvals {
-        Verdict::Send
+        Verdict::Send { approvals }
     } else {
         Verdict::Wait {
             state: state.into(),
@@ -377,21 +365,25 @@ pub fn judge(
     }
 }
 
-/// Room approval at work: the config, and the agent's Muster as this server
-/// found it.
+/// The agent's seat in Muster, as this server found it. The room settings
+/// come with each call: they may change between calls.
+#[derive(Default)]
 pub struct Room {
-    pub config: RoomApproval,
     /// Held from checking Muster through proposing: the policy Muster proposes
-    /// under is instance-wide. True once Muster was found loaded, with its
-    /// delivery node up and its own key untrusted.
-    ready: tokio::sync::Mutex<bool>,
+    /// under is instance-wide. The agent's Ed25519 key once Muster was found
+    /// loaded, with its delivery node up.
+    agent: tokio::sync::Mutex<Option<String>>,
     /// Proposals a transfer was sent for: never again.
     used: std::sync::Mutex<BTreeSet<String>>,
+    /// Rooms this server looked through for proposals a restart left open.
+    swept: std::sync::Mutex<BTreeSet<String>>,
+    /// Proposals this seat made and hasn't withdrawn: their room by id.
+    open: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 /// One Muster call, its JSON-in-a-string result decoded. Muster reports a
 /// refusal as `{"error": …}` inside a successful call.
-async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, String> {
+pub(crate) async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, String> {
     let args: Vec<Arg> = args.iter().map(|a| Arg::str(*a)).collect();
     let value = node
         .call(MUSTER, method, &args)
@@ -404,69 +396,113 @@ async fn muster(node: &dyn Node, method: &str, args: &[&str]) -> Result<Value, S
     }
 }
 
-impl Room {
-    pub fn new(config: RoomApproval) -> Self {
-        Self {
-            config,
-            ready: tokio::sync::Mutex::default(),
-            used: std::sync::Mutex::default(),
+/// Wait until Muster's delivery node is up, up to DELIVERY_WAIT.
+async fn wait_for_delivery(node: &dyn Node) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + DELIVERY_WAIT;
+    loop {
+        let up = muster(node, "connectivity", &[]).await.is_ok_and(|c| {
+            c["rows"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .any(|r| text(r, "key") == "delivery" && text(r, "level") == "ok")
+            })
+        });
+        if up {
+            return Ok(());
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "Muster's delivery node isn't up yet: nothing was proposed, try again shortly"
+                    .into(),
+            );
+        }
+        tokio::time::sleep(DELIVERY_POLL).await;
+    }
+}
+
+/// Decline proposal `intent_id` in `topic` as the agent, best effort: for
+/// callers that already hold the seat.
+async fn withdraw_now(node: &dyn Node, topic: &str, intent_id: &str) {
+    let declined = match activate(node, topic).await {
+        Ok(()) => muster(node, "coordinate_decline", &[intent_id])
+            .await
+            .map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = declined {
+        tracing::warn!(%intent_id, "could not withdraw the room proposal: {e}");
+    }
+}
+
+/// Make `topic` the agent Muster's active room: Muster reads and writes only
+/// its active room, and only that room takes in new messages. The seat is the
+/// agent's own, so this disturbs nobody.
+pub(crate) async fn activate(node: &dyn Node, topic: &str) -> Result<(), String> {
+    let rooms = muster(node, "coordinate_conversations", &[]).await?;
+    let joined = rooms
+        .as_array()
+        .and_then(|r| r.iter().find(|r| text(r, "topic") == topic))
+        .ok_or_else(|| {
+            format!(
+                "the agent's Muster isn't in the room {topic}: a member must invite it, and it must join"
+            )
+        })?;
+    if joined.get("active").and_then(Value::as_bool) != Some(true) {
+        muster(node, "coordinate_join", &[topic]).await?;
+    }
+    Ok(())
+}
+
+impl Room {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Make sure the agent's Muster can propose into the room: loaded, its
+    /// Make sure the agent's Muster can propose into `room`: loaded, its
     /// delivery node up, its own key not trusted, the room active, and enough
     /// trusted humans in it.
-    async fn check(&self, node: &dyn Node, ready: &mut bool) -> Result<(), String> {
-        if !*ready {
-            node.ensure_loaded(MUSTER).await.map_err(|e| {
-                format!("room approval needs muster_module in this logosctl session: {e}")
-            })?;
-            let identity = muster(node, "identity", &[]).await?;
+    async fn check(
+        &self,
+        node: &dyn Node,
+        room: &RoomApproval,
+        agent: &mut Option<String>,
+    ) -> Result<(), String> {
+        if agent.is_none() {
+            // A seat set up by logos-mcp has Muster loaded already, without its
+            // optional extras: load it only when it isn't.
+            let identity = match muster(node, "identity", &[]).await {
+                Ok(identity) => identity,
+                Err(_) => {
+                    node.ensure_loaded(MUSTER).await.map_err(|e| {
+                        format!("room approval needs muster_module in this logosctl session: {e}")
+                    })?;
+                    muster(node, "identity", &[]).await?
+                }
+            };
             let key = identity
                 .get("ed25519")
                 .and_then(Value::as_str)
                 .and_then(ed_key)
                 .ok_or("Muster gave no Ed25519 identity")?;
-            if self.config.approvers.contains(&key) {
-                return Err(format!(
-                    "the agent's own Muster key ed:{key} is listed as a room approver: it must never approve its own transfers"
-                ));
-            }
-            let deadline = tokio::time::Instant::now() + DELIVERY_WAIT;
-            loop {
-                let up = muster(node, "connectivity", &[]).await.is_ok_and(|c| {
-                    c["rows"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .any(|r| text(r, "key") == "delivery" && text(r, "level") == "ok")
-                    })
-                });
-                if up {
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("Muster's delivery node isn't up yet: nothing was proposed, try again shortly".into());
-                }
-                tokio::time::sleep(DELIVERY_POLL).await;
-            }
-            self.sweep(node).await;
-            *ready = true;
+            *agent = Some(key);
         }
-        let rooms = muster(node, "coordinate_conversations", &[]).await?;
-        let room = rooms
-            .as_array()
-            .and_then(|r| r.iter().find(|r| text(r, "topic") == self.config.topic))
-            .ok_or_else(|| {
-                format!(
-                    "the agent's Muster isn't in the room {}: a member must invite it, and it must join",
-                    self.config.topic
-                )
-            })?;
-        // Muster reads and proposes in its active room only.
-        if room.get("active").and_then(Value::as_bool) != Some(true) {
+        if let Some(key) = agent.as_deref()
+            && room.trusts(key)
+        {
             return Err(format!(
-                "the room {} isn't the active room in the agent's Muster: join it again with coordinate_join",
-                self.config.topic
+                "the agent's own Muster key ed:{key} is listed as a room approver: it must never approve its own transfers"
             ));
+        }
+        // A seat starts its delivery node only once a room is active, and
+        // loses what it sends while that node starts (corpetty/muster#373).
+        activate(node, &room.topic).await?;
+        wait_for_delivery(node).await?;
+        let first_look = self
+            .swept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(room.topic.clone());
+        if first_look {
+            self.sweep(node, &room.topic).await;
         }
         let members = muster(node, "coordinate_members", &[]).await?;
         let trusted: BTreeSet<String> = members
@@ -475,13 +511,13 @@ impl Room {
             .unwrap_or_default()
             .iter()
             .filter_map(|m| member_key(text(m, "identity")))
-            .filter(|k| self.config.approvers.contains(k))
+            .filter(|k| room.approvers.contains(k))
             .collect();
-        if trusted.len() < self.config.approvals {
+        if trusted.len() < room.approvals {
             return Err(format!(
                 "only {} of the trusted approvers are in the room, and {} approvals are needed",
                 trusted.len(),
-                self.config.approvals
+                room.approvals
             ));
         }
         Ok(())
@@ -497,11 +533,12 @@ impl Room {
     pub async fn propose(
         &self,
         node: &dyn Node,
+        room: &RoomApproval,
         call: &RoomCall,
         reference: &str,
     ) -> Result<String, String> {
-        let mut ready = self.ready.lock().await;
-        self.check(node, &mut ready).await?;
+        let mut agent = self.agent.lock().await;
+        self.check(node, room, &mut agent).await?;
         let policy = muster(node, "coordinate_set_policy", &["invoke"]).await?;
         if text(&policy, "policy") != "invoke" {
             return Err(format!(
@@ -510,7 +547,7 @@ impl Room {
         }
         let effect = json!({
             "effect": "invoke",
-            "module": "lez_core",
+            "module": call.module,
             "method": call.method,
             "args": call.args,
             "ref": reference,
@@ -525,6 +562,10 @@ impl Room {
             })
             .ok_or_else(|| format!("Muster gave no proposal id: {id}"))?
             .to_string();
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), room.topic.clone());
         let intents = muster(node, "coordinate_intents", &[]).await?;
         let approved_before = intents
             .as_array()
@@ -538,7 +579,7 @@ impl Room {
         }
         let said = format!("[logos-mcp] proposal {id}: {}", call.note);
         if let Err(e) = muster(node, "coordinate_post_message", &[&said]).await {
-            self.withdraw(node, &id).await;
+            withdraw_now(node, &room.topic, &id).await;
             return Err(format!(
                 "couldn't say in the room what the proposal does, so it was withdrawn: nothing was sent ({e})"
             ));
@@ -547,10 +588,12 @@ impl Room {
         Ok(id)
     }
 
-    /// Where proposal `intent_id` for `call` stands, at `now` (Unix seconds).
+    /// Where proposal `intent_id` for `call` stands in `room`, at `now` (Unix
+    /// seconds), judged by the settings as they are now.
     pub async fn look(
         &self,
         node: &dyn Node,
+        room: &RoomApproval,
         intent_id: &str,
         call: &RoomCall,
         now: u64,
@@ -565,23 +608,28 @@ impl Room {
                 "this room approval was already used".into(),
             ));
         }
+        // Held across making the room active and reading it: the seat has one
+        // active room for everything it does.
+        let agent = self.agent.lock().await;
+        if let Some(key) = agent.as_deref()
+            && room.trusts(key)
+        {
+            return Ok(Verdict::Refused(format!(
+                "the agent's own Muster key ed:{key} is now listed as a room approver"
+            )));
+        }
+        // Only the active room takes in new messages: a restarted seat has none.
+        activate(node, &room.topic).await?;
         let intents = muster(node, "coordinate_intents", &[]).await?;
         let provenance = muster(node, "coordinate_provenance", &[]).await?;
-        Ok(judge(
-            &self.config,
-            intent_id,
-            call,
-            &intents,
-            &provenance,
-            now,
-        ))
+        Ok(judge(room, intent_id, call, &intents, &provenance, now))
     }
 
     /// Decline what an earlier run of this server left open: the agent's own
     /// proposals, still collecting, for requests a restart dropped and so never
     /// sends. An executable one is left alone, as it was most likely sent.
     /// Best effort: a Muster that can't be read leaves them open.
-    async fn sweep(&self, node: &dyn Node) {
+    async fn sweep(&self, node: &dyn Node, topic: &str) {
         let intents = match muster(node, "coordinate_intents", &[]).await {
             Ok(intents) => intents,
             Err(e) => {
@@ -611,16 +659,74 @@ impl Room {
                 intent_id = text(intent, "id"),
                 "declining a room proposal a restart left open"
             );
-            self.withdraw(node, text(intent, "id")).await;
+            withdraw_now(node, topic, text(intent, "id")).await;
         }
     }
 
     /// Take back the agent's approval of a proposal that will never be sent, so
     /// the room sees it closed. Best effort: nothing is sent either way.
-    pub async fn withdraw(&self, node: &dyn Node, intent_id: &str) {
-        if let Err(e) = muster(node, "coordinate_decline", &[intent_id]).await {
-            tracing::warn!(%intent_id, "could not withdraw the room proposal: {e}");
+    pub async fn withdraw(&self, node: &dyn Node, topic: &str, intent_id: &str) {
+        let _seat = self.agent.lock().await;
+        withdraw_now(node, topic, intent_id).await;
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(intent_id);
+    }
+
+    /// End room approval: once no proposal is in flight, run `before`, take
+    /// back every proposal this seat made that was neither sent nor withdrawn,
+    /// and stop the seat with `stop`. A proposal started meanwhile waits, then
+    /// finds the seat gone.
+    pub async fn shut(
+        &self,
+        node: &dyn Node,
+        before: impl FnOnce(),
+        stop: impl std::future::Future<Output = ()>,
+    ) {
+        let mut agent = self.agent.lock().await;
+        before();
+        let open = std::mem::take(&mut *self.open.lock().unwrap_or_else(|e| e.into_inner()));
+        let used = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (intent_id, topic) in open {
+            if !used.contains(&intent_id) {
+                withdraw_now(node, &topic, &intent_id).await;
+            }
         }
+        // Stopped, the seat must be checked again before it proposes.
+        *agent = None;
+        stop.await;
+    }
+
+    /// Join `topic`: accept an invite, or make a joined room active.
+    pub async fn join(&self, node: &dyn Node, topic: &str) -> Result<(), String> {
+        crate::guard::validate_topic(topic)?;
+        let _seat = self.agent.lock().await;
+        muster(node, "coordinate_join", &[topic]).await.map(|_| ())
+    }
+
+    /// The members of `topic`, a room the seat is in, as their `ed:` keys with
+    /// any alias, and which of them is the agent.
+    pub async fn members(&self, node: &dyn Node, topic: &str) -> Result<Vec<Value>, String> {
+        let _seat = self.agent.lock().await;
+        let identity = muster(node, "identity", &[]).await?;
+        let agent = text(&identity, "ed25519").to_ascii_lowercase();
+        activate(node, topic).await?;
+        let members = muster(node, "coordinate_members", &[]).await?;
+        Ok(members
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let key = member_key(text(m, "identity"))?;
+                Some(json!({
+                    "key": format!("ed:{key}"),
+                    "alias": m["alias"],
+                    "agent": key == agent,
+                }))
+            })
+            .collect())
     }
 
     /// Spend proposal `intent_id`'s approval: false when it was already spent.
