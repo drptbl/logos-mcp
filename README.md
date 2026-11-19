@@ -299,7 +299,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - room approval never uses your own Muster: proposals come only from the agent's own seat, and without one they're refused
 - with room approval, `wallet_transfer` over the limit sends only what trusted people approved in the room, read from the agent's own Muster. No tool approves anything
 - `wallet_faucet` only pays into the agent's own public accounts
-- `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest
+- `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest. Once anyone removes that content, the record ends, so the same file stored again later is whoever stored it
 - `wallet_transfer` only sends from the agent wallet: the one this server opened, or the configured wallet found already open, with exactly its accounts on its sequencer. If `lez_core` has another wallet open, it refuses
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
 - only the Agent Access app can read the token, flip the tool switches or read the activity through the module

@@ -21,6 +21,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 pub const MAX_MESSAGES_PER_TOPIC: usize = 256;
 pub const MAX_TRACKED_SENDS: usize = 1024;
 pub const MAX_TRACKED_TRANSFERS: usize = 256;
+/// Removals remembered, each CID's latest: enough that the agent's content
+/// records are checked against them long after.
+const MAX_REMOVALS: usize = 4096;
 /// Finalized chain blocks kept for chain_events, newest last.
 pub const MAX_CHAIN_EVENTS: usize = 256;
 
@@ -58,6 +61,10 @@ pub struct SendStatus {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Transfer {
+    /// When it finished, in milliseconds since the Unix epoch: what its
+    /// content is recorded as stored at, however late the recorder looks.
+    #[serde(skip)]
+    pub done_at_ms: Option<u64>,
     pub kind: String,
     pub done: bool,
     pub success: Option<bool>,
@@ -80,6 +87,10 @@ struct Inner {
     /// which can push the agent's out of `transfers`.
     started: HashMap<String, ()>,
     started_order: VecDeque<String>,
+    /// When each CID was last removed from local storage, by anyone, in
+    /// milliseconds since the Unix epoch.
+    removed: HashMap<String, u64>,
+    removed_order: VecDeque<String>,
     next_chain_seq: u64,
     lib_blocks: VecDeque<ChainBlock>,
     /// The newest seq dropped from each topic's buffer, to tell a reader it missed some.
@@ -102,7 +113,11 @@ pub enum Cursor {
 #[derive(Default)]
 pub struct EventStore {
     inner: Mutex<Inner>,
+    /// Told of each finished removal: the CID and when, in milliseconds.
+    on_removed: Mutex<Vec<RemovalHook>>,
 }
+
+type RemovalHook = Box<dyn Fn(&str, u64) + Send + Sync>;
 
 fn arg(data: &Value, i: usize) -> Option<&Value> {
     data.get(format!("arg{i}"))
@@ -165,6 +180,10 @@ impl EventStore {
     }
 
     fn apply(&self, event: &str, data: &Value) {
+        if event == "storageRemoveDone" {
+            self.removed(data);
+            return;
+        }
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
         match event {
@@ -282,6 +301,7 @@ impl EventStore {
                 }
                 if event.ends_with("Done") {
                     t.done = true;
+                    t.done_at_ms = Some(unix_ms());
                     t.success = p.get("success").and_then(Value::as_bool);
                 }
             }
@@ -406,6 +426,40 @@ impl EventStore {
         }
     }
 
+    /// Note a finished removal, then tell whoever asked, outside the lock.
+    fn removed(&self, data: &Value) {
+        let Some(p) = arg_str(data, 0).and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+            return;
+        };
+        let (Some(true), Some(cid)) = (
+            p.get("success").and_then(Value::as_bool),
+            p.get("cid").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let at = unix_ms();
+        {
+            let mut s = self.inner.lock().unwrap();
+            let s = &mut *s;
+            track(&mut s.removed, &mut s.removed_order, cid, MAX_REMOVALS);
+            s.removed.insert(cid.to_string(), at);
+        }
+        for hook in self.on_removed.lock().unwrap().iter() {
+            hook(cid, at);
+        }
+    }
+
+    /// Call `hook` with the CID and time of every removal from now on.
+    pub fn on_removed(&self, hook: impl Fn(&str, u64) + Send + Sync + 'static) {
+        self.on_removed.lock().unwrap().push(Box::new(hook));
+    }
+
+    /// When `cid` was last removed from local storage, in milliseconds since
+    /// the Unix epoch, if this store saw it go.
+    pub fn removed_at_ms(&self, cid: &str) -> Option<u64> {
+        self.inner.lock().unwrap().removed.get(cid).copied()
+    }
+
     /// Whether a server sharing this store started `session_id`.
     pub fn started_here(&self, session_id: &str) -> bool {
         self.inner.lock().unwrap().started.contains_key(session_id)
@@ -481,6 +535,14 @@ pub fn spawn_watcher(
             backoff = (backoff * 2).min(Duration::from_secs(4));
         }
     });
+}
+
+/// Milliseconds since the Unix epoch.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

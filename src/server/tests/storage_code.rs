@@ -409,11 +409,19 @@ fn storage_server_with_wallet(
     root: &std::path::Path,
     wallet_dir: &std::path::Path,
 ) -> (LogosServer, Arc<EventStore>) {
-    let (mut s, events) = storage_server(fake, root);
-    s.settings.wallet = Some(WalletMode::Dedicated(WalletPaths {
+    // Built with its wallet, so its record is kept where the server watches.
+    let events = Arc::new(EventStore::default());
+    let mut settings = server(FakeRunner::with(vec![]), None).settings.clone();
+    settings.wallet = Some(WalletMode::Dedicated(WalletPaths {
         config: wallet_dir.join("wallet_config.json"),
         storage: wallet_dir.join("storage.json"),
     }));
+    let s = LogosServer::new(
+        Arc::new(Logosctl::new(fake)),
+        events.clone(),
+        Some(FilesRoot::new(root).unwrap()),
+        settings,
+    );
     (s, events)
 }
 
@@ -604,5 +612,158 @@ async fn a_removal_is_forgotten_as_soon_as_it_is_asked_for() {
         .await
         .unwrap();
     assert!(!is_error(&r), "{}", text(&r));
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+/// Storage reports a finished removal, whoever asked for it.
+fn removed(events: &EventStore, cid: &str) {
+    emit(
+        events,
+        "storageRemoveDone",
+        json!({ "success": true, "cid": cid }),
+    );
+}
+
+fn listed(cid: &str) -> crate::logosctl::RawOutput {
+    storage(
+        "manifests",
+        &json!([{ "cid": cid, "datasetSize": 6, "filename": "users.txt" }]).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn content_removed_by_the_user_and_stored_again_is_theirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![listed(CID)]);
+    let (s, events) = storage_server_with_wallet(fake.clone(), dir.path(), wallet.path());
+    s.remember_cid(CID, "upload").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // The user removes it in Basecamp, then stores the same file again.
+    removed(&events, CID);
+    let b = body(&s.storage_manifests().await.unwrap());
+    assert_eq!(b["count"], 0, "{b}");
+    let r = s
+        .storage_remove(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(!called(&fake, "remove"));
+    // The claim is gone for good, also for a server that starts later.
+    let (again, _) =
+        storage_server_with_wallet(FakeRunner::with(vec![]), dir.path(), wallet.path());
+    assert!(!again.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn the_agent_storing_it_again_after_a_removal_makes_it_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, events) = storage_server(FakeRunner::with(vec![]), dir.path());
+    s.remember_cid(CID, "upload").unwrap();
+    removed(&events, CID);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    s.remember_cid(CID, "upload").unwrap();
+    assert!(s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn a_removal_of_other_content_leaves_the_agents_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, events) = storage_server(FakeRunner::with(vec![]), dir.path());
+    s.remember_cid(CID, "upload").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    removed(&events, OTHER_CID);
+    emit(
+        &events,
+        "storageRemoveDone",
+        json!({ "success": false, "cid": CID, "error": "busy" }),
+    );
+    assert!(s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn content_seen_gone_from_storage_loses_its_claim() {
+    // Removed while no server watched: seeing it gone is enough.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![storage("manifests", "[]")]);
+    let (s, _events) = storage_server(fake, dir.path());
+    s.remember_cid(CID, "upload").unwrap();
+    s.storage_manifests().await.unwrap();
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn a_removal_ends_the_claim_at_once_even_across_a_restart() {
+    // Seen, then the server stops before the agent looks again.
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = tempfile::tempdir().unwrap();
+    let (s, events) =
+        storage_server_with_wallet(FakeRunner::with(vec![]), dir.path(), wallet.path());
+    s.remember_cid(CID, "upload").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    removed(&events, CID);
+    drop(s);
+    let (again, _) =
+        storage_server_with_wallet(FakeRunner::with(vec![]), dir.path(), wallet.path());
+    assert!(!again.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_removed_before_it_was_recorded_is_never_the_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("out.txt"), b"result").unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("manifests", "[]"),
+        storage("uploadUrl", r#""93""#),
+    ]);
+    let (s, events) = storage_server(fake, dir.path());
+    s.storage_upload(Parameters(UploadParams {
+        path: "out.txt".into(),
+    }))
+    .await
+    .unwrap();
+    // Done, then removed by the user before the recorder looks.
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "93", "success": true, "cid": CID }),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    removed(&events, CID);
+    // The recorder looks a little later.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!s.is_own_cid(CID).unwrap());
+}
+
+#[tokio::test]
+async fn a_removal_ends_the_claim_even_when_the_record_cannot_be_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![]);
+    let (s, events) = storage_server_with_wallet(fake.clone(), dir.path(), wallet.path());
+    s.remember_cid(CID, "upload").unwrap();
+    std::fs::write(wallet.path().join(AGENT_CIDS), "{").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    removed(&events, CID);
+    let r = s
+        .storage_remove(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(!called(&fake, "remove"));
+}
+
+#[tokio::test]
+async fn content_found_missing_loses_its_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, _events) = storage_server(
+        FakeRunner::with(vec![storage("exists", "false")]),
+        dir.path(),
+    );
+    s.remember_cid(CID, "upload").unwrap();
+    s.storage_exists(Parameters(CidParams { cid: CID.into() }))
+        .await
+        .unwrap();
     assert!(!s.is_own_cid(CID).unwrap());
 }
