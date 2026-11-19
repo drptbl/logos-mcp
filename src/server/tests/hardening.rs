@@ -79,8 +79,54 @@ async fn a_reader_is_told_when_messages_were_dropped() {
     for n in 0..(crate::events::MAX_MESSAGES_PER_TOPIC as u64 + 5) {
         receive(&events, n, format!("m{n}").as_bytes());
     }
-    let b = body(&reader(events).messaging_read(read(Some(1))).await.unwrap());
+    // A reader that had the very first one.
+    let first = events.read(TOPIC, 0, usize::MAX).1[0].seq;
+    let first_before_drops = first - 5;
+    let b = body(
+        &reader(events)
+            .messaging_read(read(Some(first_before_drops)))
+            .await
+            .unwrap(),
+    );
     assert!(b["note"].as_str().unwrap().contains("dropped"), "{b}");
+}
+
+#[tokio::test]
+async fn a_reader_from_before_a_restart_is_told_even_once_overtaken() {
+    // The old run handed out a few seqs; the new one already had more.
+    let before = EventStore::default();
+    for n in 0..3 {
+        receive(&before, n, b"old run");
+    }
+    let seen = before.read(TOPIC, 0, usize::MAX).1.last().unwrap().seq;
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let events = Arc::new(EventStore::default());
+    for n in 0..10 {
+        receive(&events, 100 + n, b"new run");
+    }
+    let b = body(
+        &reader(events)
+            .messaging_read(read(Some(seen)))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["messages"].as_array().unwrap().len(), 10, "{b}");
+    assert!(b["note"].as_str().unwrap().contains("restarted"), "{b}");
+}
+
+#[tokio::test]
+async fn chain_readers_from_before_a_restart_are_told_even_once_overtaken() {
+    let before = EventStore::default();
+    lib_block(&before, 1);
+    let seen = before.lib_blocks(0, usize::MAX).1[0].seq;
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let events = EventStore::default();
+    for h in 0..5 {
+        lib_block(&events, 10 + h);
+    }
+    let (cursor, blocks) = events.lib_blocks(seen, usize::MAX);
+    assert_eq!(cursor, Cursor::Restarted);
+    assert_eq!(blocks.len(), 5);
 }
 
 fn lib_block(events: &EventStore, height: u64) {
@@ -105,13 +151,16 @@ async fn chain_events_start_over_after_a_restart_and_report_drops() {
     assert_eq!(b["events"].as_array().unwrap().len(), 1, "{b}");
     assert!(b["note"].as_str().unwrap().contains("restarted"), "{b}");
 
+    let first = events.lib_blocks(0, 1).1[0].seq;
     for h in 2..(crate::events::MAX_CHAIN_EVENTS as u64 + 10) {
         lib_block(&events, h);
     }
     let b = body(
-        &s.chain_events(Parameters(ChainEventsParams { after_seq: Some(2) }))
-            .await
-            .unwrap(),
+        &s.chain_events(Parameters(ChainEventsParams {
+            after_seq: Some(first),
+        }))
+        .await
+        .unwrap(),
     );
     assert!(b["note"].as_str().unwrap().contains("dropped"), "{b}");
 }

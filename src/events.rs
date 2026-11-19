@@ -76,6 +76,10 @@ pub struct Transfer {
 
 #[derive(Default)]
 struct Inner {
+    /// Where this run's seqs begin: its start time in milliseconds, times
+    /// 1000. A later run starts above anything an earlier one handed out, so
+    /// a reader's after_seq from before a restart is always below it.
+    run_base: u64,
     next_seq: u64,
     topics: HashMap<String, VecDeque<ReceivedMessage>>,
     sends: HashMap<String, SendStatus>,
@@ -110,11 +114,26 @@ pub enum Cursor {
     Dropped,
 }
 
-#[derive(Default)]
 pub struct EventStore {
     inner: Mutex<Inner>,
     /// Told of each finished removal: the CID and when, in milliseconds.
     on_removed: Mutex<Vec<RemovalHook>>,
+}
+
+impl Default for EventStore {
+    fn default() -> Self {
+        // Under 2^53 for centuries, so JSON clients read seqs exactly.
+        let run_base = unix_ms().saturating_mul(1000);
+        Self {
+            inner: Mutex::new(Inner {
+                run_base,
+                next_seq: run_base,
+                next_chain_seq: run_base,
+                ..Inner::default()
+            }),
+            on_removed: Mutex::default(),
+        }
+    }
 }
 
 type RemovalHook = Box<dyn Fn(&str, u64) + Send + Sync>;
@@ -361,7 +380,7 @@ impl EventStore {
     /// restart. Checked and read in one step, so no drop slips between them.
     pub fn read(&self, topic: &str, after: u64, limit: usize) -> (Cursor, Vec<ReceivedMessage>) {
         let s = self.inner.lock().unwrap();
-        let cursor = if after > s.next_seq {
+        let cursor = if after > s.next_seq || (after != 0 && after < s.run_base) {
             Cursor::Restarted
         } else if s.dropped_upto.get(topic).is_some_and(|d| after < *d) {
             Cursor::Dropped
@@ -391,7 +410,7 @@ impl EventStore {
     /// with where `after` stood, as `read` does for messages.
     pub fn lib_blocks(&self, after: u64, limit: usize) -> (Cursor, Vec<ChainBlock>) {
         let s = self.inner.lock().unwrap();
-        let cursor = if after > s.next_chain_seq {
+        let cursor = if after > s.next_chain_seq || (after != 0 && after < s.run_base) {
             Cursor::Restarted
         } else if after < s.chain_dropped_upto {
             Cursor::Dropped
