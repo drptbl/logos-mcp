@@ -249,10 +249,10 @@ fn error_json(e: impl std::fmt::Display) -> String {
 }
 
 /// The only module allowed to read the token, change permissions or read activity:
-/// the Agent app's backend. Anything else, including an unnamed caller, is refused.
+/// the Agent Access app's backend. Anything else, including an unnamed caller, is refused.
 const APP_BACKEND: &str = "logos_mcp_app_backend";
 
-/// `f` on the control surface, for the Agent app only.
+/// `f` on the control surface, for the Agent Access app only.
 fn for_app(f: impl FnOnce(&Control) -> Result<Value, String>) -> String {
     if !logos_rust_sdk::current_caller().is_module(APP_BACKEND) {
         // Visible in Basecamp's log, so a module probing for the token shows up.

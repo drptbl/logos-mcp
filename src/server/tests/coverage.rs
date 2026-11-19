@@ -1056,7 +1056,7 @@ async fn without_lez_faucet_the_faucet_says_where_to_get_it() {
     assert!(text(&r).contains("LEZ Faucet"), "{}", text(&r));
 }
 
-/// A server running inside Basecamp, where the AI Agent app answers approvals.
+/// A server running inside Basecamp, where the Agent Access app answers approvals.
 fn hosted_server(fake: Arc<FakeRunner>) -> LogosServer {
     let mut s = server(fake, None);
     s.settings.host_owns_messaging = true;

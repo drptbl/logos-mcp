@@ -36,7 +36,7 @@ use crate::{
 pub const DEFAULT_PORT: u16 = 8765;
 /// The bearer token, in the module's data folder, readable by this user only.
 pub const TOKEN_FILE: &str = "token";
-/// Settings the user (and later the Agent app) can edit, in the module's data folder.
+/// Settings the user (and later the Agent Access app) can edit, in the module's data folder.
 pub const CONFIG_FILE: &str = "config.json";
 /// The agent's own logosctl session for Muster, in the module's data folder.
 pub const AGENT_SEAT_DIR: &str = "agent-seat";
@@ -148,7 +148,7 @@ pub struct ModuleConfig {
     pub files_root: Option<PathBuf>,
     /// Discovery peers as `/.../p2p/<peer id>` multiaddrs. Discovery tools are off without them.
     pub discovery_bootstrap: Vec<String>,
-    /// The tool groups the agent may use, switched from the Agent app.
+    /// The tool groups the agent may use, switched from the Agent Access app.
     pub tools: ToolGroups,
     /// Who approves each wallet's transfers. Missing from configs written
     /// before 0.10: then the tools' "ask before transfer" switch decides.
@@ -234,7 +234,7 @@ fn saved_policy(config: &ModuleConfig) -> ApprovalPolicy {
     }
 }
 
-/// What the Agent app reads and changes: the endpoint and its token, the tool
+/// What the Agent Access app reads and changes: the endpoint and its token, the tool
 /// groups the agent may use, and the record of its calls.
 pub struct Control {
     dir: PathBuf,
@@ -343,7 +343,7 @@ impl Control {
         self.policy.subscribe()
     }
 
-    /// Replace the approval policy, from the Agent app's JSON: refused unless
+    /// Replace the approval policy, from the Agent Access app's JSON: refused unless
     /// it can be followed, then saved and applied at once, to waiting room
     /// requests too. The old ask switch is kept in step for older apps.
     pub fn set_approval_policy(&self, json: &str) -> Result<Value, String> {
@@ -360,7 +360,7 @@ impl Control {
         let config = ModuleConfig::load_or_create(&self.dir)?;
         if policy.uses_room() && !config.agent_seat {
             return Err(
-                "room approval is off: turn it on in the AI Agent app before a tier asks the room"
+                "room approval is off: turn it on in the Agent Access app before a tier asks the room"
                     .into(),
             );
         }

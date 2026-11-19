@@ -1,6 +1,6 @@
 {
   "name": "logos_mcp_app",
-  "display_name": "AI Agent",
+  "display_name": "Agent Access",
   "version": "0.12.0",
   "type": "ui_qml",
   "interface": "universal",
