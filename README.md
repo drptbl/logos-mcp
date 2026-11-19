@@ -238,7 +238,7 @@ Room approval is off until you turn it on, and Muster is never touched while it'
 
 Turning it on needs `logosctl` installed:
 
-1. Turn on room approval => the module makes a `logosctl` session in its data folder, installs Muster and the six modules it needs from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`), and runs it while the module runs
+1. Turn on room approval => the module makes a `logosctl` session in its data folder, installs Muster `0.3.5` from Muster's catalogue (`https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json`) and the six modules it needs from the signed Logos catalogue, and runs it while the module runs. That catalogue is unsigned and follows Muster's main branch, so logos-mcp pins Muster's build by its root hash: it installs and loads no other, and a newer Muster comes with a logos-mcp release
 2. Copy the invite id and invite the agent into your room from Muster's app, then press Join next to the invite
 3. Pick the room, tick who's trusted (you by default), set how many approvals are needed and the tiers, then Save
 
@@ -253,7 +253,7 @@ Give the agent's `logosctl` session its own Muster:
 ```bash
 logosctl -D -d
 logosctl catalog add https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json
-logosctl package install muster_module --no-optional -y
+logosctl package install muster_module --version 0.3.5 --no-optional -y
 logosctl module load muster_module --no-optional
 logosctl call muster_module coordinate_start_inbox
 ```
