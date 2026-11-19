@@ -4740,13 +4740,11 @@ impl LogosServer {
         &self,
         Parameters(p): Parameters<SessionParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.events.transfer(&p.session_id) {
-            // The store also sees the user's transfers in Basecamp: those read as
-            // unknown, so their CIDs stay theirs.
-            Some(t) if self.events.started_here(&p.session_id) => {
-                ok(serde_json::to_value(t).unwrap_or(Value::Null))
-            }
-            _ => fail(format!("unknown session {}", p.session_id)),
+        // The store also sees the user's transfers in Basecamp: those read as
+        // unknown, so their CIDs stay theirs.
+        match self.events.agent_transfer(&p.session_id) {
+            Some(t) => ok(serde_json::to_value(t).unwrap_or(Value::Null)),
+            None => fail(format!("unknown session {}", p.session_id)),
         }
     }
 

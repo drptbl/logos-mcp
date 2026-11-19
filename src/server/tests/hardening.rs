@@ -730,3 +730,60 @@ async fn a_waited_download_over_its_cap_drops_what_it_fetched() {
     assert!(waited.await.unwrap().is_err());
     assert!(called(&fake, "remove"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_users_later_download_of_the_same_cid_stays_theirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+    ]);
+    let (s, events) = files_server(fake, dir.path());
+    s.storage_download(download(None)).await.unwrap();
+    std::fs::write(dir.path().join("in.bin"), vec![1u8; 300]).unwrap();
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 300, "total": 300, "success": true }),
+    );
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Days later the user fetches the same CID in Basecamp: same session id.
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 77, "total": 300, "success": true }),
+    );
+    let b = transfer_status(&s, CID).await;
+    let b = body(&b);
+    assert_eq!(b["done"], true, "{b}");
+    assert_eq!(
+        b["bytes"], 300,
+        "the agent sees its own download, not theirs: {b}"
+    );
+}
+
+#[tokio::test]
+async fn the_agent_downloading_a_cid_again_sees_the_new_run() {
+    let events = EventStore::default();
+    events.reset_transfer(CID, "download");
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": false, "error": "gone" }),
+    );
+    assert_eq!(events.agent_transfer(CID).unwrap().success, Some(false));
+    events.reset_transfer(CID, "download");
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 5, "total": 9, "success": true }),
+    );
+    let t = events.agent_transfer(CID).unwrap();
+    assert!(!t.done, "{t:?}");
+    assert_eq!(t.bytes, Some(5));
+}
