@@ -163,6 +163,7 @@ async fn an_agent_download_over_its_cap_is_stopped_and_removed() {
         storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
         storage("downloadCancel", "null"),
+        storage("remove", "null"),
     ]);
     let (s, events) = files_server(fake.clone(), dir.path());
     let r = s.storage_download(download(Some(1_000))).await.unwrap();
@@ -177,6 +178,8 @@ async fn an_agent_download_over_its_cap_is_stopped_and_removed() {
     assert!(called(&fake, "downloadCancel"));
     assert!(!dir.path().join("in.bin").exists());
     assert!(!s.is_own_cid(CID).unwrap());
+    // What it fetched leaves storage too: the cap bounds the disk, not just the file.
+    assert!(called(&fake, "remove"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -603,4 +606,78 @@ async fn a_download_that_never_started_grants_no_view_of_the_cid() {
     );
     let r = transfer_status(&s, CID).await;
     assert!(is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_capped_download_of_content_already_stored_leaves_it_stored() {
+    // Held before: the blocks are the user's.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "true"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 65536, "total": 5_000_000, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(called(&fake, "downloadCancel"));
+    assert!(!called(&fake, "remove"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_download_over_its_cap_drops_what_it_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("remove", "null"),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    std::fs::write(dir.path().join("in.bin"), vec![1u8; 5_000]).unwrap();
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!called(&fake, "downloadCancel"));
+    assert!(called(&fake, "remove"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waited_download_over_its_cap_drops_what_it_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+        storage("remove", "null"),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    let waited = tokio::spawn({
+        let s = s.clone();
+        async move {
+            s.download_to(
+                CID,
+                "in.bin",
+                Some(1_000),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 65536, "total": 5_000_000, "success": true }),
+    );
+    assert!(waited.await.unwrap().is_err());
+    assert!(called(&fake, "remove"));
 }

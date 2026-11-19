@@ -228,6 +228,9 @@ struct DownloadGuard {
     full: PathBuf,
     keys: [String; 2],
     done: bool,
+    /// Whether local storage held the content before this download: then
+    /// its blocks are the user's and stay. Taken as held until known.
+    held: bool,
 }
 
 impl DownloadGuard {
@@ -241,7 +244,7 @@ impl DownloadGuard {
     /// was left behind.
     async fn cancel_and_remove(&mut self) -> String {
         self.done = true;
-        let left = cleanup_download(&self.server, &self.cid, &self.full).await;
+        let left = cleanup_download(&self.server, &self.cid, &self.full, self.held).await;
         self.release();
         left
     }
@@ -249,9 +252,12 @@ impl DownloadGuard {
     /// Remove the file of a transfer that already finished, with no cancel: by
     /// CID it could only reach someone else's new download. Releases the
     /// reservation and says whether the file is gone.
-    fn remove_finished(&mut self) -> bool {
+    async fn remove_finished(&mut self) -> bool {
         self.done = true;
         let removed = remove_inside(&self.server, &self.full);
+        if !self.held {
+            drop_fetched(&self.server, &self.cid).await;
+        }
         self.release();
         removed
     }
@@ -275,15 +281,16 @@ impl Drop for DownloadGuard {
         }
         // The caller stopped waiting: finish the cleanup without it, then free
         // the CID and the path, so a retry can't share the old transfer.
-        let (server, cid, full, keys) = (
+        let (server, cid, full, keys, held) = (
             self.server.clone(),
             self.cid.clone(),
             self.full.clone(),
             self.keys.clone(),
+            self.held,
         );
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_download(&server, &cid, &full).await;
+                cleanup_download(&server, &cid, &full, held).await;
                 let mut held = server.downloads.lock().unwrap_or_else(|e| e.into_inner());
                 for k in &keys {
                     held.remove(k);
@@ -296,14 +303,19 @@ impl Drop for DownloadGuard {
 }
 
 /// Cancel a download and remove its file, but only while the file's folder still
-/// resolves inside the files root. Says what was left behind.
-async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path) -> String {
+/// resolves inside the files root. Unless local storage `held` the content
+/// before, what it fetched is removed from storage too, so a stopped download
+/// leaves nothing on disk. Says what was left behind.
+async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path, held: bool) -> String {
     let cancelled = server
         .node
         .call(STORAGE, "downloadCancel", &[Arg::str(cid)])
         .await
         .is_ok()
         || server.events.transfer(cid).is_some_and(|t| t.done);
+    if !held {
+        drop_fetched(server, cid).await;
+    }
     match (cancelled, remove_inside(server, full)) {
         (true, true) => "nothing was kept".into(),
         (false, true) => format!(
@@ -311,6 +323,14 @@ async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path) -> Strin
             full.display()
         ),
         (_, false) => format!("{} could not be removed", full.display()),
+    }
+}
+
+/// Remove from local storage what a discarded download of `cid` fetched,
+/// best effort: storage removes in the background.
+async fn drop_fetched(server: &LogosServer, cid: &str) {
+    if let Err(e) = server.node.call(STORAGE, "remove", &[Arg::str(cid)]).await {
+        tracing::warn!("could not remove what the download of {cid} fetched: {e}");
     }
 }
 
@@ -4580,7 +4600,10 @@ impl LogosServer {
         let full = self.files()?.new_file(path)?;
         let mut running = self.reserve_download(cid, &full)?;
         let (session, held) = match self.start_download(cid, path, false).await {
-            Ok((session, _, held)) => (session, held),
+            Ok((session, _, held)) => {
+                running.held = held;
+                (session, held)
+            }
             // The module may have started it all the same: stop it and clean up.
             Err(e) => {
                 running.cancel_and_remove().await;
@@ -4640,6 +4663,7 @@ impl LogosServer {
             full: full.to_path_buf(),
             keys,
             done: false,
+            held: true,
         })
     }
 
@@ -4848,6 +4872,7 @@ impl LogosServer {
     /// local storage held the content already.
     fn follow_download(&self, session: String, mut running: DownloadGuard, cap: u64, held: bool) {
         let server = self.clone();
+        running.held = held;
         tokio::spawn(async move {
             let cid = running.cid.clone();
             let over_cap = |t: &crate::events::Transfer| {
@@ -4861,7 +4886,7 @@ impl LogosServer {
                 Ok(t) if t.success == Some(true) => match std::fs::metadata(&running.full) {
                     Ok(m) if m.len() > cap => {
                         let size = m.len();
-                        let removed = running.remove_finished();
+                        let removed = running.remove_finished().await;
                         format!(
                             "{size} bytes, over the {cap} byte cap: {}",
                             if removed {
