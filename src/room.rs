@@ -573,8 +573,14 @@ impl Room {
             .and_then(|i| i.get("approvals").and_then(Value::as_u64))
             .unwrap_or(0);
         if approved_before > 0 {
+            // Not this request's: closed, so nothing about it stays open as the agent's.
+            withdraw_now(node, &room.topic, &id).await;
+            self.open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
             return Err(format!(
-                "the room proposal {id} already had approvals before this one: nothing was proposed"
+                "the room proposal {id} already had approvals before this one, so it was withdrawn: nothing was proposed"
             ));
         }
         let said = format!("[logos-mcp] proposal {id}: {}", call.note);
@@ -727,6 +733,17 @@ impl Room {
                 }))
             })
             .collect())
+    }
+
+    /// The proposals this seat made and hasn't withdrawn.
+    #[cfg(test)]
+    pub fn open_proposals(&self) -> Vec<String> {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Spend proposal `intent_id`'s approval: false when it was already spent.

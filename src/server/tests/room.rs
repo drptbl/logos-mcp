@@ -680,6 +680,12 @@ async fn a_proposal_that_already_had_approvals_is_refused() {
     assert!(is_error(&r));
     assert!(text(&r).contains("already had approvals"), "{}", text(&r));
     assert!(runner.muster_calls("coordinate_contribute").is_empty());
+    // Withdrawn, so the room sees it closed and the seat no longer counts it its own.
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+    assert!(s.room.open_proposals().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
