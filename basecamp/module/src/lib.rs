@@ -39,6 +39,8 @@ const WATCHED: &[(&str, &[&str])] = &[
             "storageUploadDone",
             "storageDownloadProgress",
             "storageDownloadDone",
+            // Ends the agent's claim on content anyone removes.
+            "storageRemoveDone",
         ],
     ),
     // Each new finalized tip, for chain_events. Subscribed again until the

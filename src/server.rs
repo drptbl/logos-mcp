@@ -1,7 +1,7 @@
 //! MCP tools over a running Logos node: status, messaging and storage.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -329,6 +329,33 @@ fn remove_inside(server: &LogosServer, full: &Path) -> bool {
         }
 }
 
+/// Forget the agent's record of `cid`, all of it or with `made_by` only one
+/// made at or before that time (milliseconds). Memory first: an unreadable
+/// record next to the wallet then leaves no claim behind, only a refusal.
+fn forget_record(
+    own: &std::sync::Mutex<BTreeMap<String, u64>>,
+    file: Option<&Path>,
+    cid: &str,
+    made_by: Option<u64>,
+) -> Result<(), String> {
+    let stale = |at: u64| made_by.is_none_or(|by| at <= by);
+    let mut own = own.lock().unwrap_or_else(|e| e.into_inner());
+    if own.get(cid).is_some_and(|at| stale(*at)) {
+        own.remove(cid);
+    }
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let mut map: BTreeMap<String, Value> = guard::read_side_map(Some(file.to_path_buf()))
+        .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
+    if map.get(cid).is_some_and(|r| stale(recorded_ms(r))) {
+        map.remove(cid);
+        let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+        guard::write_private(file, &text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// The dedicated wallet this server opened or adopted: the sequencer it was on
 /// and its accounts. A wallet open later counts as it only with both the same.
 #[derive(Debug, Clone)]
@@ -406,7 +433,8 @@ pub struct LogosServer {
     /// at once would share one transfer record.
     downloads: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// The agent's own content, for when no wallet gives AGENT_CIDS a home.
-    own_cids: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// CID to when it was stored, in milliseconds.
+    own_cids: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
     /// Whether this server listens to blockchain_module's events yet.
     chain_watching: Arc<std::sync::atomic::AtomicBool>,
     /// Held while checking and opening the wallet. The agent wallet's account ids
@@ -793,9 +821,15 @@ async fn sequencer_call(url: String, method: &'static str, params: Value) -> Res
 
 /// Milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    crate::events::unix_ms()
+}
+
+/// When a content record says the agent stored it, in milliseconds. Records
+/// from before 0.10.2 have whole seconds only.
+fn recorded_ms(record: &Value) -> u64 {
+    record["at_ms"]
+        .as_u64()
+        .or_else(|| record["at"].as_u64().map(|s| s.saturating_mul(1000)))
         .unwrap_or_default()
 }
 
@@ -1049,7 +1083,7 @@ impl LogosServer {
         files: Option<FilesRoot>,
         settings: NodeSettings,
     ) -> Self {
-        Self {
+        let server = Self {
             node,
             events,
             files,
@@ -1072,7 +1106,16 @@ impl LogosServer {
             muster: None,
             watching: std::sync::OnceLock::new(),
             tool_router: Self::tool_router(),
-        }
+        };
+        // A removal, by anyone, ends the agent's claim at once and on disk, so
+        // a restart or a full event store can't revive it.
+        let (own, file) = (server.own_cids.clone(), server.wallet_side_file(AGENT_CIDS));
+        server.events.on_removed(move |cid, at| {
+            if let Err(e) = forget_record(&own, file.as_deref(), cid, Some(at)) {
+                tracing::warn!("could not forget the agent's removed content {cid}: {e}");
+            }
+        });
+        server
     }
 
     /// Follow the user's tool-group switches: a change applies to the next list
@@ -4499,7 +4542,7 @@ impl LogosServer {
                 let cid = t
                     .cid
                     .ok_or_else(|| "the upload finished without a CID".to_string())?;
-                self.record_upload(&cid, held.as_ref());
+                self.record_upload(&cid, held.as_ref(), t.done_at_ms);
                 Ok(cid)
             }
             Ok(t) => Err(format!(
@@ -4563,7 +4606,7 @@ impl LogosServer {
                 ),
                 Ok(_) => {
                     running.keep();
-                    if !held && let Err(e) = self.remember_cid(cid, "download") {
+                    if !held && let Err(e) = self.remember_cid_at(cid, "download", t.done_at_ms) {
                         tracing::warn!("could not record the agent's download {cid}: {e}");
                     }
                     return Ok(full);
@@ -4739,7 +4782,7 @@ impl LogosServer {
         }
         // Asked for: the agent's claim ends now, so content stored again later,
         // by the user, never inherits it.
-        if let Err(e) = self.forget_cid(&p.cid) {
+        if let Err(e) = self.forget_cid(&p.cid, None) {
             return fail(format!(
                 "removal asked for, but the record of the agent's content couldn't be updated: {e}"
             ));
@@ -4761,10 +4804,19 @@ impl LogosServer {
         }))
     }
 
-    /// Record `cid` as content the agent put in local storage.
+    /// Record `cid` as content the agent put in local storage now.
+    #[cfg(test)]
     fn remember_cid(&self, cid: &str, via: &str) -> Result<(), String> {
+        self.remember_cid_at(cid, via, None)
+    }
+
+    /// Record `cid` as content the agent put in local storage when its
+    /// transfer finished, `done_at` (milliseconds), or now: a removal after
+    /// that, seen before the recorder looked, still ends the claim.
+    fn remember_cid_at(&self, cid: &str, via: &str, done_at: Option<u64>) -> Result<(), String> {
         let mut own = self.own_cids.lock().unwrap_or_else(|e| e.into_inner());
-        own.insert(cid.to_string());
+        let at = done_at.unwrap_or_else(now_ms);
+        own.insert(cid.to_string(), at);
         let Some(file) = self.wallet_side_file(AGENT_CIDS) else {
             return Ok(());
         };
@@ -4773,27 +4825,22 @@ impl LogosServer {
                 .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
         map.insert(
             cid.to_string(),
-            json!({ "via": via, "at": now_ms() / 1000 }),
+            json!({ "via": via, "at": at / 1000, "at_ms": at }),
         );
         let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
         guard::write_private(&file, &text).map_err(|e| e.to_string())
     }
 
-    /// Forget `cid` once it is gone from local storage.
-    fn forget_cid(&self, cid: &str) -> Result<(), String> {
-        let mut own = self.own_cids.lock().unwrap_or_else(|e| e.into_inner());
-        // The record on disk first: if it can't be updated, nothing is forgotten.
-        if let Some(file) = self.wallet_side_file(AGENT_CIDS) {
-            let mut map: std::collections::BTreeMap<String, Value> =
-                guard::read_side_map(Some(file.clone()))
-                    .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
-            if map.remove(cid).is_some() {
-                let text = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
-                guard::write_private(&file, &text).map_err(|e| e.to_string())?;
-            }
-        }
-        own.remove(cid);
-        Ok(())
+    /// Forget `cid` once it is gone from local storage: every record of it, or
+    /// with `made_by` only one made at or before that time (milliseconds), so
+    /// the agent storing it again meanwhile keeps its new claim.
+    fn forget_cid(&self, cid: &str, made_by: Option<u64>) -> Result<(), String> {
+        forget_record(
+            &self.own_cids,
+            self.wallet_side_file(AGENT_CIDS).as_deref(),
+            cid,
+            made_by,
+        )
     }
 
     /// Follow an agent's download in the background: stop and remove it once
@@ -4826,7 +4873,9 @@ impl LogosServer {
                     }
                     _ => {
                         running.keep();
-                        if !held && let Err(e) = server.remember_cid(&cid, "download") {
+                        if !held
+                            && let Err(e) = server.remember_cid_at(&cid, "download", t.done_at_ms)
+                        {
                             tracing::warn!("could not record the agent's download {cid}: {e}");
                         }
                         return;
@@ -4855,7 +4904,7 @@ impl LogosServer {
                 .await;
             let Ok(t) = done else { return };
             if let (Some(true), Some(cid)) = (t.success, t.cid) {
-                server.record_upload(&cid, held.as_ref());
+                server.record_upload(&cid, held.as_ref(), t.done_at_ms);
             }
         });
     }
@@ -4863,58 +4912,97 @@ impl LogosServer {
     /// Record an uploaded CID as the agent's, unless local storage held it
     /// before the upload or what it held is unknown. Unrecorded, it only can't
     /// be removed later, so a failure never fails the upload.
-    fn record_upload(&self, cid: &str, held: Option<&BTreeSet<String>>) {
+    fn record_upload(&self, cid: &str, held: Option<&BTreeSet<String>>, done_at: Option<u64>) {
         if !held.is_some_and(|held| !held.contains(cid)) {
             return;
         }
-        if let Err(e) = self.remember_cid(cid, "upload") {
+        if let Err(e) = self.remember_cid_at(cid, "upload", done_at) {
             tracing::warn!("could not record the agent's upload {cid}: {e}");
         }
     }
 
-    /// What local storage holds, one manifest per content.
+    /// What local storage holds, one manifest per content. Content the agent
+    /// stored that it no longer holds loses its claim.
     async fn manifests(&self) -> Result<Vec<Value>, String> {
+        let asked_at = now_ms();
         let listed = embedded_json(
             self.node
                 .call(STORAGE, "manifests", &[])
                 .await
                 .map_err(|e| e.to_string())?,
         );
-        match listed {
-            Value::Array(list) => Ok(list),
-            other => Err(format!("unexpected manifests reply: {other}")),
+        let Value::Array(list) = listed else {
+            return Err(format!("unexpected manifests reply: {listed}"));
+        };
+        for cid in self.own_cid_set() {
+            if !list.iter().any(|m| m["cid"].as_str() == Some(&cid)) {
+                self.found_missing(&cid, asked_at);
+            }
+        }
+        Ok(list)
+    }
+
+    /// `cid` was missing from local storage when asked at `asked_at`
+    /// (milliseconds), maybe removed while no server watched: a claim made
+    /// before then ends, so the same content stored again later is never the
+    /// agent's by an old record.
+    fn found_missing(&self, cid: &str, asked_at: u64) {
+        if let Err(e) = self.forget_cid(cid, Some(asked_at)) {
+            tracing::warn!("could not forget the agent's missing content {cid}: {e}");
         }
     }
 
-    /// Every CID the agent put in local storage, read once. An unreadable record
-    /// counts as none, so nothing is marked the agent's by mistake.
-    fn own_cid_set(&self) -> BTreeSet<String> {
+    /// The agent's content still in local storage as far as this server
+    /// knows, CID to when it was stored: this server's memory and the record
+    /// next to the wallet. A record made before its content was last removed,
+    /// by anyone, is forgotten: content stored again later is whoever's stored
+    /// it. Also says when the record next to the wallet can't be read, which
+    /// leaves only memory.
+    fn own_records(&self) -> (BTreeMap<String, u64>, Option<String>) {
         let mut own = self
             .own_cids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Ok(map) = guard::read_side_map::<Value>(self.wallet_side_file(AGENT_CIDS)) {
-            own.extend(map.into_keys());
-        }
-        own
+        let unreadable = match guard::read_side_map::<Value>(self.wallet_side_file(AGENT_CIDS)) {
+            Ok(map) => {
+                for (cid, record) in map {
+                    let at = recorded_ms(&record);
+                    own.entry(cid)
+                        .and_modify(|t| *t = (*t).max(at))
+                        .or_insert(at);
+                }
+                None
+            }
+            Err(e) => Some(format!(
+                "{AGENT_CIDS} next to the wallet can't be read ({e})"
+            )),
+        };
+        own.retain(|cid, at| match self.events.removed_at_ms(cid) {
+            Some(gone) if gone >= *at => {
+                if let Err(e) = self.forget_cid(cid, Some(gone)) {
+                    tracing::warn!("could not forget the agent's removed content {cid}: {e}");
+                }
+                false
+            }
+            _ => true,
+        });
+        (own, unreadable)
     }
 
-    /// Whether the agent put `cid` in local storage, by this server's memory or
-    /// the record next to the wallet.
+    /// Every CID the agent put in local storage. An unreadable record counts
+    /// as none, so nothing is marked the agent's by mistake.
+    fn own_cid_set(&self) -> BTreeSet<String> {
+        self.own_records().0.into_keys().collect()
+    }
+
+    /// Whether the agent put `cid` in local storage.
     fn is_own_cid(&self, cid: &str) -> Result<bool, String> {
-        if self
-            .own_cids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(cid)
-        {
-            return Ok(true);
+        match self.own_records() {
+            (own, _) if own.contains_key(cid) => Ok(true),
+            (_, Some(unreadable)) => Err(unreadable),
+            (_, None) => Ok(false),
         }
-        let map: std::collections::BTreeMap<String, Value> =
-            guard::read_side_map(self.wallet_side_file(AGENT_CIDS))
-                .map_err(|e| format!("{AGENT_CIDS} next to the wallet can't be read ({e})"))?;
-        Ok(map.contains_key(cid))
     }
 
     #[tool(
@@ -4928,8 +5016,14 @@ impl LogosServer {
         if let Err(e) = guard::validate_cid(&p.cid) {
             return fail(e);
         }
+        let asked_at = now_ms();
         match self.node.call(STORAGE, "exists", &[Arg::str(&p.cid)]).await {
-            Ok(v) => ok(json!({ "cid": p.cid, "exists": v })),
+            Ok(v) => {
+                if v == Value::Bool(false) {
+                    self.found_missing(&p.cid, asked_at);
+                }
+                ok(json!({ "cid": p.cid, "exists": v }))
+            }
             Err(e) => logos_fail(e),
         }
     }
