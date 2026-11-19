@@ -434,12 +434,26 @@ fn every_tool_tells_clients_whether_it_changes_anything() {
         }
     }
     for reads in [
-        "wallet_accounts",
         "messaging_read",
-        "chain_info",
         "storage_manifests",
+        "wallet_transfer_status",
     ] {
         assert_eq!(hint(reads).read_only_hint, Some(true), "{reads}");
+    }
+    // Their first call can open the wallet, start discovery or load the chain
+    // module: not read-only, though harmless and safe to repeat.
+    for starts in [
+        "wallet_accounts",
+        "wallet_status",
+        "discovery_lookup",
+        "discovery_peers",
+        "chain_info",
+        "chain_events",
+    ] {
+        let a = hint(starts);
+        assert_eq!(a.read_only_hint, Some(false), "{starts}");
+        assert_eq!(a.destructive_hint, Some(false), "{starts}");
+        assert_eq!(a.idempotent_hint, Some(true), "{starts}");
     }
     for spends in ["wallet_transfer", "chain_transfer", "storage_remove"] {
         assert_eq!(hint(spends).read_only_hint, Some(false), "{spends}");
