@@ -15,6 +15,45 @@ fn muster(method: &str, value: serde_json::Value) -> RawOutput {
 }
 
 const NO_DAEMON: &str = r#"{"daemon":{"reason":"No daemon running"}}"#;
+const OFFICIAL: &str = "https://raw.githubusercontent.com/logos-co/logos-modules-release/refs/heads/main/logos-repo.json";
+
+/// What installing Muster would do: Muster from its catalogue with `root`,
+/// and a dependency from `dep_from`.
+fn plan(root: &str, dep_from: &str) -> RawOutput {
+    out(&serde_json::json!({
+        "status": "ok",
+        "op": "install",
+        "changes": [
+            {"name": "lez_core", "action": "install", "toVersion": "0.5.1",
+             "repository": dep_from, "rootHash": "5f39b202"},
+            {"name": "muster_module", "action": "install", "toVersion": MUSTER_VERSION,
+             "repository": MUSTER_CATALOG, "rootHash": root},
+        ],
+    })
+    .to_string())
+}
+
+/// The pinned plan.
+fn pinned_plan() -> RawOutput {
+    plan(MUSTER_ROOT, OFFICIAL)
+}
+
+/// The installed Muster, with root hash `root` and its manifest as pinned.
+fn installed(root: &str) -> RawOutput {
+    installed_with(root, &MUSTER_DEPENDENCIES, "muster_module_plugin.dylib")
+}
+
+/// The installed Muster, its manifest naming `deps` and loading `main`.
+fn installed_with(root: &str, deps: &[&str], main: &str) -> RawOutput {
+    out(&serde_json::json!({
+        "name": "muster_module", "version": MUSTER_VERSION, "hashes": {"root": root},
+        "dependencies": deps,
+        "mainFilePath": format!("/seat/modules/muster_module/{main}"),
+    })
+    .to_string())
+}
+
+const OTHER_ROOT: &str = "00000000000000000000000000000000000000000000000000000000000000aa";
 const RUNNING: &str = r#"{"daemon":{"pid":4242,"status":"running"},"modules":[]}"#;
 
 /// A seat that outlives the test, as the module's does.
@@ -57,7 +96,9 @@ async fn setting_up_installs_muster_without_its_optional_extras_and_opens_the_in
         out("Daemon started (pid 4242)"),
         out(r#"[{"name":"logos-modules-official","enabled":true}]"#),
         out(r#"{"success":true}"#),
-        out(r#"{"status":"ok"}"#),
+        pinned_plan(),
+        pinned_plan(),
+        installed(MUSTER_ROOT),
         out(r#"{"status":"ok"}"#),
         muster(
             "coordinate_start_inbox",
@@ -74,7 +115,13 @@ async fn setting_up_installs_muster_without_its_optional_extras_and_opens_the_in
             "-D -d".into(),
             "--json catalog ls".into(),
             format!("--json catalog add {MUSTER_CATALOG}"),
-            "--json package install muster_module --no-optional -y".into(),
+            format!(
+                "--json package install muster_module --version {MUSTER_VERSION} --no-optional -y --dry-run"
+            ),
+            format!(
+                "--json package install muster_module --version {MUSTER_VERSION} --no-optional -y"
+            ),
+            "--json package show muster_module".into(),
             "--json module load muster_module --no-optional".into(),
             "--json call muster_module coordinate_start_inbox".into(),
         ]
@@ -85,6 +132,7 @@ async fn setting_up_installs_muster_without_its_optional_extras_and_opens_the_in
 async fn starting_a_running_seat_leaves_its_daemon_and_catalog_alone() {
     let fake = FakeRunner::with(vec![
         out(RUNNING),
+        installed(MUSTER_ROOT),
         out(r#"{"status":"ok"}"#),
         muster(
             "coordinate_start_inbox",
@@ -96,6 +144,7 @@ async fn starting_a_running_seat_leaves_its_daemon_and_catalog_alone() {
         argv(&fake),
         [
             "--json status".to_string(),
+            "--json package show muster_module".into(),
             "--json module load muster_module --no-optional".into(),
             "--json call muster_module coordinate_start_inbox".into(),
         ]
@@ -150,7 +199,8 @@ struct SlowInstall {
 
 impl Runner for SlowInstall {
     fn run(&self, args: Vec<String>) -> crate::logosctl::RunFuture<'_> {
-        let installing = args.iter().any(|a| a == "install");
+        let installing =
+            args.iter().any(|a| a == "install") && !args.iter().any(|a| a == "--dry-run");
         let reply = self.fake.run(args);
         Box::pin(async move {
             if installing {
@@ -167,8 +217,10 @@ async fn while_setting_up_the_status_says_so_and_another_set_up_is_refused() {
         out(NO_DAEMON),
         out("Daemon started (pid 4242)"),
         out(r#"[{"name":"muster","enabled":true}]"#),
-        out(r#"{"status":"ok"}"#), // install, once the gate opens
-        out(NO_DAEMON),            // status, meanwhile
+        pinned_plan(),
+        pinned_plan(),  // install, once the gate opens
+        out(NO_DAEMON), // status, meanwhile
+        installed(MUSTER_ROOT),
         out(r#"{"status":"ok"}"#), // module load
         muster(
             "coordinate_start_inbox",
@@ -189,7 +241,10 @@ async fn while_setting_up_the_status_says_so_and_another_set_up_is_refused() {
     .unwrap();
     // Busy as soon as the call returns, before anything ran.
     assert!(set_up(seat, || Ok(())).is_err());
-    while !argv(&fake).iter().any(|c| c.contains("install")) {
+    while !argv(&fake)
+        .iter()
+        .any(|c| c.contains("install") && !c.contains("--dry-run"))
+    {
         tokio::task::yield_now().await;
     }
     assert_eq!(seat.status().await["setting_up"], true);
@@ -197,10 +252,7 @@ async fn while_setting_up_the_status_says_so_and_another_set_up_is_refused() {
     settled(seat).await;
     assert!(remembered.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(seat.status().await["setup_error"], serde_json::Value::Null);
-    assert_eq!(
-        argv(&fake).iter().filter(|c| c.contains("install")).count(),
-        1
-    );
+    assert_eq!(installs(&argv(&fake)), 1);
 }
 
 #[tokio::test]
@@ -229,7 +281,9 @@ async fn a_seat_installed_but_not_remembered_says_why() {
     let fake = FakeRunner::with(vec![
         out(RUNNING),
         out(r#"[{"name":"muster","enabled":true}]"#),
-        out(r#"{"status":"ok"}"#),
+        pinned_plan(),
+        pinned_plan(),
+        installed(MUSTER_ROOT),
         out(r#"{"status":"ok"}"#),
         muster(
             "coordinate_start_inbox",
@@ -251,6 +305,7 @@ fn a_setup_stopped_midway_can_be_started_again() {
         out(NO_DAEMON),
         out("Daemon started (pid 4242)"),
         out(r#"[{"name":"muster","enabled":true}]"#),
+        pinned_plan(),
     ]);
     let seat = seat(Arc::new(SlowInstall {
         fake: fake.clone(),
@@ -262,7 +317,10 @@ fn a_setup_stopped_midway_can_be_started_again() {
     seat.set_up_in_background(runtime.handle(), || Ok(()))
         .unwrap();
     runtime.block_on(async {
-        while !argv(&fake).iter().any(|c| c.contains("install")) {
+        while !argv(&fake)
+            .iter()
+            .any(|c| c.contains("install") && !c.contains("--dry-run"))
+        {
             tokio::task::yield_now().await;
         }
     });
@@ -277,7 +335,8 @@ async fn stopping_mid_setup_ends_the_setup_before_the_daemon() {
         out(NO_DAEMON),
         out("Daemon started (pid 4242)"),
         out(r#"[{"name":"muster","enabled":true}]"#),
-        out(r#"{"status":"ok"}"#), // install: never answered
+        pinned_plan(),
+        pinned_plan(), // install: never answered
         out(r#"{"message":"Daemon shutting down.","status":"ok"}"#),
     ]);
     let seat = seat(Arc::new(SlowInstall {
@@ -285,7 +344,10 @@ async fn stopping_mid_setup_ends_the_setup_before_the_daemon() {
         gate: Arc::new(tokio::sync::Notify::new()), // never opens
     }));
     set_up(seat, || panic!("a stopped setup is never remembered")).unwrap();
-    while !argv(&fake).iter().any(|c| c.contains("install")) {
+    while !argv(&fake)
+        .iter()
+        .any(|c| c.contains("install") && !c.contains("--dry-run"))
+    {
         tokio::task::yield_now().await;
     }
     seat.stop().await;
@@ -306,4 +368,185 @@ async fn a_seat_room_approval_doesnt_use_reports_its_setup_and_asks_nothing() {
     assert_eq!(status["running"], false);
     assert!(status["setup_error"].is_string(), "{status}");
     assert_eq!(argv(&fake).len(), calls);
+}
+
+/// Set a seat up with `replies` after its daemon starts and Muster's
+/// catalogue is there, and return what it said and ran.
+async fn set_up_with(replies: Vec<RawOutput>) -> (serde_json::Value, Vec<String>) {
+    let mut all = vec![
+        out(NO_DAEMON),
+        out("Daemon started (pid 4242)"),
+        out(r#"[{"name":"muster","enabled":true}]"#),
+    ];
+    all.extend(replies);
+    let fake = FakeRunner::with(all);
+    let seat = seat(fake.clone());
+    set_up(seat, || panic!("a refused setup is never remembered")).unwrap();
+    settled(seat).await;
+    (seat.status().await, argv(&fake))
+}
+
+fn installs(argv: &[String]) -> usize {
+    argv.iter()
+        .filter(|c| c.contains("package install") && !c.contains("--dry-run"))
+        .count()
+}
+
+#[tokio::test]
+async fn another_muster_build_is_refused_before_anything_installs() {
+    let (status, argv) = set_up_with(vec![plan(OTHER_ROOT, OFFICIAL)]).await;
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pinned")),
+        "{status}"
+    );
+    assert_eq!(installs(&argv), 0, "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_dependency_from_musters_own_catalogue_is_refused() {
+    // Only Muster itself may come from its unsigned catalogue.
+    let (status, argv) = set_up_with(vec![plan(MUSTER_ROOT, MUSTER_CATALOG)]).await;
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("lez_core")),
+        "{status}"
+    );
+    assert_eq!(installs(&argv), 0, "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_build_that_differs_once_installed_is_removed_and_never_loaded() {
+    let (status, argv) = set_up_with(vec![
+        pinned_plan(),
+        pinned_plan(),
+        installed(OTHER_ROOT),
+        out(r#"{"status":"ok"}"#), // remove
+    ])
+    .await;
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pinned")),
+        "{status}"
+    );
+    assert!(
+        argv.iter()
+            .any(|c| c == "--json package remove muster_module -y"),
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|c| c.contains("module load")), "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_seat_holding_another_muster_build_never_loads_it() {
+    // Set up before Muster was pinned.
+    let fake = FakeRunner::with(vec![out(RUNNING), installed(OTHER_ROOT)]);
+    let e = Seat::new(fake.clone()).start().await.unwrap_err();
+    assert!(e.contains("turn room approval off and on"), "{e}");
+    assert!(!argv(&fake).iter().any(|c| c.contains("module load")));
+}
+
+const REMOVE_MUSTER: &str = "--json package remove muster_module -y";
+
+#[tokio::test]
+async fn a_manifest_pulling_in_another_dependency_is_removed_and_never_loaded() {
+    // The root hash covers Muster's files, not its manifest.
+    let mut deps = MUSTER_DEPENDENCIES.to_vec();
+    deps.push("evil_module");
+    let (status, argv) = set_up_with(vec![
+        pinned_plan(),
+        pinned_plan(),
+        installed_with(MUSTER_ROOT, &deps, "muster_module_plugin.dylib"),
+        out(r#"{"status":"ok"}"#),
+    ])
+    .await;
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pinned")),
+        "{status}"
+    );
+    assert!(argv.iter().any(|c| c == REMOVE_MUSTER), "{argv:?}");
+    assert!(!argv.iter().any(|c| c.contains("module load")), "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_manifest_loading_another_file_is_removed_and_never_loaded() {
+    let (status, argv) = set_up_with(vec![
+        pinned_plan(),
+        pinned_plan(),
+        installed_with(MUSTER_ROOT, &MUSTER_DEPENDENCIES, "libssl.3.dylib"),
+        out(r#"{"status":"ok"}"#),
+    ])
+    .await;
+    assert!(status["setup_error"].is_string(), "{status}");
+    assert!(argv.iter().any(|c| c == REMOVE_MUSTER), "{argv:?}");
+    assert!(!argv.iter().any(|c| c.contains("module load")), "{argv:?}");
+}
+
+#[tokio::test]
+async fn what_the_install_actually_did_is_checked_too() {
+    // The catalogue changed between the plan and the install.
+    let (status, argv) = set_up_with(vec![
+        pinned_plan(),
+        plan(MUSTER_ROOT, MUSTER_CATALOG),
+        out(r#"{"status":"ok"}"#), // remove lez_core
+        out(r#"{"status":"ok"}"#), // remove muster_module
+    ])
+    .await;
+    assert!(
+        status["setup_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("lez_core")),
+        "{status}"
+    );
+    assert!(
+        argv.iter()
+            .any(|c| c == "--json package remove lez_core -y"),
+        "{argv:?}"
+    );
+    assert!(argv.iter().any(|c| c == REMOVE_MUSTER), "{argv:?}");
+    assert!(!argv.iter().any(|c| c.contains("module load")), "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_plan_that_cant_be_read_installs_nothing() {
+    let (status, argv) = set_up_with(vec![out(r#"{"status":"ok"}"#)]).await;
+    assert!(status["setup_error"].is_string(), "{status}");
+    assert_eq!(installs(&argv), 0, "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_dependency_from_an_unnamed_catalogue_installs_nothing() {
+    let (status, argv) = set_up_with(vec![plan(MUSTER_ROOT, "")]).await;
+    assert!(status["setup_error"].is_string(), "{status}");
+    assert_eq!(installs(&argv), 0, "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_check_that_fails_to_read_never_removes_a_good_install() {
+    let (status, argv) = set_up_with(vec![
+        pinned_plan(),
+        pinned_plan(),
+        // package show gets no reply: unreadable, not a mismatch
+    ])
+    .await;
+    assert!(status["setup_error"].is_string(), "{status}");
+    assert!(!argv.iter().any(|c| c == REMOVE_MUSTER), "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_seat_that_fails_the_check_at_start_is_stopped() {
+    // An old Muster loaded in a running daemon must not stay callable.
+    let fake = FakeRunner::with(vec![
+        out(RUNNING),
+        installed(OTHER_ROOT),
+        out(r#"{"message":"Daemon shutting down.","status":"ok"}"#),
+    ]);
+    let e = Seat::new(fake.clone()).start().await.unwrap_err();
+    assert!(e.contains("room settings"), "{e}");
+    assert_eq!(argv(&fake).last().unwrap(), "--json daemon stop");
 }

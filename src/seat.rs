@@ -12,9 +12,34 @@ use crate::{
     room::{member_key, muster, text},
 };
 
-/// Muster's own package catalogue.
+/// Muster's own package catalogue. It follows Muster's main branch and its
+/// packages are unsigned, so what it serves is checked against the pin below.
 pub const MUSTER_CATALOG: &str =
     "https://raw.githubusercontent.com/corpetty/muster/main/catalog/logos-repo.json";
+
+/// The Muster build the seat runs: this version, and only with this root
+/// hash, which logosctl checks against the package's files when it installs
+/// it. A newer Muster needs a logos-mcp release that pins it.
+pub const MUSTER_VERSION: &str = "0.3.5";
+pub const MUSTER_ROOT: &str = "ed0aaa46399fd9e5edae20336c8a01d938e1cfae1b8ef5dcf66ab55420194917";
+/// What that build's manifest names, which the root hash doesn't cover: the
+/// modules it needs, sorted, and the file it loads, without its extension.
+pub const MUSTER_DEPENDENCIES: [&str; 5] = [
+    "delivery_module",
+    "eth_rpc_module",
+    "keystore_module",
+    "lez_core",
+    "tx_sender_module",
+];
+const MUSTER_PLUGIN: &str = "muster_module_plugin";
+
+/// Which Muster the seat holds.
+enum Installed {
+    Pinned,
+    Other,
+    /// It couldn't be read: nothing is known, so nothing is removed.
+    Unknown(String),
+}
 
 /// The logosctl binary: on `PATH`, then `~/.local/logosctl/bin/logosctl`.
 pub fn find_logosctl() -> Option<PathBuf> {
@@ -153,7 +178,8 @@ impl Seat {
         Ok(())
     }
 
-    /// Load Muster with only what it needs, and listen for room invites.
+    /// Load Muster with only what it needs, and listen for room invites. The
+    /// caller has checked it is the pinned build.
     async fn load_muster(&self) -> Result<(), String> {
         self.ctl
             .command(&["module", "load", "muster_module", "--no-optional"])
@@ -164,8 +190,17 @@ impl Seat {
     }
 
     /// Start a seat that is set up: its daemon, Muster and its inbox.
+    /// Only the pinned Muster build is loaded, even in a seat set up before
+    /// it was pinned.
     pub async fn start(&self) -> Result<(), String> {
         self.ensure_daemon().await?;
+        if let Err(e) = self.check_installed().await {
+            // A Muster already loaded in a running daemon would stay callable.
+            if let Err(stop) = self.ctl.command(&["daemon", "stop"]).await {
+                tracing::warn!("could not stop the agent seat: {stop}");
+            }
+            return Err(e);
+        }
         self.load_muster().await
     }
 
@@ -194,8 +229,112 @@ impl Seat {
         lock(&self.setup)
     }
 
-    /// Make the session: add Muster's catalogue, install Muster without its
-    /// optional extras, and start it.
+    /// Which Muster the session holds: the pinned build has its version, its
+    /// root hash, which logosctl checks against the files, and the manifest
+    /// the root hash doesn't cover, naming its dependencies and its plugin.
+    async fn installed(&self) -> Installed {
+        let shown = match self
+            .ctl
+            .command(&["package", "show", "muster_module"])
+            .await
+        {
+            Ok(shown) => shown,
+            Err(e) => return Installed::Unknown(e.to_string()),
+        };
+        let mut deps: Vec<&str> = shown["dependencies"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        deps.sort_unstable();
+        let plugin = std::path::Path::new(text(&shown, "mainFilePath"))
+            .file_stem()
+            .and_then(|s| s.to_str());
+        let pinned = text(&shown, "version") == MUSTER_VERSION
+            && shown.pointer("/hashes/root").and_then(Value::as_str) == Some(MUSTER_ROOT)
+            && deps == MUSTER_DEPENDENCIES
+            && plugin == Some(MUSTER_PLUGIN);
+        if pinned {
+            Installed::Pinned
+        } else {
+            Installed::Other
+        }
+    }
+
+    /// Whether the Muster installed in the session is the pinned build.
+    async fn check_installed(&self) -> Result<(), String> {
+        match self.installed().await {
+            Installed::Pinned => Ok(()),
+            Installed::Other => Err(Self::not_pinned()),
+            Installed::Unknown(e) => Err(format!("could not check the agent seat's Muster: {e}")),
+        }
+    }
+
+    fn not_pinned() -> String {
+        format!(
+            "the agent seat holds a Muster build other than the pinned {MUSTER_VERSION}, so it isn't loaded: turn room approval off and on to install the pinned one, which drops the room settings, so pick the room again after"
+        )
+    }
+
+    /// Refuse an install plan, or what an install did, unless it brings the
+    /// pinned Muster, and every other package from a named catalogue other
+    /// than Muster's unsigned one. Returns the packages that broke the rule.
+    fn check_plan(plan: &Value) -> Result<(), (String, Vec<String>)> {
+        let Some(changes) = plan["changes"].as_array() else {
+            return Err((
+                format!("logosctl's install plan can't be read: {plan}"),
+                vec![],
+            ));
+        };
+        let mut wrong = Vec::new();
+        let mut why = None;
+        for change in changes {
+            let name = text(change, "name");
+            let refused = if name == "muster_module" {
+                (text(change, "toVersion") != MUSTER_VERSION
+                    || text(change, "rootHash") != MUSTER_ROOT)
+                    .then(|| {
+                        format!(
+                            "Muster's catalogue offers a build other than the pinned {MUSTER_VERSION}"
+                        )
+                    })
+            } else {
+                match text(change, "repository") {
+                    "" => Some(format!("{name} comes from no named catalogue")),
+                    MUSTER_CATALOG => Some(format!(
+                        "Muster's catalogue would supply {name}, which only the signed Logos catalogue may"
+                    )),
+                    _ => None,
+                }
+            };
+            if let Some(refused) = refused {
+                why.get_or_insert(refused);
+                wrong.push(name.to_string());
+            }
+        }
+        match why {
+            Some(why) => Err((why, wrong)),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove `packages` from the session, best effort.
+    async fn remove(&self, packages: &[String]) {
+        for package in packages {
+            if let Err(e) = self
+                .ctl
+                .command(&["package", "remove", package, "-y"])
+                .await
+            {
+                tracing::warn!("could not remove {package} from the agent seat: {e}");
+            }
+        }
+    }
+
+    /// Make the session: add Muster's catalogue, install the pinned Muster
+    /// without its optional extras, and start it.
     async fn prepare_session(&self) -> Result<(), String> {
         self.ensure_daemon().await?;
         let catalogs = self
@@ -212,11 +351,43 @@ impl Seat {
                 .await
                 .map_err(|e| format!("could not add Muster's catalogue: {e}"))?;
         }
-        self.slow
-            .command(&["package", "install", "muster_module", "--no-optional", "-y"])
+        let install = [
+            "package",
+            "install",
+            "muster_module",
+            "--version",
+            MUSTER_VERSION,
+            "--no-optional",
+            "-y",
+        ];
+        // What it would install, checked before anything is.
+        let plan = self
+            .slow
+            .command(&[&install[..], &["--dry-run"]].concat())
             .await
             .map_err(|e| format!("could not install Muster: {e}"))?;
-        self.load_muster().await
+        Self::check_plan(&plan).map_err(|(why, _)| format!("{why}: nothing was installed"))?;
+        let done = self
+            .slow
+            .command(&install)
+            .await
+            .map_err(|e| format!("could not install Muster: {e}"))?;
+        // The catalogue may have changed since the plan: what landed counts.
+        if let Err((why, mut wrong)) = Self::check_plan(&done) {
+            wrong.retain(|p| p != "muster_module");
+            wrong.push("muster_module".into());
+            self.remove(&wrong).await;
+            return Err(format!("{why}: it was removed and nothing was loaded"));
+        }
+        match self.installed().await {
+            Installed::Pinned => self.load_muster().await,
+            Installed::Other => {
+                self.remove(&["muster_module".into()]).await;
+                Err(Self::not_pinned())
+            }
+            // Maybe fine: left installed, and checked again before it loads.
+            Installed::Unknown(e) => Err(format!("could not check the agent seat's Muster: {e}")),
+        }
     }
 
     /// Stop the session's daemon, ending any setup under way first so it
