@@ -17,7 +17,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `messaging_subscribe` / `messaging_unsubscribe` | follow or stop following a content topic |
 | `messaging_send` | publishes text or base64 bytes to a topic and returns a `request_id`. Refused up front when RLN can't send right now |
 | `messaging_send_status` | queued, sent, propagated or error for a `request_id` |
-| `messaging_read` | messages received on a subscribed topic, paged with `after_seq` |
+| `messaging_read` | messages received on a subscribed topic, paged with `after_seq`. With `wait_secs`, up to 60, it waits for a new one |
 | `rln_status` | whether the node can send right now: RLN membership state, messages left in this epoch and the node's memberships |
 | `chat_status` | starts Logos Chat if needed and shows the agent's chat address, the network state, its conversation count and whether chat reports healthy |
 | `chat_start` | opens an end-to-end encrypted conversation with another agent's chat address |
@@ -38,7 +38,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `discovery_connect` / `discovery_disconnect` / `discovery_ping` | dials a peer by its multiaddr, drops one, or pings one for its round trip |
 | `chain_info` | the Logos chain's id, consensus tip, slot timing and network peers |
 | `chain_blocks` | the chain blocks in a range of slots, at most 600 at a time |
-| `chain_events` | each new finalized block's height and header id as it arrives, paged by `after_seq` |
+| `chain_events` | each new finalized block's height and header id as it arrives, paged by `after_seq`. With `wait_secs`, up to 60, it waits for the next one |
 | `chain_rewards` / `chain_claim_reward` | the leader reward vouchers and mined tickets the chain node hasn't claimed, or claims one voucher into its wallet. The claim's fee comes from the node's funding key |
 | `chain_wallet` | the chain node's own addresses with their balances, or one address with its notes |
 | `chain_transfer` | sends TestToken from one of the chain node's addresses. Waits for your OK in the Agent Access app by default, or for a Muster room. Outside Basecamp only a room can approve it |
