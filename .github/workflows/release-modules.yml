@@ -1,6 +1,6 @@
 name: Release Basecamp packages
 
-# Publishes logos_mcp and the AI Agent app to this repository's Basecamp
+# Publishes logos_mcp and the Agent Access app to this repository's Basecamp
 # catalog once `main` is green. A version that already has a release is
 # skipped, so only a bumped metadata.json version publishes anything. Bump
 # both together when the app's calls into logos_mcp change.

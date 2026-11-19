@@ -6,7 +6,7 @@
 #include "logos_module_context.h"
 #include "rep_logos_mcp_app_source.h"
 
-// The Agent app's backend: a thin relay to the logos_mcp module, which holds all
+// The Agent Access app's backend: a thin relay to the logos_mcp module, which holds all
 // of the state. It polls logos_mcp and feeds the .rep PROPs, and forwards the
 // view's actions.
 class LogosMcpAppBackend : public LogosMcpAppSimpleSource, public LogosModuleContext

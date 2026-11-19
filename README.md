@@ -2,7 +2,7 @@
 
 MCP server that lets AI agents use a running [Logos](https://logos.co/) node. Your agent can send and receive messages over Logos Messaging, talk privately to other agents over Logos Chat, store and fetch files on Logos Storage, find other nodes through discovery, hold and send LEZ from its own accounts and check node health, from Claude Code, Codex or any other MCP client.
 
-It runs two ways: as a standalone binary that talks to your node through `logosctl`, the official headless Logos runtime, or as a module inside Basecamp, with the AI Agent app to control what the agent may do.
+It runs two ways: as a standalone binary that talks to your node through `logosctl`, the official headless Logos runtime, or as a module inside Basecamp, with the Agent Access app to control what the agent may do.
 
 For agents that hire each other, paid through an escrow, use [logos-agents](https://github.com/drptbl/logos-agents). It builds on this server as a library and adds the `service_*` tools.
 
@@ -29,7 +29,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `wallet_labels` | the account behind a label, or an account's labels, in the agent's wallet only |
 | `wallet_tx_status` | whether a LEZ transaction is in a block yet, answered at once by the wallet's sequencer |
 | `wallet_faucet` | asks the LEZ testnet faucet for its drop, 0.1 LEZ once a day, into one of the agent's own public accounts. Needs Basecamp's LEZ Faucet module |
-| `wallet_transfer` | sends lepta from one of the agent accounts to a public account, or waits for [approval](#room-approval): your OK in the AI Agent app, or trusted people in a Muster room |
+| `wallet_transfer` | sends lepta from one of the agent accounts to a public account, or waits for [approval](#room-approval): your OK in the Agent Access app, or trusted people in a Muster room |
 | `wallet_transfer_status` | where a transfer that waited for approval stands, with its `tx_hash` once sent. A room request also shows its proposal and the trusted approvals so far |
 | `wallet_new_account` | creates a public account in the agent wallet, for example a fresh receive address per job |
 | `discovery_advertise` / `discovery_stop` | advertises a service on the Logos discovery network, or stops |
@@ -41,7 +41,7 @@ Early release. Logos itself is on testnet (`v0.3`) and is not meant for real fun
 | `chain_events` | each new finalized block's height and header id as it arrives, paged by `after_seq` |
 | `chain_rewards` / `chain_claim_reward` | the leader reward vouchers and mined tickets the chain node hasn't claimed, or claims one voucher into its wallet. The claim's fee comes from the node's funding key |
 | `chain_wallet` | the chain node's own addresses with their balances, or one address with its notes |
-| `chain_transfer` | sends TestToken from one of the chain node's addresses. Waits for your OK in the AI Agent app by default, or for a Muster room. Outside Basecamp only a room can approve it |
+| `chain_transfer` | sends TestToken from one of the chain node's addresses. Waits for your OK in the Agent Access app by default, or for a Muster room. Outside Basecamp only a room can approve it |
 | `chain_block` / `chain_transaction` | a chain block and its transactions by its header id, or a transaction still waiting in the mempool by its hash. The node finds a mined transaction only through its block |
 | `storage_upload` | uploads a file from the files root, the CID shows up in `storage_transfer_status` |
 | `storage_download` | downloads a CID into a new file under the files root, optionally over the mixnet |
@@ -173,7 +173,7 @@ Add this repository to Basecamp: in Package Repositories, paste
 https://raw.githubusercontent.com/drptbl/logos-mcp/main/logos-repo.json
 ```
 
-and install `logos_mcp` and the AI Agent app from the catalog. Updates show up there too. Both are signed, and `logos-repo.json` lists the signer's DID as trusted.
+and install `logos_mcp` and the Agent Access app from the catalog. Updates show up there too. Both are signed, and `logos-repo.json` lists the signer's DID as trusted.
 
 To build the module yourself, build it with Nix and install `result/logos-logos_mcp-module-lib.lgx` from Basecamp's Package Manager:
 
@@ -192,9 +192,9 @@ claude mcp add --transport http logos http://127.0.0.1:8765/mcp --header "Author
 
 Start messaging in Basecamp first. The module never creates or starts the node.
 
-The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`, or you hand it one of your own accounts in the AI Agent app. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
+The agent uses the wallet you have open in Basecamp, but sends only from its own agent accounts. `wallet_new_account` creates one and lists it in `agent-accounts.json`, or you hand it one of your own accounts in the Agent Access app. Fund it with what the agent may spend. It never sends from your other accounts, and it refuses to send while the open wallet doesn't hold its accounts.
 
-The AI Agent app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. To build it yourself, install `result/logos-logos_mcp_app-module.lgx` after the module:
+The Agent Access app controls all of this from inside Basecamp. It needs Basecamp `0.4.0-rc.2` or later. To build it yourself, install `result/logos-logos_mcp_app-module.lgx` after the module:
 
 ```bash
 cd basecamp/app
@@ -225,7 +225,7 @@ Start on `logos.dev` if you just want to try it.
 For each wallet, a limit splits transfers in two, and each side is one of:
 
 1. Send => the agent sends it
-2. Ask me => it waits for your Approve or Deny in the AI Agent app's Wallet tab
+2. Ask me => it waits for your Approve or Deny in the Agent Access app's Wallet tab
 3. Room => it waits for trusted people to approve it in a [Muster](https://github.com/corpetty/muster) room
 
 The side above the limit can't be looser than the one under it, and a limit of 0 puts every transfer above it. The agent wallet covers LEZ transfers and escrow payments. The node wallet covers Logos chain transfers, which spend your chain node's own wallet, so it asks you for every one unless you change it.
@@ -234,7 +234,7 @@ The room approves with the agent as its own member, never as you. The agent prop
 
 ### In Basecamp
 
-Room approval is off until you turn it on, and Muster is never touched while it's off. The AI Agent app's Approvals tab then offers Send and Ask me only.
+Room approval is off until you turn it on, and Muster is never touched while it's off. The Agent Access app's Approvals tab then offers Send and Ask me only.
 
 Turning it on needs `logosctl` installed:
 
@@ -302,7 +302,7 @@ The server is the boundary between your agent and your node, so it checks what t
 - `storage_remove` only removes content the agent put in local storage, recorded next to the wallet, never the rest
 - `wallet_transfer` only sends from the agent wallet: the one this server opened, or the configured wallet found already open, with exactly its accounts on its sequencer. If `lez_core` has another wallet open, it refuses
 - inside Basecamp, `wallet_transfer` only sends from the agent accounts, and the MCP endpoint needs the bearer token. Requests from web pages (with an `Origin` header) or for a host other than localhost are refused
-- only the AI Agent app can read the token, flip the tool switches or read the activity through the module
+- only the Agent Access app can read the token, flip the tool switches or read the activity through the module
 - `lez_core` `0.5.1` can only open unencrypted key storage, so lock the wallet folder down (`chmod 700`)
 
 Uploaded files are announced to the network and anyone with the CID can fetch them. Don't put anything in the files root you wouldn't publish.

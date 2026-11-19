@@ -11,7 +11,7 @@ use crate::room::RoomApproval;
 pub enum Approver {
     /// Nobody: the agent sends it.
     Send,
-    /// The user, in the AI Agent app.
+    /// The user, in the Agent Access app.
     Ask,
     /// Trusted people in the Muster room.
     Room,

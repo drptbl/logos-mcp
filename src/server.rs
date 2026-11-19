@@ -870,7 +870,7 @@ fn submitted(p: &TransferParams, tx_hash: &str) -> Value {
     })
 }
 
-/// A tool's answer as JSON, or its error text: how the Agent app reuses the tools.
+/// A tool's answer as JSON, or its error text: how the Agent Access app reuses the tools.
 fn tool_json(result: Result<CallToolResult, McpError>) -> Result<Value, String> {
     let result = result.map_err(|e| e.message.to_string())?;
     let text = result
@@ -907,7 +907,7 @@ fn chat_fail(e: LogosError) -> Result<CallToolResult, McpError> {
 /// Who answers a transfer request.
 #[derive(Debug, Clone, Copy)]
 enum Approver {
-    /// The user, in the AI Agent app.
+    /// The user, in the Agent Access app.
     User,
     /// Trusted humans in a Muster room, within this many minutes.
     Room(u64),
@@ -1123,7 +1123,7 @@ impl LogosServer {
             (Some(seat), _) => Ok(seat.as_ref()),
             (None, false) => Ok(self.node.as_ref()),
             (None, true) => Err(
-                "room approval needs the agent's own seat in Muster: set it up in the AI Agent app first: nothing was sent"
+                "room approval needs the agent's own seat in Muster: set it up in the Agent Access app first: nothing was sent"
                     .into(),
             ),
         }
@@ -1135,7 +1135,7 @@ impl LogosServer {
         self
     }
 
-    /// The open wallet for the Agent app: its status as wallet_status reports it,
+    /// The open wallet for the Agent Access app: its status as wallet_status reports it,
     /// and every account, even in a wallet that isn't the agent's.
     pub async fn wallet_overview(&self) -> Result<Value, String> {
         let status = tool_json(self.wallet_status().await)?;
@@ -1171,7 +1171,7 @@ impl LogosServer {
     }
 
     /// Transfers waiting for the user, and those waiting for the room, for
-    /// the Agent app.
+    /// the Agent Access app.
     pub fn approvals(&self) -> Value {
         json!({ "waiting": self.approvals.waiting(), "room": self.approvals.room_waiting() })
     }
@@ -1329,7 +1329,7 @@ impl LogosServer {
         }
     }
 
-    /// A fresh agent account for the Agent app, as wallet_new_account makes it.
+    /// A fresh agent account for the Agent Access app, as wallet_new_account makes it.
     pub async fn new_agent_account(&self) -> Result<Value, String> {
         tool_json(self.wallet_new_account().await)
     }
@@ -1507,7 +1507,7 @@ impl LogosServer {
         } else {
             let group = ToolGroups::group_of(&tool).unwrap_or("this");
             fail(format!(
-                "the user turned off the {group} tools in the Agent app"
+                "the user turned off the {group} tools in the Agent Access app"
             ))
             .map(Into::into)
         };
@@ -3136,7 +3136,7 @@ impl LogosServer {
     }
 
     #[tool(
-        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so a chain transfer usually waits for approval, the user's in the AI Agent app or a Muster room's: then it returns awaiting_approval and a request_id for wallet_transfer_status. Outside Basecamp only a room can approve it. Irreversible once sent.",
+        description = "Send TestToken on the Logos chain from one of the chain node's own addresses. The node's wallet is the user's, so a chain transfer usually waits for approval, the user's in the Agent Access app or a Muster room's: then it returns awaiting_approval and a request_id for wallet_transfer_status. Outside Basecamp only a room can approve it. Irreversible once sent.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3154,7 +3154,7 @@ impl LogosServer {
         // node's own wallet is never spent unapproved.
         if !self.settings.host_owns_messaging && approver != policy::Approver::Room {
             return fail(
-                "chain transfers spend the node's own wallet, so they need the user's Approve in the AI Agent app, which only Basecamp has, or a Muster room (--room-topic)",
+                "chain transfers spend the node's own wallet, so they need the user's Approve in the Agent Access app, which only Basecamp has, or a Muster room (--room-topic)",
             );
         }
         let checked = (|| {

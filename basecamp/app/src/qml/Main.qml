@@ -4,7 +4,7 @@ import QtQuick.Layouts
 import Logos.Theme
 import Logos.Controls
 
-// The Agent app: connect an MCP client, choose the tool groups the agent may
+// The Agent Access app: connect an MCP client, choose the tool groups the agent may
 // use, and see its calls. All state lives in the logos_mcp module; the backend
 // relays it as JSON PROPs.
 Item {
@@ -318,7 +318,7 @@ Item {
                 Layout.fillWidth: true
                 spacing: Theme.spacing.medium
                 LogosText {
-                    text: qsTr("AI Agent")
+                    text: qsTr("Agent Access")
                     font.pixelSize: Theme.typography.pageTitleText
                     font.weight: Theme.typography.weightBold
                 }
