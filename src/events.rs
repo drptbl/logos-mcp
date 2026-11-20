@@ -121,6 +121,8 @@ pub struct EventStore {
     inner: Mutex<Inner>,
     /// Told of each finished removal: the CID and when, in milliseconds.
     on_removed: Mutex<Vec<RemovalHook>>,
+    /// Woken by every event, for readers waiting for something new.
+    changed: tokio::sync::Notify,
 }
 
 impl Default for EventStore {
@@ -135,6 +137,7 @@ impl Default for EventStore {
                 ..Inner::default()
             }),
             on_removed: Mutex::default(),
+            changed: tokio::sync::Notify::new(),
         }
     }
 }
@@ -202,6 +205,37 @@ impl EventStore {
     }
 
     fn apply(&self, event: &str, data: &Value) {
+        self.apply_one(event, data);
+        self.changed.notify_waiters();
+    }
+
+    /// Wait until `ready` gives something, `wait` passes or `ct` is cancelled,
+    /// and return what it gave last. Each event wakes it to look again.
+    pub async fn wait_for<T>(
+        &self,
+        wait: std::time::Duration,
+        ct: &tokio_util::sync::CancellationToken,
+        mut ready: impl FnMut() -> (T, bool),
+    ) -> T {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Registered before looking, so an event in between still wakes it.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (found, enough) = ready();
+            if enough || tokio::time::Instant::now() >= deadline {
+                return found;
+            }
+            tokio::select! {
+                () = &mut changed => {}
+                () = tokio::time::sleep_until(deadline) => {}
+                () = ct.cancelled() => return found,
+            }
+        }
+    }
+
+    fn apply_one(&self, event: &str, data: &Value) {
         if event == "storageRemoveDone" {
             self.removed(data);
             return;

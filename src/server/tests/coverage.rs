@@ -1615,9 +1615,15 @@ async fn chain_events_pages_finalized_blocks_by_seq() {
     lib_block(&events, 105, &"bb".repeat(32));
     events.apply_event("libBlock", &json!({ "arg0": "null" }));
     let b = body(
-        &s.chain_events(Parameters(ChainEventsParams { after_seq: None }))
-            .await
-            .unwrap(),
+        &s.chain_events(
+            CancellationToken::new(),
+            Parameters(ChainEventsParams {
+                after_seq: None,
+                wait_secs: None,
+            }),
+        )
+        .await
+        .unwrap(),
     );
     let list = b["events"].as_array().unwrap();
     assert_eq!(list.len(), 2, "{b}");
@@ -1625,9 +1631,13 @@ async fn chain_events_pages_finalized_blocks_by_seq() {
     assert_eq!(list[1]["header_id"], "bb".repeat(32), "{b}");
     let first = list[0]["seq"].as_u64().unwrap();
     let b = body(
-        &s.chain_events(Parameters(ChainEventsParams {
-            after_seq: Some(first),
-        }))
+        &s.chain_events(
+            CancellationToken::new(),
+            Parameters(ChainEventsParams {
+                after_seq: Some(first),
+                wait_secs: None,
+            }),
+        )
         .await
         .unwrap(),
     );
