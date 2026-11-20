@@ -93,7 +93,7 @@ fn read_cursor_and_ring_buffer_bound() {
 #[test]
 fn tracks_upload_to_completion_with_cid() {
     let s = EventStore::default();
-    s.expect_transfer("sess-1", "upload");
+    s.expect_transfer("sess-1", "upload", 0);
     assert!(!s.transfer("sess-1").unwrap().done);
     s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"bytes\":10,\"total\":20}"},"event":"storageUploadProgress","module":"storage_module"}"#);
     s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"cid\":\"zDvZRwzm\"}"},"event":"storageUploadDone","module":"storage_module"}"#);

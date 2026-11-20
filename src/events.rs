@@ -336,7 +336,10 @@ impl EventStore {
 
     /// Start tracking a transfer the moment its session id is known, so a
     /// status query before the first event reports "in progress", not unknown.
-    pub fn expect_transfer(&self, session_id: &str, kind: &str) {
+    /// `asked_ms` is when the transfer was asked for: a finished one under the
+    /// same session id from before then is an earlier run's, as when storage
+    /// restarted and hands out its ids again.
+    pub fn expect_transfer(&self, session_id: &str, kind: &str, asked_ms: u64) {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
         track(
@@ -352,11 +355,19 @@ impl EventStore {
             MAX_TRACKED_TRANSFERS,
         );
         let t = s.transfers.get_mut(session_id).expect("just tracked");
+        let earlier = |t: &Transfer| t.done && t.done_at_ms.is_some_and(|at| at < asked_ms);
+        if earlier(t) {
+            *t = Transfer::default();
+        }
         if t.kind.is_empty() {
             t.kind = kind.into();
         }
-        // It may have finished before this was called.
-        if let Some(kept @ None) = s.started.get_mut(session_id) {
+        let kept = s.started.get_mut(session_id).expect("just tracked");
+        if kept.as_ref().is_some_and(earlier) {
+            *kept = None;
+        }
+        // It may have finished, this run, before this was called.
+        if kept.is_none() {
             *kept = t.done.then(|| t.clone());
         }
     }
@@ -452,13 +463,23 @@ impl EventStore {
     pub fn stop_transfer(&self, session_id: &str, error: String) {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
-        if let Some(t) = s.transfers.get_mut(session_id) {
+        let stop = |t: &mut Transfer| {
             t.done = true;
             t.success = Some(false);
-            t.error = Some(error);
-            if let Some(kept) = s.started.get_mut(session_id) {
-                *kept = Some(t.clone());
-            }
+            t.error = Some(error.clone());
+        };
+        // The agent's own record of it, not the live one, which someone
+        // else's later transfer of the same CID may have moved on.
+        if let Some(kept) = s.started.get_mut(session_id) {
+            let mut ended = match kept.take() {
+                Some(ended) => ended,
+                None => s.transfers.get(session_id).cloned().unwrap_or_default(),
+            };
+            stop(&mut ended);
+            *kept = Some(ended);
+        }
+        if let Some(t) = s.transfers.get_mut(session_id) {
+            stop(t);
         }
     }
 

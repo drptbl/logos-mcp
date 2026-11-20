@@ -243,8 +243,10 @@ impl DownloadGuard {
     /// Stop the transfer, remove its file and release the reservation. Says what
     /// was left behind.
     async fn cancel_and_remove(&mut self) -> String {
-        self.done = true;
+        // Marked done only after: a caller that stops waiting meanwhile drops
+        // the guard, and its drop finishes the cleanup and the release.
         let left = cleanup_download(&self.server, &self.cid, &self.full, self.held).await;
+        self.done = true;
         self.release();
         left
     }
@@ -253,11 +255,11 @@ impl DownloadGuard {
     /// CID it could only reach someone else's new download. Releases the
     /// reservation and says whether the file is gone.
     async fn remove_finished(&mut self) -> bool {
-        self.done = true;
         let removed = remove_inside(&self.server, &self.full);
         if !self.held {
             drop_fetched(&self.server, &self.cid).await;
         }
+        self.done = true;
         self.release();
         removed
     }
@@ -313,10 +315,11 @@ async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path, held: bo
         .await
         .is_ok()
         || server.events.transfer(cid).is_some_and(|t| t.done);
-    if !held {
-        drop_fetched(server, cid).await;
-    }
+    let dropping = !held && drop_fetched(server, cid).await;
     match (cancelled, remove_inside(server, full)) {
+        (true, true) if dropping => {
+            "its file is gone, and storage is removing what it fetched".into()
+        }
         (true, true) => "nothing was kept".into(),
         (false, true) => format!(
             "it could not be cancelled, so {} may still be written",
@@ -327,10 +330,23 @@ async fn cleanup_download(server: &LogosServer, cid: &str, full: &Path, held: bo
 }
 
 /// Remove from local storage what a discarded download of `cid` fetched,
-/// best effort: storage removes in the background.
-async fn drop_fetched(server: &LogosServer, cid: &str) {
-    if let Err(e) = server.node.call(STORAGE, "remove", &[Arg::str(cid)]).await {
-        tracing::warn!("could not remove what the download of {cid} fetched: {e}");
+/// best effort: storage removes in the background. Only while the content is
+/// still incomplete: complete, it may be the user's by now, stored meanwhile.
+/// True when removal was asked for.
+async fn drop_fetched(server: &LogosServer, cid: &str) -> bool {
+    let incomplete = matches!(
+        server.node.call(STORAGE, "exists", &[Arg::str(cid)]).await,
+        Ok(Value::Bool(false))
+    );
+    if !incomplete {
+        return false;
+    }
+    match server.node.call(STORAGE, "remove", &[Arg::str(cid)]).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("could not remove what the download of {cid} fetched: {e}");
+            false
+        }
     }
 }
 
@@ -4534,9 +4550,10 @@ impl LogosServer {
             Arg::Int(CHUNK_SIZE),
             Arg::Bool(true),
         ];
+        let asked = now_ms();
         match self.node.call(STORAGE, "uploadUrl", &args).await {
             Ok(Value::String(session)) => {
-                self.events.expect_transfer(&session, "upload");
+                self.events.expect_transfer(&session, "upload", asked);
                 Ok((session, held))
             }
             Ok(other) => Err(format!("unexpected uploadUrl result: {other}")),
@@ -4571,9 +4588,10 @@ impl LogosServer {
         );
         // The download session id is the CID: clear any earlier run first.
         self.events.reset_transfer(cid, "download");
+        let asked = now_ms();
         match self.node.call(STORAGE, "downloadToUrl", &args).await {
             Ok(Value::String(session)) => {
-                self.events.expect_transfer(&session, "download");
+                self.events.expect_transfer(&session, "download", asked);
                 Ok((session, full, held))
             }
             refused => {
@@ -4597,7 +4615,7 @@ impl LogosServer {
     ) -> Result<crate::events::Transfer, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(t) = self.events.transfer(session) {
+            if let Some(t) = self.events.agent_transfer(session) {
                 if let Some(why) = stop(&t) {
                     return Err(why);
                 }

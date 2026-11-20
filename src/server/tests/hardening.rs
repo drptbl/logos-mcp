@@ -212,6 +212,7 @@ async fn an_agent_download_over_its_cap_is_stopped_and_removed() {
         storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
         storage("downloadCancel", "null"),
+        storage("exists", "false"), // still incomplete: only the agent's fetch
         storage("remove", "null"),
     ]);
     let (s, events) = files_server(fake.clone(), dir.path());
@@ -634,7 +635,7 @@ async fn transfer_status(s: &LogosServer, session: &str) -> CallToolResult {
 async fn the_agents_transfer_stays_readable_after_many_of_the_users() {
     let dir = tempfile::tempdir().unwrap();
     let (s, events) = files_server(FakeRunner::with(vec![]), dir.path());
-    events.expect_transfer("agents", "upload");
+    events.expect_transfer("agents", "upload", 0);
     for n in 0..crate::events::MAX_TRACKED_TRANSFERS + 10 {
         emit(
             &events,
@@ -693,12 +694,13 @@ async fn a_capped_download_of_content_already_stored_leaves_it_stored() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_finished_download_over_its_cap_drops_what_it_fetched() {
+async fn a_finished_download_over_its_cap_leaves_complete_content_stored() {
+    // Complete content may be the user's by now: only an incomplete fetch goes.
     let dir = tempfile::tempdir().unwrap();
     let fake = FakeRunner::with(vec![
         storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
-        storage("remove", "null"),
+        storage("exists", "true"),
     ]);
     let (s, events) = files_server(fake.clone(), dir.path());
     s.storage_download(download(Some(1_000))).await.unwrap();
@@ -710,7 +712,8 @@ async fn a_finished_download_over_its_cap_drops_what_it_fetched() {
     );
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(!called(&fake, "downloadCancel"));
-    assert!(called(&fake, "remove"));
+    assert!(!called(&fake, "remove"));
+    assert!(!dir.path().join("in.bin").exists());
 }
 
 #[tokio::test(start_paused = true)]
@@ -720,6 +723,7 @@ async fn a_waited_download_over_its_cap_drops_what_it_fetched() {
         storage("exists", "false"),
         storage("downloadToUrl", &format!("{CID:?}")),
         storage("downloadCancel", "null"),
+        storage("exists", "false"),
         storage("remove", "null"),
     ]);
     let (s, events) = files_server(fake.clone(), dir.path());
@@ -800,4 +804,84 @@ async fn the_agent_downloading_a_cid_again_sees_the_new_run() {
     let t = events.agent_transfer(CID).unwrap();
     assert!(!t.done, "{t:?}");
     assert_eq!(t.bytes, Some(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn content_the_user_completed_meanwhile_is_never_removed() {
+    // Not held when the agent began, complete by the time it gives up.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeRunner::with(vec![
+        storage("exists", "false"),
+        storage("downloadToUrl", &format!("{CID:?}")),
+        storage("downloadCancel", "null"),
+        storage("exists", "true"),
+    ]);
+    let (s, events) = files_server(fake.clone(), dir.path());
+    s.storage_download(download(Some(1_000))).await.unwrap();
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 65536, "total": 5_000_000, "success": true }),
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(called(&fake, "downloadCancel"));
+    assert!(!called(&fake, "remove"));
+}
+
+#[test]
+fn a_reused_upload_session_id_starts_fresh() {
+    // Storage restarted and handed out an id it used before.
+    let events = EventStore::default();
+    events.expect_transfer("84", "upload", 0);
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "84", "success": true, "cid": CID }),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    events.expect_transfer("84", "upload", crate::events::unix_ms());
+    let t = events.agent_transfer("84").unwrap();
+    assert!(!t.done, "{t:?}");
+    assert_eq!(t.cid, None);
+}
+
+#[test]
+fn an_upload_that_finished_before_it_was_tracked_still_counts() {
+    let events = EventStore::default();
+    let asked = crate::events::unix_ms();
+    emit(
+        &events,
+        "storageUploadDone",
+        json!({ "sessionId": "85", "success": true, "cid": CID }),
+    );
+    events.expect_transfer("85", "upload", asked);
+    let t = events.agent_transfer("85").unwrap();
+    assert!(t.done);
+    assert_eq!(t.cid.as_deref(), Some(CID));
+}
+
+#[test]
+fn stopping_a_finished_download_keeps_its_own_counts() {
+    // The user's later fetch of the same CID moved the live counts on.
+    let events = EventStore::default();
+    events.reset_transfer(CID, "download");
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 300, "total": 300, "success": true }),
+    );
+    emit(
+        &events,
+        "storageDownloadDone",
+        json!({ "sessionId": CID, "success": true }),
+    );
+    emit(
+        &events,
+        "storageDownloadProgress",
+        json!({ "sessionId": CID, "bytes": 7, "total": 300, "success": true }),
+    );
+    events.stop_transfer(CID, "over the cap".into());
+    let t = events.agent_transfer(CID).unwrap();
+    assert_eq!(t.bytes, Some(300), "{t:?}");
+    assert_eq!(t.success, Some(false));
 }
