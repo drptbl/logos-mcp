@@ -338,6 +338,13 @@ python3 scripts/e2e.py --check storage
 
 Use `--config-dir` to point it at a separate `logosctl` session, so you don't touch the node you actually use.
 
+With `--devnet`, it runs two servers against each other on a local LEZ devnet that [logos-devnet](https://github.com/drptbl/logos-devnet) starts from `logos-devnet.toml`: one sends a message and the other reads it, one uploads a file and the other downloads it, one pays the other from its funded wallet, and one advertises a service the other finds. Messages, files and discovery go through the devnet's own hub, never a public network. CI runs it on every pull request:
+
+```bash
+logos-devnet up
+python3 scripts/e2e.py --devnet
+```
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

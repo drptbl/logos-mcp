@@ -1,0 +1,16 @@
+# A local LEZ chain for `scripts/e2e.py --devnet`: `logos-devnet up`, then the script.
+# See https://github.com/drptbl/logos-devnet.
+
+# Two logosctl sessions, one per logos-mcp server, each with a funded wallet.
+[sessions.mcp-a]
+modules = ["delivery_module", "libp2p_module"]
+
+[sessions.mcp-b]
+modules = ["delivery_module", "libp2p_module"]
+
+# A local delivery node and discovery bootstrap, so messages and service discovery stay
+# off the public fleets.
+[messaging]
+
+# A local storage node the sessions share, so a file one uploads, the other downloads.
+[storage]
