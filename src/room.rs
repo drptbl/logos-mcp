@@ -420,17 +420,18 @@ async fn wait_for_delivery(node: &dyn Node) -> Result<(), String> {
 }
 
 /// Decline proposal `intent_id` in `topic` as the agent, best effort: for
-/// callers that already hold the seat.
-async fn withdraw_now(node: &dyn Node, topic: &str, intent_id: &str) {
+/// callers that already hold the seat. True when Muster took the decline.
+async fn withdraw_now(node: &dyn Node, topic: &str, intent_id: &str) -> bool {
     let declined = match activate(node, topic).await {
         Ok(()) => muster(node, "coordinate_decline", &[intent_id])
             .await
             .map(|_| ()),
         Err(e) => Err(e),
     };
-    if let Err(e) = declined {
+    if let Err(e) = &declined {
         tracing::warn!(%intent_id, "could not withdraw the room proposal: {e}");
     }
+    declined.is_ok()
 }
 
 /// Make `topic` the agent Muster's active room: Muster reads and writes only
@@ -573,14 +574,23 @@ impl Room {
             .and_then(|i| i.get("approvals").and_then(Value::as_u64))
             .unwrap_or(0);
         if approved_before > 0 {
-            // Not this request's: closed, so nothing about it stays open as the agent's.
-            withdraw_now(node, &room.topic, &id).await;
-            self.open
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+            // Not this request's: closed, so nothing about it stays open as the
+            // agent's. One that can't be declined now stays listed, for turning
+            // room approval off to try again.
+            let withdrawn = withdraw_now(node, &room.topic, &id).await;
+            if withdrawn {
+                self.open
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+            }
             return Err(format!(
-                "the room proposal {id} already had approvals before this one, so it was withdrawn: nothing was proposed"
+                "the room proposal {id} already had approvals before this one{}: nothing was proposed",
+                if withdrawn {
+                    ", so it was withdrawn"
+                } else {
+                    ""
+                }
             ));
         }
         let said = format!("[logos-mcp] proposal {id}: {}", call.note);
@@ -673,11 +683,13 @@ impl Room {
     /// the room sees it closed. Best effort: nothing is sent either way.
     pub async fn withdraw(&self, node: &dyn Node, topic: &str, intent_id: &str) {
         let _seat = self.agent.lock().await;
-        withdraw_now(node, topic, intent_id).await;
-        self.open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(intent_id);
+        // Kept when it fails, so turning room approval off tries it again.
+        if withdraw_now(node, topic, intent_id).await {
+            self.open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(intent_id);
+        }
     }
 
     /// End room approval: once no proposal is in flight, run `before`, take

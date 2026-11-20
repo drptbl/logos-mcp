@@ -1461,3 +1461,25 @@ async fn a_restarted_seat_joins_its_room_before_waiting_for_delivery() {
     };
     assert!(at("coordinate_join") < at("connectivity"), "{calls:?}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_withdrawal_that_fails_stays_open_to_retry() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    runner.always(
+        "coordinate_intents",
+        json!([{"id": INTENT, "state": "executable", "approvals": 2}]),
+    );
+    runner.always("coordinate_decline", json!({"error": "not delivered"}));
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, OVER),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(!text(&r).contains("it was withdrawn"), "{}", text(&r));
+    // Turning room approval off tries it again.
+    assert_eq!(s.room.open_proposals(), [INTENT.to_string()]);
+}
