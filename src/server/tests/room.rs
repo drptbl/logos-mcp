@@ -680,6 +680,12 @@ async fn a_proposal_that_already_had_approvals_is_refused() {
     assert!(is_error(&r));
     assert!(text(&r).contains("already had approvals"), "{}", text(&r));
     assert!(runner.muster_calls("coordinate_contribute").is_empty());
+    // Withdrawn, so the room sees it closed and the seat no longer counts it its own.
+    assert_eq!(
+        runner.muster_calls("coordinate_decline")[0][4],
+        format!("str:{INTENT}")
+    );
+    assert!(s.room.open_proposals().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1454,4 +1460,26 @@ async fn a_restarted_seat_joins_its_room_before_waiting_for_delivery() {
             .unwrap()
     };
     assert!(at("coordinate_join") < at("connectivity"), "{calls:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_withdrawal_that_fails_stays_open_to_retry() {
+    let runner = RoomRunner::new(wallet_open().to_vec());
+    runner.always(
+        "coordinate_intents",
+        json!([{"id": INTENT, "state": "executable", "approvals": 2}]),
+    );
+    runner.always("coordinate_decline", json!({"error": "not delivered"}));
+    let (s, _dir) = room_server(runner.clone(), &[HUMAN]);
+    let r = s
+        .wallet_transfer(
+            CancellationToken::new(),
+            transfer(AGENT_FROM, RLN_PAYER, OVER),
+        )
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert!(!text(&r).contains("it was withdrawn"), "{}", text(&r));
+    // Turning room approval off tries it again.
+    assert_eq!(s.room.open_proposals(), [INTENT.to_string()]);
 }

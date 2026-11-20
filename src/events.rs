@@ -76,6 +76,10 @@ pub struct Transfer {
 
 #[derive(Default)]
 struct Inner {
+    /// Where this run's seqs begin: its start time in milliseconds, times
+    /// 1000. A later run starts above anything an earlier one handed out, so
+    /// a reader's after_seq from before a restart is always below it.
+    run_base: u64,
     next_seq: u64,
     topics: HashMap<String, VecDeque<ReceivedMessage>>,
     sends: HashMap<String, SendStatus>,
@@ -85,7 +89,10 @@ struct Inner {
     /// Sessions a server sharing this store started, kept apart from the
     /// transfers themselves: in Basecamp the store also sees the user's own,
     /// which can push the agent's out of `transfers`.
-    started: HashMap<String, ()>,
+    /// With each, its final state once it finished, kept apart: a download's
+    /// session is its CID, so the user fetching the same CID later updates
+    /// the live transfer, never what the agent reads.
+    started: HashMap<String, Option<Transfer>>,
     started_order: VecDeque<String>,
     /// When each CID was last removed from local storage, by anyone, in
     /// milliseconds since the Unix epoch.
@@ -110,11 +117,26 @@ pub enum Cursor {
     Dropped,
 }
 
-#[derive(Default)]
 pub struct EventStore {
     inner: Mutex<Inner>,
     /// Told of each finished removal: the CID and when, in milliseconds.
     on_removed: Mutex<Vec<RemovalHook>>,
+}
+
+impl Default for EventStore {
+    fn default() -> Self {
+        // Under 2^53 for centuries, so JSON clients read seqs exactly.
+        let run_base = unix_ms().saturating_mul(1000);
+        Self {
+            inner: Mutex::new(Inner {
+                run_base,
+                next_seq: run_base,
+                next_chain_seq: run_base,
+                ..Inner::default()
+            }),
+            on_removed: Mutex::default(),
+        }
+    }
 }
 
 type RemovalHook = Box<dyn Fn(&str, u64) + Send + Sync>;
@@ -303,6 +325,9 @@ impl EventStore {
                     t.done = true;
                     t.done_at_ms = Some(unix_ms());
                     t.success = p.get("success").and_then(Value::as_bool);
+                    if let Some(kept @ None) = s.started.get_mut(id) {
+                        *kept = Some(t.clone());
+                    }
                 }
             }
             _ => {}
@@ -311,7 +336,10 @@ impl EventStore {
 
     /// Start tracking a transfer the moment its session id is known, so a
     /// status query before the first event reports "in progress", not unknown.
-    pub fn expect_transfer(&self, session_id: &str, kind: &str) {
+    /// `asked_ms` is when the transfer was asked for: a finished one under the
+    /// same session id from before then is an earlier run's, as when storage
+    /// restarted and hands out its ids again.
+    pub fn expect_transfer(&self, session_id: &str, kind: &str, asked_ms: u64) {
         let mut s = self.inner.lock().unwrap();
         let s = &mut *s;
         track(
@@ -327,8 +355,20 @@ impl EventStore {
             MAX_TRACKED_TRANSFERS,
         );
         let t = s.transfers.get_mut(session_id).expect("just tracked");
+        let earlier = |t: &Transfer| t.done && t.done_at_ms.is_some_and(|at| at < asked_ms);
+        if earlier(t) {
+            *t = Transfer::default();
+        }
         if t.kind.is_empty() {
             t.kind = kind.into();
+        }
+        let kept = s.started.get_mut(session_id).expect("just tracked");
+        if kept.as_ref().is_some_and(earlier) {
+            *kept = None;
+        }
+        // It may have finished, this run, before this was called.
+        if kept.is_none() {
+            *kept = t.done.then(|| t.clone());
         }
     }
 
@@ -350,6 +390,8 @@ impl EventStore {
             session_id,
             MAX_TRACKED_TRANSFERS,
         );
+        // A new run: what an earlier one ended with is no longer the answer.
+        s.started.insert(session_id.to_string(), None);
         *s.transfers.get_mut(session_id).expect("just tracked") = Transfer {
             kind: kind.into(),
             ..Transfer::default()
@@ -361,7 +403,7 @@ impl EventStore {
     /// restart. Checked and read in one step, so no drop slips between them.
     pub fn read(&self, topic: &str, after: u64, limit: usize) -> (Cursor, Vec<ReceivedMessage>) {
         let s = self.inner.lock().unwrap();
-        let cursor = if after > s.next_seq {
+        let cursor = if after > s.next_seq || (after != 0 && after < s.run_base) {
             Cursor::Restarted
         } else if s.dropped_upto.get(topic).is_some_and(|d| after < *d) {
             Cursor::Dropped
@@ -391,7 +433,7 @@ impl EventStore {
     /// with where `after` stood, as `read` does for messages.
     pub fn lib_blocks(&self, after: u64, limit: usize) -> (Cursor, Vec<ChainBlock>) {
         let s = self.inner.lock().unwrap();
-        let cursor = if after > s.next_chain_seq {
+        let cursor = if after > s.next_chain_seq || (after != 0 && after < s.run_base) {
             Cursor::Restarted
         } else if after < s.chain_dropped_upto {
             Cursor::Dropped
@@ -419,10 +461,25 @@ impl EventStore {
 
     /// Settle a transfer this server stopped, so it never reads as a success.
     pub fn stop_transfer(&self, session_id: &str, error: String) {
-        if let Some(t) = self.inner.lock().unwrap().transfers.get_mut(session_id) {
+        let mut s = self.inner.lock().unwrap();
+        let s = &mut *s;
+        let stop = |t: &mut Transfer| {
             t.done = true;
             t.success = Some(false);
-            t.error = Some(error);
+            t.error = Some(error.clone());
+        };
+        // The agent's own record of it, not the live one, which someone
+        // else's later transfer of the same CID may have moved on.
+        if let Some(kept) = s.started.get_mut(session_id) {
+            let mut ended = match kept.take() {
+                Some(ended) => ended,
+                None => s.transfers.get(session_id).cloned().unwrap_or_default(),
+            };
+            stop(&mut ended);
+            *kept = Some(ended);
+        }
+        if let Some(t) = s.transfers.get_mut(session_id) {
+            stop(t);
         }
     }
 
@@ -463,6 +520,16 @@ impl EventStore {
     /// Whether a server sharing this store started `session_id`.
     pub fn started_here(&self, session_id: &str) -> bool {
         self.inner.lock().unwrap().started.contains_key(session_id)
+    }
+
+    /// A transfer a server sharing this store started, as it stands, or as it
+    /// ended once it finished. None for anyone else's.
+    pub fn agent_transfer(&self, session_id: &str) -> Option<Transfer> {
+        let s = self.inner.lock().unwrap();
+        match s.started.get(session_id)? {
+            Some(ended) => Some(ended.clone()),
+            None => s.transfers.get(session_id).cloned(),
+        }
     }
 
     /// Take back `started_here` for a transfer that never started.

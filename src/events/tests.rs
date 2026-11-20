@@ -17,7 +17,14 @@ fn stores_received_message_with_decoded_text() {
         Some("hello logos.dev from logos-mcp")
     );
     assert_eq!(msgs[0].source, "live");
-    assert_eq!(msgs[0].seq, 1);
+    assert_eq!(
+        msgs[0].seq,
+        s.read("/logos-mcp/1/smoke/proto", 0, 1).1[0].seq
+    );
+    assert!(
+        msgs[0].seq > 1_000_000,
+        "a run's seqs start at its time base"
+    );
     assert!(s.read("/other/1/topic/proto", 0, 10).1.is_empty());
 }
 
@@ -71,7 +78,13 @@ fn read_cursor_and_ring_buffer_bound() {
     }
     let all = s.read("/logos-mcp/1/smoke/proto", 0, usize::MAX).1;
     assert_eq!(all.len(), MAX_MESSAGES_PER_TOPIC);
-    assert_eq!(all[0].seq, 11, "oldest entries are evicted first");
+    assert_eq!(
+        all.last().unwrap().seq - all[0].seq,
+        MAX_MESSAGES_PER_TOPIC as u64 - 1,
+        "the newest are kept"
+    );
+    let (cursor, _) = s.read("/logos-mcp/1/smoke/proto", all[0].seq - 11, 1);
+    assert_eq!(cursor, Cursor::Dropped, "oldest entries are evicted first");
     let after = s.read("/logos-mcp/1/smoke/proto", all[100].seq, 5).1;
     assert_eq!(after.len(), 5);
     assert_eq!(after[0].seq, all[101].seq);
@@ -80,7 +93,7 @@ fn read_cursor_and_ring_buffer_bound() {
 #[test]
 fn tracks_upload_to_completion_with_cid() {
     let s = EventStore::default();
-    s.expect_transfer("sess-1", "upload");
+    s.expect_transfer("sess-1", "upload", 0);
     assert!(!s.transfer("sess-1").unwrap().done);
     s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"bytes\":10,\"total\":20}"},"event":"storageUploadProgress","module":"storage_module"}"#);
     s.ingest_line(r#"{"data":{"arg0":"{\"success\":true,\"sessionId\":\"sess-1\",\"cid\":\"zDvZRwzm\"}"},"event":"storageUploadDone","module":"storage_module"}"#);
